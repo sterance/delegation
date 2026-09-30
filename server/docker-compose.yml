@@ -1,0 +1,27 @@
+services:
+  server:
+    build: .
+    restart: unless-stopped
+    volumes:
+      - server-data:/app/data
+    # Deliberately no `ports:` mapping — cloudflared reaches this
+    # container over the internal compose network by service name
+    # (see cloudflared's ingress config), so nothing needs a host port
+    # published, which is the whole point of not opening router ports.
+
+  cloudflared:
+    image: cloudflare/cloudflared:latest
+    restart: unless-stopped
+    command: tunnel run
+    environment:
+      # Create this tunnel from the Cloudflare Zero Trust dashboard
+      # (Networks > Tunnels > Create a tunnel > Docker), point its
+      # public hostname (llm.smith-c.com) at http://server:8080, and
+      # paste the token it gives you into a .env file next to this
+      # compose file as TUNNEL_TOKEN=... — nothing else to configure.
+      TUNNEL_TOKEN: ${TUNNEL_TOKEN}
+    depends_on:
+      - server
+
+volumes:
+  server-data:

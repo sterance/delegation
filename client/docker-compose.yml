@@ -1,0 +1,12 @@
+services:
+  delegation-agent:
+    build: .
+    restart: unless-stopped
+    environment:
+      DELEGATION_SERVER: ${DELEGATION_SERVER:-https://llm.smith-c.com}
+      PAIRING_CODE: ${PAIRING_CODE:-}
+    volumes:
+      - agent-identity:/root/.config/delegation-agent
+
+volumes:
+  agent-identity:
