@@ -47,7 +47,7 @@ pub fn load_or_enroll(server_http_base: &str, pairing_code: Option<&str>) -> Res
             .try_into()
             .map_err(|_| anyhow::anyhow!("stored signing key is not 32 bytes"))?;
         let signing_key = SigningKey::from_bytes(&seed);
-        println!("[identity] loaded existing identity, client_id={}", file.client_id);
+        println!("[{}] [identity] loaded existing identity, client_id={}", crate::ts(), file.client_id);
         return Ok(Identity { client_id: file.client_id, signing_key });
     }
 
@@ -82,7 +82,7 @@ pub fn load_or_enroll(server_http_base: &str, pairing_code: Option<&str>) -> Res
     }
 
     let url = format!("{}/enroll", server_http_base.trim_end_matches('/'));
-    println!("[identity] enrolling with {url} ...");
+    println!("[{}] [identity] enrolling with {url} ...", crate::ts());
 
     let response = ureq::post(&url).send_json(ureq::json!(EnrollRequest {
         pairing_code: code,
@@ -114,7 +114,7 @@ pub fn load_or_enroll(server_http_base: &str, pairing_code: Option<&str>) -> Res
     // Owner read/write only — this file holds a private key.
     fs::set_permissions(&path, fs::Permissions::from_mode(0o600))?;
 
-    println!("[identity] enrolled, client_id={client_id} (saved to {:?})", path);
+    println!("[{}] [identity] enrolled, client_id={client_id} (saved to {:?})", crate::ts(), path);
     Ok(Identity { client_id, signing_key })
 }
 

@@ -5,4 +5,4 @@
 import { createPairingCode } from "./registry.js";
 
 const code = await createPairingCode();
-console.log(`Pairing code (valid 10 minutes): ${code}`);
+console.log(`[${new Date().toISOString()}] Pairing code (valid 10 minutes): ${code}`);

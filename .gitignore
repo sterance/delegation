@@ -1,0 +1,26 @@
+# Dependencies
+server/node_modules/
+client/target/
+
+# Build outputs
+server/dist/
+
+# Environment variables
+.env
+
+# Logs
+*.log
+
+# IDE and editor files
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS generated files
+.DS_Store
+Thumbs.db
+
+# Temporary files
+*.tmp
+*.temp

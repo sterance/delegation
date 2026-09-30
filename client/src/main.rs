@@ -6,8 +6,41 @@ use base64::{engine::general_purpose::STANDARD, Engine as _};
 use ed25519_dalek::Signer;
 use futures_util::{SinkExt, StreamExt};
 use protocol::{ClientMessage, ServerMessage};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio_tungstenite::tungstenite::Message;
+
+/// How long we'll tolerate going without a heartbeat_ack before treating
+/// the connection as dead and forcing a reconnect. This is what catches
+/// a silently dropped connection (dead wifi, out-of-range client) that
+/// never produces a transport-level error — see the hurdles writeup.
+const ACK_TIMEOUT: Duration = Duration::from_secs(30);
+const HEARTBEAT_DURATION: Duration = Duration::from_secs(10);
+
+/// UTC timestamp for log lines, e.g. "2026-09-29T23:31:05Z". Hand-rolled
+/// (Howard Hinnant's civil_from_days algorithm) rather than pulling in a
+/// date/time crate, in keeping with this agent's minimal-dependency goal.
+pub(crate) fn ts() -> String {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default();
+    let secs = now.as_secs();
+    let days = (secs / 86400) as i64;
+    let tod = secs % 86400;
+    let (hh, mm, ss) = (tod / 3600, (tod % 3600) / 60, tod % 60);
+
+    let z = days + 719468;
+    let era = if z >= 0 { z } else { z - 146096 } / 146097;
+    let doe = (z - era * 146097) as u64;
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    let y = yoe as i64 + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let month = if mp < 10 { mp + 3 } else { mp - 9 };
+    let year = if month <= 2 { y + 1 } else { y };
+
+    format!("{year:04}-{month:02}-{d:02}T{hh:02}:{mm:02}:{ss:02}Z")
+}
 
 struct Args {
     server: String, // e.g. "http://localhost:8080" or "https://llm.smith-c.com"
@@ -54,10 +87,10 @@ async fn main() -> Result<()> {
     // cleanly rather than spinning or silently dying.
     let mut backoff = Duration::from_secs(1);
     loop {
-        println!("[ws] connecting to {ws_url} ...");
+        println!("[{}] [ws] connecting to {ws_url} ...", ts());
         match run_session(&ws_url, &identity).await {
-            Ok(()) => println!("[ws] session ended cleanly, reconnecting in {backoff:?}"),
-            Err(e) => eprintln!("[ws] session error: {e:#}. Reconnecting in {backoff:?}"),
+            Ok(()) => println!("[{}] [ws] session ended cleanly, reconnecting in {backoff:?}", ts()),
+            Err(e) => eprintln!("[{}] [ws] session error: {e:#}. Reconnecting in {backoff:?}", ts()),
         }
         tokio::time::sleep(backoff).await;
         backoff = std::cmp::min(backoff * 2, Duration::from_secs(30));
@@ -88,7 +121,7 @@ async fn run_session(ws_url: &str, identity: &identity::Identity) -> Result<()> 
 
     let auth_result = next_message(&mut read).await?;
     match auth_result {
-        ServerMessage::AuthOk {} => println!("[ws] authenticated"),
+        ServerMessage::AuthOk {} => println!("[{}] [ws] authenticated", ts()),
         ServerMessage::AuthFailed { reason } => bail!("server rejected auth: {reason}"),
         other => bail!("expected auth_ok, got {other:?}"),
     }
@@ -101,21 +134,37 @@ async fn run_session(ws_url: &str, identity: &identity::Identity) -> Result<()> 
         .map(|s| s.trim().to_string())
         .unwrap_or_else(|| "unknown-host".to_string());
 
-    let mut ticker = tokio::time::interval(Duration::from_secs(10));
+    // Baseline set right after auth, so a server that never acks even the
+    // first heartbeat gets caught by the same timeout rather than waiting
+    // indefinitely for a "last" ack that never came.
+    let mut last_ack = Instant::now();
+
+    let mut ticker = tokio::time::interval(HEARTBEAT_DURATION);
     loop {
         tokio::select! {
-            _ = ticker.tick() => {
+             _ = ticker.tick() => {
+                // Self-heal on a silently dead connection: if the transport
+                // hasn't told us anything is wrong but we also haven't heard
+                // an ack in a while, the server has likely already given up
+                // on us (its own heartbeat-timeout sweep) — don't wait for
+                // an OS-level TCP error that may never come.
+                if last_ack.elapsed() > ACK_TIMEOUT {
+                    bail!("no heartbeat_ack received in {:?}, treating connection as dead", last_ack.elapsed());
+                }
                 let timestamp = now_ms();
                 send(&mut write, &ClientMessage::Heartbeat { timestamp, hostname: hostname.clone() }).await?;
-                println!("[heartbeat] sent");
-            }
+                println!("[{}] [heartbeat] sent", ts());
+             }
             msg = read.next() => {
                 match msg {
                     Some(Ok(Message::Text(text))) => {
                         match serde_json::from_str::<ServerMessage>(&text) {
-                            Ok(ServerMessage::HeartbeatAck {}) => println!("[heartbeat] acked"),
-                            Ok(other) => println!("[ws] unexpected message during heartbeat loop: {other:?}"),
-                            Err(e) => println!("[ws] couldn't parse server message: {e}"),
+                            Ok(ServerMessage::HeartbeatAck {}) => {
+                                last_ack = Instant::now();
+                                println!("[{}] [heartbeat] acked", ts());
+                            }
+                            Ok(other) => println!("[{}] [ws] unexpected message during heartbeat loop: {other:?}", ts()),
+                            Err(e) => println!("[{}] [ws] couldn't parse server message: {e}", ts()),
                         }
                     }
                     Some(Ok(Message::Close(_))) | None => bail!("server closed connection"),

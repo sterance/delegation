@@ -22,6 +22,14 @@ function b64ToBytes(b64: string): Uint8Array {
   return new Uint8Array(Buffer.from(b64, "base64"));
 }
 
+function log(...args: unknown[]) {
+  console.log(`[${new Date().toISOString()}]`, ...args);
+}
+
+function logErr(...args: unknown[]) {
+  console.error(`[${new Date().toISOString()}]`, ...args);
+}
+
 function send(ws: WebSocket, msg: ServerMessage) {
   ws.send(JSON.stringify(msg));
 }
@@ -48,11 +56,11 @@ const httpServer = http.createServer((req, res) => {
           hostname: parsed.hostname,
           enrolled_at: new Date().toISOString(),
         });
-        console.log(`[enroll] new client ${client_id} (${parsed.hostname})`);
+        log(`[enroll] new client ${client_id} (${parsed.hostname})`);
         res.writeHead(200, { "content-type": "application/json" });
         res.end(JSON.stringify({ client_id }));
       } catch (err) {
-        console.error("[enroll] error", err);
+        logErr("[enroll] error", err);
         res.writeHead(400, { "content-type": "application/json" });
         res.end(JSON.stringify({ error: "bad request" }));
       }
@@ -66,10 +74,7 @@ const httpServer = http.createServer((req, res) => {
 
 // ---------------- WebSocket: challenge-response + heartbeat ----------------
 
-type ConnState =
-  | { stage: "awaiting_hello" }
-  | { stage: "awaiting_response"; client_id: string; nonce: Uint8Array }
-  | { stage: "authenticated"; client_id: string; lastHeartbeat: number };
+type ConnState = { stage: "awaiting_hello" } | { stage: "awaiting_response"; client_id: string; nonce: Uint8Array } | { stage: "authenticated"; client_id: string; lastHeartbeat: number };
 
 const wss = new WebSocketServer({ server: httpServer, path: "/agent" });
 
@@ -86,7 +91,7 @@ wss.on("connection", (ws) => {
 
   const authTimeout = setTimeout(() => {
     if (state.stage !== "authenticated") {
-      console.log("[ws] handshake timed out, closing");
+      log("[ws] handshake timed out, closing");
       ws.close(4001, "handshake timeout");
     }
   }, AUTH_TIMEOUT_MS);
@@ -103,7 +108,7 @@ wss.on("connection", (ws) => {
     if (msg.type === "hello" && state.stage === "awaiting_hello") {
       const record = await getClient(msg.client_id);
       if (!record) {
-        console.log(`[ws] unknown client_id ${msg.client_id}`);
+        log(`[ws] unknown client_id ${msg.client_id}`);
         send(ws, { type: "auth_failed", reason: "unknown client_id" });
         ws.close(4003, "unknown client");
         return;
@@ -124,13 +129,13 @@ wss.on("connection", (ws) => {
       const signature = b64ToBytes(msg.signature);
       const valid = await ed.verifyAsync(signature, state.nonce, publicKey);
       if (!valid) {
-        console.log(`[ws] bad signature from ${state.client_id}`);
+        log(`[ws] bad signature from ${state.client_id}`);
         send(ws, { type: "auth_failed", reason: "signature verification failed" });
         ws.close(4003, "auth failed");
         return;
       }
       clearTimeout(authTimeout);
-      console.log(`[ws] client ${state.client_id} authenticated`);
+      log(`[ws] client ${state.client_id} authenticated`);
       setState({ stage: "authenticated", client_id: state.client_id, lastHeartbeat: Date.now() });
       send(ws, { type: "auth_ok" });
       return;
@@ -138,23 +143,23 @@ wss.on("connection", (ws) => {
 
     if (msg.type === "heartbeat" && state.stage === "authenticated") {
       state.lastHeartbeat = Date.now();
-      console.log(`[heartbeat] ${state.client_id} (${msg.hostname}) at ${new Date(msg.timestamp).toISOString()}`);
+      log(`[heartbeat] ${state.client_id} (${msg.hostname}) at ${new Date(msg.timestamp).toISOString()}`);
       send(ws, { type: "heartbeat_ack" });
       return;
     }
 
-    console.log(`[ws] unexpected message "${msg.type}" in stage "${state.stage}"`);
+    log(`[ws] unexpected message "${msg.type}" in stage "${state.stage}"`);
   });
 
   ws.on("close", () => {
     clearTimeout(authTimeout);
     connections.delete(ws);
     if (state.stage === "authenticated") {
-      console.log(`[ws] client ${state.client_id} disconnected`);
+      log(`[ws] client ${state.client_id} disconnected`);
     }
   });
 
-  ws.on("error", (err) => console.error("[ws] error", err));
+  ws.on("error", (err) => logErr("[ws] error", err));
 });
 
 // Sweep for clients that stopped heartbeating without a clean disconnect
@@ -165,7 +170,7 @@ setInterval(() => {
   const now = Date.now();
   for (const [ws, state] of connections) {
     if (state.stage === "authenticated" && now - state.lastHeartbeat > HEARTBEAT_TIMEOUT_MS) {
-      console.log(`[heartbeat] client ${state.client_id} timed out, closing`);
+      log(`[heartbeat] client ${state.client_id} timed out, closing`);
       ws.close(4008, "heartbeat timeout");
       connections.delete(ws);
     }
@@ -173,7 +178,7 @@ setInterval(() => {
 }, 10_000);
 
 httpServer.listen(PORT, () => {
-  console.log(`delegation-server-scaffold listening on :${PORT}`);
-  console.log(`  enroll:  POST http://localhost:${PORT}/enroll`);
-  console.log(`  agent:   ws://localhost:${PORT}/agent`);
+  log(`delegation-server-scaffold listening on :${PORT}`);
+  log(`  enroll:  POST http://localhost:${PORT}/enroll`);
+  log(`  agent:   ws://localhost:${PORT}/agent`);
 });
