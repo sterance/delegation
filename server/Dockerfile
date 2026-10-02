@@ -23,5 +23,5 @@ COPY --from=builder /app/dist ./dist
 # enrolled client.
 VOLUME /app/data
 
-EXPOSE 8080
+EXPOSE 7070
 CMD ["node", "dist/server.js"]

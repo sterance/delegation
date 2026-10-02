@@ -18,7 +18,7 @@ services:
     environment:
       # Create this tunnel from the Cloudflare Zero Trust dashboard
       # (Networks > Tunnels > Create a tunnel > Docker), point its
-      # public hostname (llm.smith-c.com) at http://server:8080, and
+      # public hostname (llm.smith-c.com) at http://server:7070, and
       # paste the token it gives you into a .env file next to this
       # compose file as TUNNEL_TOKEN=... — nothing else to configure.
       TUNNEL_TOKEN: ${TUNNEL_TOKEN}

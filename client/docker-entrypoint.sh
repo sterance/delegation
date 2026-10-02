@@ -1,7 +1,7 @@
 #!/bin/sh
 set -e
 
-SERVER="${DELEGATION_SERVER:-http://localhost:8080}"
+SERVER="${DELEGATION_SERVER:-http://localhost:7070}"
 ARGS="--server $SERVER"
 
 # Only needed on first run for a given identity volume — once enrolled,

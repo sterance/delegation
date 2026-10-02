@@ -65,15 +65,31 @@ scaffold/
 
 ### Shared configuration
 
-The project-wide [config.env](./config.env) file is the shared dotenv-style
-configuration source for both Compose services and local server commands.
-The server currently reads `SERVER_PORT` from it (default `8080`). Client
-configuration can be added to the same file as the client gains additional
-settings.
+The project-wide [config.env.example](./config.env.example) file is the
+tracked template for the shared dotenv-style configuration used by both
+services. Before deploying, create the ignored runtime file:
 
-For local server commands, the package scripts load this file automatically.
-Both `server/docker-compose.yml` and `client/docker-compose.yml` pass it to
-their respective services.
+```bash
+cp config.env.example config.env
+```
+
+The server package scripts load `config.env` automatically, and both
+Compose files pass it to their respective services. Duration values use
+milliseconds:
+
+| Variable                              |  Default | Purpose                                                      |
+| ------------------------------------- | -------: | ------------------------------------------------------------ |
+| `SERVER_AUTH_TIMEOUT_MS`              |   `5000` | Time allowed for the WebSocket handshake                     |
+| `SERVER_HEARTBEAT_TIMEOUT_MS`         |  `30000` | Time without a heartbeat before closing a client             |
+| `SERVER_HEARTBEAT_SWEEP_INTERVAL_MS`  |  `10000` | Frequency of the server heartbeat timeout sweep              |
+| `SERVER_PAIRING_CODE_TTL_MS`          | `600000` | Pairing-code validity period                                 |
+| `CLIENT_ACK_TIMEOUT_MS`               |  `30000` | Time without a heartbeat acknowledgement before reconnecting |
+| `CLIENT_HEARTBEAT_INTERVAL_MS`        |  `10000` | Interval between client heartbeats                           |
+| `CLIENT_RECONNECT_INITIAL_BACKOFF_MS` |   `1000` | Initial reconnect delay                                      |
+| `CLIENT_RECONNECT_MAX_BACKOFF_MS`     |  `30000` | Maximum reconnect delay                                      |
+
+`SERVER_PORT` remains the server listening port. Client configuration can be
+added to the same file as the client gains additional settings.
 
 ---
 
@@ -90,6 +106,7 @@ their respective services.
    POST /enroll
    { "pairing_code": "ABC12345", "public_key": "<base64>", "hostname": "..." }
    ```
+
 3. The server validates and consumes the code, generates a `client_id`
    (UUID), stores `{client_id, public_key, hostname}`, and returns
    `{ "client_id": "..." }`.
@@ -113,19 +130,20 @@ client                              server
 ```
 
 This is deliberately WireGuard/SSH-style: the private key never leaves the
-client, ever — not even during enrollment, where only the *public* key is
+client, ever — not even during enrollment, where only the _public_ key is
 sent. Possession of the private key is proven by signing a fresh
 server-issued nonce, so a captured message can't be replayed.
 
-### 3.3 Heartbeat (every 10s once authenticated)
+### 3.3 Heartbeat (every `CLIENT_HEARTBEAT_INTERVAL_MS` once authenticated)
 
 ```
 client ── {type:"heartbeat", timestamp, hostname} ──▶ server
 client ◀──────── {type:"heartbeat_ack"} ─────────────── server
 ```
 
-The server sweeps every 10s for any authenticated client whose last
-heartbeat is older than 30s and closes that connection, logging it as
+The server sweeps every `SERVER_HEARTBEAT_SWEEP_INTERVAL_MS` for any
+authenticated client whose last heartbeat is older than
+`SERVER_HEARTBEAT_TIMEOUT_MS` and closes that connection, logging it as
 timed out.
 
 ---
@@ -138,25 +156,25 @@ cd server
 npm install
 npm run build
 npm start
-#   listening on :8080
-#   enroll:  POST http://localhost:8080/enroll
-#   agent:   ws://localhost:8080/agent
+#   listening on :7070
+#   enroll:  POST http://localhost:7070/enroll
+#   agent:   ws://localhost:7070/agent
 
 # in another terminal, mint a pairing code:
 npm run gen-code
-#   Pairing code (valid 10 minutes): ABC12345
+#   Pairing code (valid according to SERVER_PAIRING_CODE_TTL_MS): ABC12345
 ```
 
 ```bash
 # --- client (native binary) ---
 cd client
 cargo build --release
-./target/release/delegation-agent --server http://localhost:8080 --pairing-code ABC12345
-#   [identity] enrolling with http://localhost:8080/enroll ...
+./target/release/delegation-agent --server http://localhost:7070 --pairing-code ABC12345
+#   [identity] enrolling with http://localhost:7070/enroll ...
 #   [identity] enrolled, client_id=...
-#   [ws] connecting to ws://localhost:8080/agent ...
+#   [ws] connecting to ws://localhost:7070/agent ...
 #   [ws] authenticated
-#   [heartbeat] sent / acked, every 10s
+#   [heartbeat] sent / acked, according to CLIENT_HEARTBEAT_INTERVAL_MS
 ```
 
 Run it again later with no `--pairing-code` at all — it loads the saved
@@ -166,7 +184,7 @@ identity and reconnects straight to the heartbeat loop.
 
 ```bash
 cd client
-echo "DELEGATION_SERVER=http://host.docker.internal:8080" > .env
+echo "DELEGATION_SERVER=http://host.docker.internal:7070" > .env
 echo "PAIRING_CODE=ABC12345" >> .env
 docker compose up --build
 ```
@@ -183,7 +201,7 @@ single-use server-side and only ever read if no identity file exists yet.
 
 1. **Cloudflare Tunnel:** in the Cloudflare Zero Trust dashboard, Networks
    → Tunnels → Create a tunnel → Docker. Point the public hostname
-   `llm.smith-c.com` at `http://server:8080` (the compose service name —
+   `llm.smith-c.com` at `http://server:7070` (the compose service name —
    cloudflared and the server share the compose network, so this resolves
    without any port being published to the host). Copy the tunnel token.
 2. On the server host (Pi or otherwise):
@@ -194,7 +212,7 @@ single-use server-side and only ever read if no identity file exists yet.
    ```
 3. Mint a pairing code on the server (`docker compose exec server node dist/gen-code.js`),
    and enroll a real client agent against `https://llm.smith-c.com` instead
-   of `http://localhost:8080`. Everything else about the protocol is
+   of `http://localhost:7070`. Everything else about the protocol is
    identical — only the URL changes.
 4. **Alpine/Pi note:** the server's Dockerfile is pinned to pure-JS
    dependencies specifically so `npm install` doesn't need a native build
@@ -226,47 +244,49 @@ manager**, on every machine that builds this client natively. This
 scaffold's `Cargo.toml` has several version pins that exist only to work
 around that constrained environment; a `rustup`-installed current stable
 almost certainly doesn't need them.
-  - One genuine improvement came out of chasing this down anyway: the
-    original design used `reqwest` for the one HTTP enroll call, which
-    pulled in a large chunk of that dependency tree. Switching to `ureq`
-    (synchronous, minimal deps) for just that one call meaningfully
-    shrunk the client's footprint — a better fit for "as lightweight as
-    possible" regardless of the toolchain issue.
+
+- One genuine improvement came out of chasing this down anyway: the
+  original design used `reqwest` for the one HTTP enroll call, which
+  pulled in a large chunk of that dependency tree. Switching to `ureq`
+  (synchronous, minimal deps) for just that one call meaningfully
+  shrunk the client's footprint — a better fit for "as lightweight as
+  possible" regardless of the toolchain issue.
 
 **3. The server correctly detects a dead client — the client does not
 symmetrically detect a dead server, and this matters a lot.** Three
 distinct disconnect scenarios were tested:
-  - *Server killed outright (`kill -9`):* the client sees an immediate
-    "connection reset" error and reconnects with exponential backoff
-    (1s→2s→4s→8s...), re-authenticating cleanly once the server comes
-    back. **Works exactly as designed.**
-  - *Client killed outright, on localhost:* the server sees an immediate
-    clean disconnect, because the kernel still sends a proper close on
-    the client's socket even under `kill -9`. This is **not** representative
-    of a real network failure.
-  - *Packets silently dropped in both directions* (simulated with
-    `iptables`, no FIN/RST either way — this is what a dead Wi-Fi
-    connection or a phone leaving range actually looks like): the server's
-    30-second heartbeat-timeout sweep worked exactly as designed and
-    correctly gave up on the client. **The client, however, kept sending
-    heartbeats into the void indefinitely**, with no way to know the
-    server had already forgotten about it — because the client only reacts
-    to transport-level errors, and a silent packet drop produces none.
-    Recovery only happened once connectivity was restored and a stale
-    reset packet finally got through — which is not guaranteed on a real
-    network (e.g. a device that gets a new IP address when it reconnects
-    may never receive that stale packet at all, leaving it to Linux's
-    default TCP retransmission timeout, which can exceed ten minutes).
 
-  **The fix:** the client needs its own application-level liveness check —
-  track the time since the last `heartbeat_ack` was actually received, and
-  if it exceeds some multiple of the heartbeat interval (e.g. 3×), treat
-  the connection as dead and force a reconnect, rather than waiting on the
-  transport layer to notice. This is a small, well-understood change (the
-  same idea as WebSocket ping/pong timeouts) but it's the single most
-  important fix to make before relying on this over real, unreliable
-  client internet connections — it was not part of the original design and
-  would not have been found without this exact test.
+- _Server killed outright (`kill -9`):_ the client sees an immediate
+  "connection reset" error and reconnects with exponential backoff
+  (1s→2s→4s→8s...), re-authenticating cleanly once the server comes
+  back. **Works exactly as designed.**
+- _Client killed outright, on localhost:_ the server sees an immediate
+  clean disconnect, because the kernel still sends a proper close on
+  the client's socket even under `kill -9`. This is **not** representative
+  of a real network failure.
+- _Packets silently dropped in both directions_ (simulated with
+  `iptables`, no FIN/RST either way — this is what a dead Wi-Fi
+  connection or a phone leaving range actually looks like): the server's
+  30-second heartbeat-timeout sweep worked exactly as designed and
+  correctly gave up on the client. **The client, however, kept sending
+  heartbeats into the void indefinitely**, with no way to know the
+  server had already forgotten about it — because the client only reacts
+  to transport-level errors, and a silent packet drop produces none.
+  Recovery only happened once connectivity was restored and a stale
+  reset packet finally got through — which is not guaranteed on a real
+  network (e.g. a device that gets a new IP address when it reconnects
+  may never receive that stale packet at all, leaving it to Linux's
+  default TCP retransmission timeout, which can exceed ten minutes).
+
+**The fix:** the client needs its own application-level liveness check —
+track the time since the last `heartbeat_ack` was actually received, and
+if it exceeds some multiple of the heartbeat interval (e.g. 3×), treat
+the connection as dead and force a reconnect, rather than waiting on the
+transport layer to notice. This is a small, well-understood change (the
+same idea as WebSocket ping/pong timeouts) but it's the single most
+important fix to make before relying on this over real, unreliable
+client internet connections — it was not part of the original design and
+would not have been found without this exact test.
 
 **4. Docker Hub was unreachable from the sandboxed environment used to
 prototype this**, so the Dockerfiles here are correct by careful,
@@ -280,7 +300,7 @@ it work.
 
 ---
 
-## 7. What this scaffold deliberately does *not* handle yet
+## 7. What this scaffold deliberately does _not_ handle yet
 
 - No dashboard (React/TypeScript, later) — the admin flow is a CLI script
   on purpose, so the enrollment protocol itself gets proven before any UI

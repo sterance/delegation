@@ -10,6 +10,7 @@
 
 import { promises as fs } from "node:fs";
 import path from "node:path";
+import { PAIRING_CODE_TTL_MS } from "./config.js";
 
 const DATA_DIR = path.join(process.cwd(), "data");
 const CLIENTS_FILE = path.join(DATA_DIR, "clients.json");
@@ -51,7 +52,7 @@ async function writeJson(file: string, data: unknown) {
 
 // ---- pairing codes ----
 
-export async function createPairingCode(ttlMs = 10 * 60 * 1000): Promise<string> {
+export async function createPairingCode(ttlMs = PAIRING_CODE_TTL_MS): Promise<string> {
   const code = Math.random().toString(36).slice(2, 10).toUpperCase();
   const codes = await readJson<Record<string, PendingCode>>(CODES_FILE, {});
   codes[code] = { expires_at: Date.now() + ttlMs };

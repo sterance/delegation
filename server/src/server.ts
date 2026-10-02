@@ -4,6 +4,7 @@ import { WebSocketServer, WebSocket } from "ws";
 import * as ed from "@noble/ed25519";
 import type { ClientMessage, ServerMessage, EnrollRequest } from "./protocol.js";
 import { addClient, consumePairingCode, getClient } from "./registry.js";
+import { AUTH_TIMEOUT_MS, HEARTBEAT_SWEEP_INTERVAL_MS, HEARTBEAT_TIMEOUT_MS } from "./config.js";
 
 // Hurdle #1 encountered while building this: @noble/ed25519 v2's docs (and
 // a lot of copy-pasted example code online) show manually wiring up
@@ -14,9 +15,7 @@ import { addClient, consumePairingCode, getClient } from "./registry.js";
 // whatever version is current when you actually build this for real,
 // since it clearly moved once already.
 
-const PORT = Number(process.env.SERVER_PORT ?? 8080);
-const HEARTBEAT_TIMEOUT_MS = 30_000; // how long without a heartbeat before we call a client dead
-const AUTH_TIMEOUT_MS = 5_000; // how long a client has to complete the handshake
+const PORT = Number(process.env.SERVER_PORT ?? 7070);
 
 function b64ToBytes(b64: string): Uint8Array {
   return new Uint8Array(Buffer.from(b64, "base64"));
@@ -175,7 +174,7 @@ setInterval(() => {
       connections.delete(ws);
     }
   }
-}, 10_000);
+}, HEARTBEAT_SWEEP_INTERVAL_MS);
 
 httpServer.listen(PORT, () => {
   log(`delegation-server-scaffold listening on :${PORT}`);
