@@ -23,7 +23,7 @@ services:
       # compose file as TUNNEL_TOKEN=... — nothing else to configure.
       TUNNEL_TOKEN: ${TUNNEL_TOKEN}
     depends_on:
-      - server
+      - delegation-server
 
 volumes:
   server-data:
