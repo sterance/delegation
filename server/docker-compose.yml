@@ -1,5 +1,5 @@
 services:
-  server:
+  delegation-server:
     build: .
     restart: unless-stopped
     env_file:
