@@ -2,6 +2,8 @@ services:
   server:
     build: .
     restart: unless-stopped
+    env_file:
+      - ../config.env
     volumes:
       - server-data:/app/data
     # Deliberately no `ports:` mapping — cloudflared reaches this

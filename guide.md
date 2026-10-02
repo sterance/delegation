@@ -63,6 +63,18 @@ scaffold/
     └── docker-compose.yml   # for running the agent itself in a container
 ```
 
+### Shared configuration
+
+The project-wide [config.env](./config.env) file is the shared dotenv-style
+configuration source for both Compose services and local server commands.
+The server currently reads `SERVER_PORT` from it (default `8080`). Client
+configuration can be added to the same file as the client gains additional
+settings.
+
+For local server commands, the package scripts load this file automatically.
+Both `server/docker-compose.yml` and `client/docker-compose.yml` pass it to
+their respective services.
+
 ---
 
 ## 3. Protocol specification

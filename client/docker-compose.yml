@@ -2,6 +2,8 @@ services:
   delegation-agent:
     build: .
     restart: unless-stopped
+    env_file:
+      - ../config.env
     environment:
       DELEGATION_SERVER: ${DELEGATION_SERVER:-https://llm.smith-c.com}
       PAIRING_CODE: ${PAIRING_CODE:-}

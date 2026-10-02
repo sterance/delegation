@@ -14,7 +14,7 @@ import { addClient, consumePairingCode, getClient } from "./registry.js";
 // whatever version is current when you actually build this for real,
 // since it clearly moved once already.
 
-const PORT = Number(process.env.PORT ?? 8080);
+const PORT = Number(process.env.SERVER_PORT ?? 8080);
 const HEARTBEAT_TIMEOUT_MS = 30_000; // how long without a heartbeat before we call a client dead
 const AUTH_TIMEOUT_MS = 5_000; // how long a client has to complete the handshake
 

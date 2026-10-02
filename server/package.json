@@ -5,9 +5,9 @@
   "type": "module",
   "scripts": {
     "build": "tsc -p .",
-    "start": "node dist/server.js",
-    "dev": "tsc -p . && node dist/server.js",
-    "gen-code": "tsc -p . && node dist/gen-code.js"
+    "start": "node --env-file=../config.env dist/server.js",
+    "dev": "tsc -p . && node --env-file=../config.env dist/server.js",
+    "gen-code": "tsc -p . && node --env-file=../config.env dist/gen-code.js"
   },
   "dependencies": {
     "@noble/ed25519": "^2.1.0",

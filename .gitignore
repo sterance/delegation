@@ -26,3 +26,4 @@ Thumbs.db
 *.temp
 
 server/data
+config.env
