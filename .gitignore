@@ -1,12 +1,23 @@
-# Dependencies
-server/node_modules/
-client/target/
+# Rust build output (workspace root and any stray per-crate target dirs)
+target/
 
-# Build outputs
-server/dist/
+# Node (legacy server, kept in case of leftovers)
+node_modules/
+dist/
 
-# Environment variables
+# Local runtime data (SQLite DB defaults to data/delegation.db)
+data/
+*.db
+*.db-journal
+*.db-wal
+*.db-shm
+
+# Environment / local config (config.env.example is committed)
 .env
+config.env
+
+# Local docker overrides
+docker-compose.override.yml
 
 # Logs
 *.log
@@ -24,6 +35,4 @@ Thumbs.db
 # Temporary files
 *.tmp
 *.temp
-
-server/data
-config.env
+dev/.native-home/

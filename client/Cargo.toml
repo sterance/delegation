@@ -6,6 +6,7 @@ edition = "2021"
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
+protocol = { path = "../protocol" }
 # NOTE: several of these are pinned to older patch/minor versions purely
 # because this scaffold was prototyped against a distro-packaged Rust
 # 1.75 toolchain (see the guide's "hurdles" section). On a real dev

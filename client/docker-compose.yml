@@ -1,9 +1,9 @@
 services:
   delegation-agent:
-    build: .
+    build:
+      context: ..
+      dockerfile: client/Dockerfile
     restart: unless-stopped
-    env_file:
-      - ../config.env
     environment:
       DELEGATION_SERVER: ${DELEGATION_SERVER:-https://llm.smith-c.com}
       PAIRING_CODE: ${PAIRING_CODE:-}

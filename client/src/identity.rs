@@ -1,6 +1,7 @@
 use anyhow::{bail, Context, Result};
 use base64::{engine::general_purpose::STANDARD, Engine as _};
 use ed25519_dalek::{SigningKey, VerifyingKey};
+use protocol::{ts, EnrollError, EnrollRequest, EnrollResponse};
 use rand::rngs::OsRng;
 use serde::{Deserialize, Serialize};
 use std::fs;
@@ -47,7 +48,7 @@ pub fn load_or_enroll(server_http_base: &str, pairing_code: Option<&str>) -> Res
             .try_into()
             .map_err(|_| anyhow::anyhow!("stored signing key is not 32 bytes"))?;
         let signing_key = SigningKey::from_bytes(&seed);
-        println!("[{}] [identity] loaded existing identity, client_id={}", crate::ts(), file.client_id);
+        println!("[{}] [identity] loaded existing identity, client_id={}", ts(), file.client_id);
         return Ok(Identity { client_id: file.client_id, signing_key });
     }
 
@@ -66,28 +67,13 @@ pub fn load_or_enroll(server_http_base: &str, pairing_code: Option<&str>) -> Res
 
     let hostname = hostname_string();
 
-    #[derive(Serialize)]
-    struct EnrollRequest<'a> {
-        pairing_code: &'a str,
-        public_key: &'a str,
-        hostname: &'a str,
-    }
-    #[derive(Deserialize)]
-    struct EnrollResponse {
-        client_id: String,
-    }
-    #[derive(Deserialize)]
-    struct EnrollError {
-        error: String,
-    }
-
     let url = format!("{}/enroll", server_http_base.trim_end_matches('/'));
-    println!("[{}] [identity] enrolling with {url} ...", crate::ts());
+    println!("[{}] [identity] enrolling with {url} ...", ts());
 
     let response = ureq::post(&url).send_json(ureq::json!(EnrollRequest {
-        pairing_code: code,
-        public_key: &public_key_b64,
-        hostname: &hostname,
+        pairing_code: code.to_string(),
+        public_key: public_key_b64.clone(),
+        hostname: hostname.clone(),
     }));
 
     let client_id = match response {
@@ -114,8 +100,15 @@ pub fn load_or_enroll(server_http_base: &str, pairing_code: Option<&str>) -> Res
     // Owner read/write only — this file holds a private key.
     fs::set_permissions(&path, fs::Permissions::from_mode(0o600))?;
 
-    println!("[{}] [identity] enrolled, client_id={client_id} (saved to {:?})", crate::ts(), path);
+    println!("[{}] [identity] enrolled, client_id={client_id} (saved to {:?})", ts(), path);
     Ok(Identity { client_id, signing_key })
+}
+
+/// Wipes the saved identity so the next run requires a fresh
+/// `--pairing-code` — called when the server tells us it no longer
+/// recognizes our client_id.
+pub fn clear() {
+    let _ = fs::remove_file(identity_path());
 }
 
 fn hostname_string() -> String {

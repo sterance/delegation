@@ -1,0 +1,35 @@
+# Local dev stack: server + client on a private compose network, no
+# cloudflared, no public hostname. Fully isolated from the deploy stacks
+# (server/docker-compose.yml, client/docker-compose.yml): different
+# compose project name ("delegation-dev") and its own named volumes, so
+# `dev/dev.sh reset` can never touch production data or identities.
+name: delegation-dev
+
+services:
+  server:
+    build:
+      context: ..
+      dockerfile: server/Dockerfile
+    # Localhost-only so the admin endpoints (unauthenticated) aren't
+    # exposed to the LAN. Lets you curl it and point a native client at it.
+    ports:
+      - "127.0.0.1:7070:7070"
+    volumes:
+      - dev-server-data:/app/data
+
+  client:
+    build:
+      context: ..
+      dockerfile: client/Dockerfile
+    profiles: ["client"]   # started by dev.sh after a pairing code exists
+    depends_on:
+      - server
+    environment:
+      DELEGATION_SERVER: http://server:7070
+      PAIRING_CODE: ${PAIRING_CODE:-}
+    volumes:
+      - dev-client-identity:/root/.config/delegation-agent
+
+volumes:
+  dev-server-data:
+  dev-client-identity:

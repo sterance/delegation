@@ -1,26 +1,26 @@
+# Run from inside server/ exactly as before (`docker compose up -d --build`)
+# — `context: ..` reaches up to the repo root so the build can see the
+# shared protocol/ crate, but the command-line usage doesn't change.
 services:
   delegation-server:
-    build: .
+    build:
+      context: ..
+      dockerfile: server/Dockerfile
     restart: unless-stopped
-    env_file:
-      - ../config.env
     volumes:
       - server-data:/app/data
     # Deliberately no `ports:` mapping — cloudflared reaches this
-    # container over the internal compose network by service name
-    # (see cloudflared's ingress config), so nothing needs a host port
-    # published, which is the whole point of not opening router ports.
+    # container over the internal compose network by service name.
 
   cloudflared:
     image: cloudflare/cloudflared:latest
     restart: unless-stopped
     command: tunnel run
     environment:
-      # Create this tunnel from the Cloudflare Zero Trust dashboard
-      # (Networks > Tunnels > Create a tunnel > Docker), point its
-      # public hostname (llm.smith-c.com) at http://server:7070, and
-      # paste the token it gives you into a .env file next to this
-      # compose file as TUNNEL_TOKEN=... — nothing else to configure.
+      # Same tunnel/token as before — only the origin's internals
+      # changed (Node -> Rust); the dashboard route config does not:
+      # http://delegation-server:7070 still resolves to this same
+      # service name on the compose network.
       TUNNEL_TOKEN: ${TUNNEL_TOKEN}
     depends_on:
       - delegation-server

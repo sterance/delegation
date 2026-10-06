@@ -8,9 +8,15 @@
 # left in place because they don't hurt, but feel free to loosen them.
 FROM rust:1-slim-bookworm AS builder
 WORKDIR /build
-COPY Cargo.toml Cargo.lock ./
-COPY src ./src
-RUN cargo build --release
+# Build context is now the repo root (see client/docker-compose.yml's
+# `context: ..`), since this crate depends on the shared protocol/
+# workspace member — COPY paths below are relative to that root, not
+# to client/ itself.
+COPY Cargo.toml Cargo.lock* ./
+COPY protocol ./protocol
+COPY client ./client
+COPY server ./server
+RUN cargo build --release -p delegation-agent
 
 # ---- runtime stage ----
 FROM debian:bookworm-slim
@@ -23,7 +29,7 @@ RUN apt-get update \
     && rm -rf /var/lib/apt/lists/*
 
 COPY --from=builder /build/target/release/delegation-agent /usr/local/bin/delegation-agent
-COPY docker-entrypoint.sh /usr/local/bin/docker-entrypoint.sh
+COPY client/docker-entrypoint.sh /usr/local/bin/docker-entrypoint.sh
 RUN chmod +x /usr/local/bin/docker-entrypoint.sh
 
 # The identity file (keypair + client_id) lives here. Mount a named
