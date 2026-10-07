@@ -1,3 +1,14 @@
+# Dashboard build. Node exists only in this stage — the runtime image
+# below receives nothing but the static dist/ output, and no Node
+# process ever runs in production. package*.json are copied first so
+# the `npm ci` layer stays cached until dependencies actually change.
+FROM node:20-alpine AS frontend
+WORKDIR /build/frontend
+COPY frontend/package.json frontend/package-lock.json ./
+RUN npm ci
+COPY frontend ./
+RUN npm run build
+
 # rusqlite's `bundled` feature compiles SQLite from source as part of
 # `cargo build`, which needs a C compiler in the builder stage —
 # build-essential provides that. The runtime stage needs nothing extra:
@@ -17,6 +28,8 @@ RUN cargo build --release -p delegation-server
 
 FROM debian:bookworm-slim
 COPY --from=builder /build/target/release/delegation-server /usr/local/bin/delegation-server
+COPY --from=frontend /build/frontend/dist /app/frontend/dist
+ENV FRONTEND_DIR=/app/frontend/dist
 
 # SQLite database lives here — mount a volume at this path or every
 # container recreation starts with a totally empty client registry.

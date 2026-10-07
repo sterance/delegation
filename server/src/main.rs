@@ -24,6 +24,7 @@ use std::{
     sync::{Arc, Mutex},
     time::{Duration, Instant},
 };
+use tower_http::services::ServeDir;
 use uuid::Uuid;
 
 /// client_id -> last time we heard a heartbeat from it. Presence in this
@@ -58,19 +59,31 @@ async fn main() {
         connections: Arc::new(Mutex::new(HashMap::new())),
     };
 
+    // The built React dashboard (`npm run build` in frontend/). Default is
+    // relative so it resolves both from the repo root natively and from
+    // /app in the Docker image.
+    let frontend_dir = std::env::var("FRONTEND_DIR").unwrap_or_else(|_| "frontend/dist".to_string());
+    if !std::path::Path::new(&frontend_dir).join("index.html").is_file() {
+        log(format!("[dashboard] no index.html in {frontend_dir}, dashboard will 404 (build frontend/ first)"));
+    }
+
     let app = Router::new()
         .route("/enroll", post(enroll))
         .route("/admin/pairing-code", post(create_pairing_code))
         .route("/admin/pairing-code/:code/status", get(pairing_code_status))
         .route("/clients", get(list_clients))
         .route("/agent", get(ws_upgrade))
+        // Fallback, not a route: only requests no route above matched ever
+        // reach the static files, so the dashboard can't shadow the API.
+        .fallback_service(ServeDir::new(&frontend_dir))
         .with_state(state);
 
     let port = std::env::var("PORT").unwrap_or_else(|_| "7070".to_string());
     let addr = format!("0.0.0.0:{port}");
     log(format!("delegation-server listening on :{port}"));
-    log(format!("  enroll:  POST http://localhost:{port}/enroll"));
-    log(format!("  agent:   ws://localhost:{port}/agent"));
+    log(format!("  enroll:    POST http://localhost:{port}/enroll"));
+    log(format!("  agent:     ws://localhost:{port}/agent"));
+    log(format!("  dashboard: http://localhost:{port}/ (from {frontend_dir})"));
 
     let listener = tokio::net::TcpListener::bind(&addr).await.unwrap();
     axum::serve(listener, app).await.unwrap();

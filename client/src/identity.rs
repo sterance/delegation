@@ -22,7 +22,7 @@ pub struct Identity {
 
 fn config_dir() -> PathBuf {
     let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
-    PathBuf::from(home).join(".config").join("delegation-agent")
+    PathBuf::from(home).join(".config").join("delegation-client")
 }
 
 fn identity_path() -> PathBuf {

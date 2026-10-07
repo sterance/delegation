@@ -111,7 +111,7 @@ added to the same file as the client gains additional settings.
    (UUID), stores `{client_id, public_key, hostname}`, and returns
    `{ "client_id": "..." }`.
 4. The client saves `{client_id, private_key}` to
-   `~/.config/delegation-agent/identity.json`, permissions `0600`. This
+   `~/.config/delegation-client/identity.json`, permissions `0600`. This
    file is the client's entire identity — treat it like an SSH private key.
 
 ### 3.2 Connection handshake (every time the client connects)
@@ -169,7 +169,7 @@ npm run gen-code
 # --- client (native binary) ---
 cd client
 cargo build --release
-./target/release/delegation-agent --server http://localhost:7070 --pairing-code ABC12345
+./target/release/delegation-client --server http://localhost:7070 --pairing-code ABC12345
 #   [identity] enrolling with http://localhost:7070/enroll ...
 #   [identity] enrolled, client_id=...
 #   [ws] connecting to ws://localhost:7070/agent ...

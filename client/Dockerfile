@@ -16,7 +16,7 @@ COPY Cargo.toml Cargo.lock* ./
 COPY protocol ./protocol
 COPY client ./client
 COPY server ./server
-RUN cargo build --release -p delegation-agent
+RUN cargo build --release -p delegation-client
 
 # ---- runtime stage ----
 FROM debian:bookworm-slim
@@ -28,13 +28,13 @@ RUN apt-get update \
     && apt-get install -y --no-install-recommends hostname \
     && rm -rf /var/lib/apt/lists/*
 
-COPY --from=builder /build/target/release/delegation-agent /usr/local/bin/delegation-agent
+COPY --from=builder /build/target/release/delegation-client /usr/local/bin/delegation-client
 COPY client/docker-entrypoint.sh /usr/local/bin/docker-entrypoint.sh
 RUN chmod +x /usr/local/bin/docker-entrypoint.sh
 
 # The identity file (keypair + client_id) lives here. Mount a named
 # volume at this path — without it, every `docker compose up` after a
 # container recreation looks like a brand new, unenrolled machine.
-VOLUME /root/.config/delegation-agent
+VOLUME /root/.config/delegation-client
 
 ENTRYPOINT ["/usr/local/bin/docker-entrypoint.sh"]

@@ -26,7 +26,7 @@ case "${1:-up}" in
   up)
     $DC up -d --build server
     wait_server
-    if $DC run --rm --no-deps -T --entrypoint test client -f /root/.config/delegation-agent/identity.json 2>/dev/null; then
+    if $DC run --rm --no-deps -T --entrypoint test client -f /root/.config/delegation-client/identity.json 2>/dev/null; then
       $DC --profile client up -d --build client
     else
       PAIRING_CODE="$(mint_code)" $DC --profile client up -d --build client
@@ -40,10 +40,10 @@ case "${1:-up}" in
     wait_server
     cd ..
     OLDHOME="$HOME"
-    # Separate HOME so the dev identity never clobbers ~/.config/delegation-agent
+    # Separate HOME so the dev identity never clobbers ~/.config/delegation-client
     export HOME="$PWD/dev/.native-home"; mkdir -p "$HOME"
     export CARGO_HOME="${CARGO_HOME:-$OLDHOME/.cargo}" RUSTUP_HOME="${RUSTUP_HOME:-$OLDHOME/.rustup}"
-    exec cargo run -p delegation-agent -- --server "$URL" --pairing-code "$(mint_code)"
+    exec cargo run -p delegation-client -- --server "$URL" --pairing-code "$(mint_code)"
     ;;
   restart-server) $DC restart server ;;
   down)    $DC --profile client down ;;

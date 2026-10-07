@@ -21,14 +21,14 @@ services:
     build:
       context: ..
       dockerfile: client/Dockerfile
-    profiles: ["client"]   # started by dev.sh after a pairing code exists
+    profiles: ["client"] # started by dev.sh after a pairing code exists
     depends_on:
       - server
     environment:
       DELEGATION_SERVER: http://server:7070
       PAIRING_CODE: ${PAIRING_CODE:-}
     volumes:
-      - dev-client-identity:/root/.config/delegation-agent
+      - dev-client-identity:/root/.config/delegation-client
 
 volumes:
   dev-server-data:

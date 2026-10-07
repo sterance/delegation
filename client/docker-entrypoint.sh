@@ -12,4 +12,4 @@ if [ -n "$PAIRING_CODE" ]; then
   ARGS="$ARGS --pairing-code $PAIRING_CODE"
 fi
 
-exec /usr/local/bin/delegation-agent $ARGS
+exec /usr/local/bin/delegation-client $ARGS
