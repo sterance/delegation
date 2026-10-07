@@ -1,4 +1,4 @@
-//! Wire protocol shared by the delegation server and client agent.
+//! Wire protocol shared by the delegation server and client.
 //!
 //! This used to be two hand-maintained copies (`protocol.ts` on the
 //! server, `protocol.rs` on the client) that had to be kept in sync by
@@ -55,7 +55,7 @@ pub enum ServerMessage {
     HeartbeatAck {},
 }
 
-/// A machine-readable reason string for auth failure. The client agent
+/// A machine-readable reason string for auth failure. The client
 /// pattern-matches on this specific value to decide whether to wipe its
 /// local identity and fall back to asking for a new pairing code, rather
 /// than looping forever on a handshake that can never succeed (see the

@@ -72,7 +72,7 @@ async fn main() {
         .route("/admin/pairing-code", post(create_pairing_code))
         .route("/admin/pairing-code/:code/status", get(pairing_code_status))
         .route("/clients", get(list_clients))
-        .route("/agent", get(ws_upgrade))
+        .route("/ws", get(ws_upgrade))
         // Fallback, not a route: only requests no route above matched ever
         // reach the static files, so the dashboard can't shadow the API.
         .fallback_service(ServeDir::new(&frontend_dir))
@@ -82,7 +82,7 @@ async fn main() {
     let addr = format!("0.0.0.0:{port}");
     log(format!("delegation-server listening on :{port}"));
     log(format!("  enroll:    POST http://localhost:{port}/enroll"));
-    log(format!("  agent:     ws://localhost:{port}/agent"));
+    log(format!("  ws:        ws://localhost:{port}/ws"));
     log(format!("  dashboard: http://localhost:{port}/ (from {frontend_dir})"));
 
     let listener = tokio::net::TcpListener::bind(&addr).await.unwrap();

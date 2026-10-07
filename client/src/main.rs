@@ -44,7 +44,7 @@ fn ws_url_for(server_http_base: &str) -> String {
     } else {
         server_http_base.to_string()
     };
-    format!("{}/agent", ws_base.trim_end_matches('/'))
+    format!("{}/ws", ws_base.trim_end_matches('/'))
 }
 
 #[tokio::main]

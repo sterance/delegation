@@ -20,7 +20,7 @@ RUN cargo build --release -p delegation-client
 
 # ---- runtime stage ----
 FROM debian:bookworm-slim
-# `hostname` is used by the agent to label its heartbeats; debian-slim
+# `hostname` is used by the client to label its heartbeats; debian-slim
 # doesn't ship it by default. rustls-tls-webpki-roots (already enabled in
 # Cargo.toml) bundles its own CA roots, so no ca-certificates package is
 # needed here purely for TLS to work.

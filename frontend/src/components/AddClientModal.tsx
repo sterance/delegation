@@ -118,7 +118,7 @@ export default function AddClientModal({ open, onClose }: Props) {
         {flow.step === 'code' && (
           <>
             <Typography variant="body2" color="text.secondary">
-              Enroll the new machine's client agent with this pairing code. It's single-use and valid for 10 minutes.
+              Enroll the new machine's client with this pairing code. It's single-use and valid for 10 minutes.
             </Typography>
             <Stack direction="row" spacing={1} sx={{ alignItems: 'center', justifyContent: 'center', my: 3 }}>
               <Typography

@@ -34,7 +34,7 @@ fn identity_path() -> PathBuf {
 ///
 /// Linux-only for this scaffold (uses unix file permission bits directly
 /// to lock the private key file down to the owner). The Windows/macOS
-/// ports need their own equivalent before this agent runs there.
+/// ports need their own equivalent before this client runs there.
 pub fn load_or_enroll(server_http_base: &str, pairing_code: Option<&str>) -> Result<Identity> {
     let path = identity_path();
 

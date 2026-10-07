@@ -1,7 +1,7 @@
 # Delegation Server — Networking Scaffold Implementation Guide
 
 **Scope of this scaffold:** server core & infra, security/enrollment, and a
-minimal Linux client agent that does nothing but enroll, connect, and
+minimal Linux client that does nothing but enroll, connect, and
 heartbeat. No job queue, no inference, no dashboard, no Windows/macOS
 builds — all of that comes later. The entire point of this stage is to
 prove the networking and security model actually works before anything
@@ -18,7 +18,7 @@ broke and what that implies for the full build.
 
 ```
  ┌────────────────────┐        outbound WSS/HTTPS         ┌──────────────────────┐
- │   Client Agent      │ ───────────────────────────────▶ │  Cloudflare Tunnel    │
+ │   Client            │ ───────────────────────────────▶ │  Cloudflare Tunnel    │
  │  (Rust, Linux only) │                                   │  (llm.smith-c.com)   │
  └────────────────────┘                                   └──────────┬───────────┘
                                                                        │
@@ -26,7 +26,7 @@ broke and what that implies for the full build.
                                                             │  Delegation Server    │
                                                             │  (Node/TS, Docker)    │
                                                             │  - /enroll  (HTTP)    │
-                                                            │  - /agent   (WS)      │
+                                                            │  - /ws      (WS)      │
                                                             │  - file-backed store  │
                                                             └───────────────────────┘
 ```
@@ -52,7 +52,7 @@ scaffold/
 │   ├── Dockerfile           # node:20-alpine, multi-stage
 │   └── docker-compose.yml   # server + cloudflared, for real deployment
 │
-└── client/                  # Rust client agent (Linux-only for now)
+└── client/                  # Rust client (Linux-only for now)
     ├── src/
     │   ├── main.rs          # connect, handshake, heartbeat loop, reconnect/backoff
     │   ├── identity.rs      # keypair generation, persistence, enrollment
@@ -60,7 +60,7 @@ scaffold/
     ├── Cargo.toml
     ├── Dockerfile           # multi-stage: rust:1-slim-bookworm → debian:bookworm-slim
     ├── docker-entrypoint.sh
-    └── docker-compose.yml   # for running the agent itself in a container
+    └── docker-compose.yml   # for running the client itself in a container
 ```
 
 ### Shared configuration
@@ -158,7 +158,7 @@ npm run build
 npm start
 #   listening on :7070
 #   enroll:  POST http://localhost:7070/enroll
-#   agent:   ws://localhost:7070/agent
+#   ws:      ws://localhost:7070/ws
 
 # in another terminal, mint a pairing code:
 npm run gen-code
@@ -172,7 +172,7 @@ cargo build --release
 ./target/release/delegation-client --server http://localhost:7070 --pairing-code ABC12345
 #   [identity] enrolling with http://localhost:7070/enroll ...
 #   [identity] enrolled, client_id=...
-#   [ws] connecting to ws://localhost:7070/agent ...
+#   [ws] connecting to ws://localhost:7070/ws ...
 #   [ws] authenticated
 #   [heartbeat] sent / acked, according to CLIENT_HEARTBEAT_INTERVAL_MS
 ```
@@ -189,7 +189,7 @@ echo "PAIRING_CODE=ABC12345" >> .env
 docker compose up --build
 ```
 
-The identity persists in a named Docker volume (`agent-identity`), so
+The identity persists in a named Docker volume (`client-identity`), so
 `docker compose up` again later — even after removing and recreating the
 container — reconnects with the same identity rather than re-enrolling.
 Once enrolled, `PAIRING_CODE` in `.env` is harmless to leave in place; it's
@@ -211,7 +211,7 @@ single-use server-side and only ever read if no identity file exists yet.
    docker compose up -d --build
    ```
 3. Mint a pairing code on the server (`docker compose exec server node dist/gen-code.js`),
-   and enroll a real client agent against `https://llm.smith-c.com` instead
+   and enroll a real client against `https://llm.smith-c.com` instead
    of `http://localhost:7070`. Everything else about the protocol is
    identical — only the URL changes.
 4. **Alpine/Pi note:** the server's Dockerfile is pinned to pure-JS

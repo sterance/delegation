@@ -8,7 +8,7 @@ services:
       DELEGATION_SERVER: ${DELEGATION_SERVER:-https://llm.smith-c.com}
       PAIRING_CODE: ${PAIRING_CODE:-}
     volumes:
-      - agent-identity:/root/.config/delegation-client
+      - client-identity:/root/.config/delegation-client
 
 volumes:
-  agent-identity:
+  client-identity:
