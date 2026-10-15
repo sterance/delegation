@@ -8,6 +8,8 @@
 
 use serde::{Deserialize, Serialize};
 
+pub mod config;
+
 // ---- enrollment (HTTP) ----
 
 #[derive(Serialize, Deserialize)]

@@ -4,15 +4,32 @@ use anyhow::{bail, Context, Result};
 use base64::{engine::general_purpose::STANDARD, Engine as _};
 use ed25519_dalek::Signer;
 use futures_util::{SinkExt, StreamExt};
-use protocol::{ts, ClientMessage, ServerMessage, AUTH_FAILED_UNKNOWN_CLIENT};
+use protocol::{config::Config, ts, ClientMessage, ServerMessage, AUTH_FAILED_UNKNOWN_CLIENT};
 use std::time::{Duration, Instant};
 use tokio_tungstenite::tungstenite::Message;
 
-/// How long we'll tolerate going without a heartbeat_ack before treating
-/// the connection as dead and forcing a reconnect. This is what catches
-/// a silently dropped connection (dead wifi, out-of-range client) that
-/// never produces a transport-level error — see the hurdles writeup.
-const ACK_TIMEOUT: Duration = Duration::from_secs(30);
+/// The CLIENT_*_MS values from config.env.
+struct Timings {
+    /// How long we'll tolerate going without a heartbeat_ack before treating
+    /// the connection as dead and forcing a reconnect. This is what catches
+    /// a silently dropped connection (dead wifi, out-of-range client) that
+    /// never produces a transport-level error — see the hurdles writeup.
+    ack_timeout: Duration,
+    heartbeat_interval: Duration,
+    reconnect_initial_backoff: Duration,
+    reconnect_max_backoff: Duration,
+}
+
+impl Timings {
+    fn from_config(config: &Config) -> Self {
+        Timings {
+            ack_timeout: config.ms("CLIENT_ACK_TIMEOUT_MS", 30_000),
+            heartbeat_interval: config.ms("CLIENT_HEARTBEAT_INTERVAL_MS", 10_000),
+            reconnect_initial_backoff: config.ms("CLIENT_RECONNECT_INITIAL_BACKOFF_MS", 1_000),
+            reconnect_max_backoff: config.ms("CLIENT_RECONNECT_MAX_BACKOFF_MS", 30_000),
+        }
+    }
+}
 
 struct Args {
     server: String, // e.g. "http://localhost:8080" or "https://llm.smith-c.com"
@@ -50,6 +67,22 @@ fn ws_url_for(server_http_base: &str) -> String {
 #[tokio::main]
 async fn main() -> Result<()> {
     let args = parse_args()?;
+    // Natively the working directory is usually wherever the user ran it
+    // from (or $HOME under systemd), so also look next to the identity file.
+    let config = Config::load(&["config.env".into(), identity::config_dir().join("config.env")]);
+    let timings = Timings::from_config(&config);
+    match config.source() {
+        Some(path) => println!("[{}] [config] loaded {}", ts(), path.display()),
+        None => println!("[{}] [config] no config file, using environment and defaults", ts()),
+    }
+    println!(
+        "[{}] [config] heartbeat every {:?}, ack timeout {:?}, reconnect backoff {:?}..{:?}",
+        ts(),
+        timings.heartbeat_interval,
+        timings.ack_timeout,
+        timings.reconnect_initial_backoff,
+        timings.reconnect_max_backoff
+    );
     let identity = identity::load_or_enroll(&args.server, args.pairing_code.as_deref())?;
     let ws_url = ws_url_for(&args.server);
 
@@ -57,15 +90,15 @@ async fn main() -> Result<()> {
     // testing hardest once this is on a real home connection instead of
     // localhost: kill the tunnel mid-session and confirm this recovers
     // cleanly rather than spinning or silently dying.
-    let mut backoff = Duration::from_secs(1);
+    let mut backoff = timings.reconnect_initial_backoff;
     loop {
         println!("[{}] [ws] connecting to {ws_url} ...", ts());
-        match run_session(&ws_url, &identity).await {
+        match run_session(&ws_url, &identity, &timings).await {
             Ok(()) => println!("[{}] [ws] session ended cleanly, reconnecting in {backoff:?}", ts()),
             Err(e) => eprintln!("[{}] [ws] session error: {e:#}. Reconnecting in {backoff:?}", ts()),
         }
         tokio::time::sleep(backoff).await;
-        backoff = std::cmp::min(backoff * 2, Duration::from_secs(30));
+        backoff = std::cmp::min(backoff * 2, timings.reconnect_max_backoff);
     }
 }
 
@@ -86,7 +119,7 @@ fn handle_unknown_client() -> ! {
     std::process::exit(1);
 }
 
-async fn run_session(ws_url: &str, identity: &identity::Identity) -> Result<()> {
+async fn run_session(ws_url: &str, identity: &identity::Identity, timings: &Timings) -> Result<()> {
     let (ws_stream, _) = tokio_tungstenite::connect_async(ws_url)
         .await
         .context("websocket connect failed")?;
@@ -142,7 +175,7 @@ async fn run_session(ws_url: &str, identity: &identity::Identity) -> Result<()> 
     // indefinitely for a "last" ack that never came.
     let mut last_ack = Instant::now();
 
-    let mut ticker = tokio::time::interval(Duration::from_secs(10));
+    let mut ticker = tokio::time::interval(timings.heartbeat_interval);
     loop {
         tokio::select! {
             _ = ticker.tick() => {
@@ -151,7 +184,7 @@ async fn run_session(ws_url: &str, identity: &identity::Identity) -> Result<()> 
                 // an ack in a while, the server has likely already given up
                 // on us (its own heartbeat-timeout sweep) — don't wait for
                 // an OS-level TCP error that may never come.
-                if last_ack.elapsed() > ACK_TIMEOUT {
+                if last_ack.elapsed() > timings.ack_timeout {
                     bail!("no heartbeat_ack received in {:?}, treating connection as dead", last_ack.elapsed());
                 }
                 let timestamp = now_ms();

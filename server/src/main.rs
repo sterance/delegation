@@ -14,7 +14,7 @@ use base64::{engine::general_purpose::STANDARD, Engine as _};
 use db::Db;
 use ed25519_dalek::{Signature, Verifier, VerifyingKey};
 use protocol::{
-    ClientMessage, EnrollError, EnrollRequest, EnrollResponse, ServerMessage,
+    config::Config, ClientMessage, EnrollError, EnrollRequest, EnrollResponse, ServerMessage,
     AUTH_FAILED_UNKNOWN_CLIENT,
 };
 use rand::Rng;
@@ -37,10 +37,17 @@ type Connections = Arc<Mutex<HashMap<String, Instant>>>;
 struct AppState {
     db: Db,
     connections: Connections,
+    timings: Timings,
 }
 
-const HEARTBEAT_TIMEOUT: Duration = Duration::from_secs(30);
-const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
+/// The SERVER_*_MS values from config.env.
+#[derive(Clone, Copy)]
+struct Timings {
+    auth_timeout: Duration,
+    heartbeat_timeout: Duration,
+    heartbeat_sweep_interval: Duration,
+    pairing_code_ttl: Duration,
+}
 
 fn log(msg: impl AsRef<str>) {
     println!("[{}] {}", protocol::ts(), msg.as_ref());
@@ -48,7 +55,23 @@ fn log(msg: impl AsRef<str>) {
 
 #[tokio::main]
 async fn main() {
-    let db_path = std::env::var("DB_PATH").unwrap_or_else(|_| "data/delegation.db".to_string());
+    let config = Config::load(&["config.env".into()]);
+    let timings = Timings {
+        auth_timeout: config.ms("SERVER_AUTH_TIMEOUT_MS", 5_000),
+        heartbeat_timeout: config.ms("SERVER_HEARTBEAT_TIMEOUT_MS", 30_000),
+        heartbeat_sweep_interval: config.ms("SERVER_HEARTBEAT_SWEEP_INTERVAL_MS", 10_000),
+        pairing_code_ttl: config.ms("SERVER_PAIRING_CODE_TTL_MS", 600_000),
+    };
+    match config.source() {
+        Some(path) => log(format!("[config] loaded {}", path.display())),
+        None => log("[config] no config file, using environment and defaults"),
+    }
+    log(format!(
+        "[config] auth timeout {:?}, heartbeat timeout {:?}, sweep every {:?}, pairing code TTL {:?}",
+        timings.auth_timeout, timings.heartbeat_timeout, timings.heartbeat_sweep_interval, timings.pairing_code_ttl
+    ));
+
+    let db_path = config.string("DB_PATH", "data/delegation.db");
     if let Some(parent) = std::path::Path::new(&db_path).parent() {
         std::fs::create_dir_all(parent).ok();
     }
@@ -57,12 +80,13 @@ async fn main() {
     let state = AppState {
         db,
         connections: Arc::new(Mutex::new(HashMap::new())),
+        timings,
     };
 
     // The built React dashboard (`npm run build` in frontend/). Default is
     // relative so it resolves both from the repo root natively and from
     // /app in the Docker image.
-    let frontend_dir = std::env::var("FRONTEND_DIR").unwrap_or_else(|_| "frontend/dist".to_string());
+    let frontend_dir = config.string("FRONTEND_DIR", "frontend/dist");
     if !std::path::Path::new(&frontend_dir).join("index.html").is_file() {
         log(format!("[dashboard] no index.html in {frontend_dir}, dashboard will 404 (build frontend/ first)"));
     }
@@ -78,7 +102,7 @@ async fn main() {
         .fallback_service(ServeDir::new(&frontend_dir))
         .with_state(state);
 
-    let port = std::env::var("PORT").unwrap_or_else(|_| "7070".to_string());
+    let port = config.u64("SERVER_PORT", 7070);
     let addr = format!("0.0.0.0:{port}");
     log(format!("delegation-server listening on :{port}"));
     log(format!("  enroll:    POST http://localhost:{port}/enroll"));
@@ -123,7 +147,7 @@ struct PairingCodeResponse {
 
 async fn create_pairing_code(State(state): State<AppState>) -> impl IntoResponse {
     let code = random_code();
-    match db::create_pairing_code(&state.db, 600, &code) {
+    match db::create_pairing_code(&state.db, state.timings.pairing_code_ttl.as_secs().max(1) as i64, &code) {
         Ok(()) => {
             log(format!("[admin] pairing code generated: {code}"));
             Json(PairingCodeResponse { code }).into_response()
@@ -223,7 +247,7 @@ async fn recv_within(socket: &mut WebSocket, timeout: Duration) -> Option<Client
 }
 
 async fn handle_socket(mut socket: WebSocket, state: AppState) {
-    let Some(ClientMessage::Hello { client_id }) = recv_within(&mut socket, HANDSHAKE_TIMEOUT).await else {
+    let Some(ClientMessage::Hello { client_id }) = recv_within(&mut socket, state.timings.auth_timeout).await else {
         log("[ws] handshake timed out or malformed hello, closing");
         return;
     };
@@ -241,7 +265,7 @@ async fn handle_socket(mut socket: WebSocket, state: AppState) {
     }
 
     let Some(ClientMessage::ChallengeResponse { signature }) =
-        recv_within(&mut socket, HANDSHAKE_TIMEOUT).await
+        recv_within(&mut socket, state.timings.auth_timeout).await
     else {
         log(format!("[ws] {client_id} didn't respond to challenge in time"));
         return;
@@ -266,7 +290,7 @@ async fn handle_socket(mut socket: WebSocket, state: AppState) {
     send(&mut socket, &ServerMessage::AuthOk {}).await;
     state.connections.lock().unwrap().insert(client_id.clone(), Instant::now());
 
-    let mut ticker = tokio::time::interval(Duration::from_secs(10));
+    let mut ticker = tokio::time::interval(state.timings.heartbeat_sweep_interval);
     ticker.tick().await; // first tick is immediate; consume it so we don't false-positive on the opening tick
 
     loop {
@@ -274,7 +298,7 @@ async fn handle_socket(mut socket: WebSocket, state: AppState) {
             _ = ticker.tick() => {
                 let stale = state.connections.lock().unwrap()
                     .get(&client_id)
-                    .map(|last| last.elapsed() > HEARTBEAT_TIMEOUT)
+                    .map(|last| last.elapsed() > state.timings.heartbeat_timeout)
                     .unwrap_or(true);
                 if stale {
                     log(format!("[heartbeat] client {client_id} timed out, closing"));

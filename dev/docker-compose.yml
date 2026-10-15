@@ -10,6 +10,11 @@ services:
     build:
       context: ..
       dockerfile: server/Dockerfile
+    # Shared settings (see config.env.example). Optional: without it the
+    # binary uses its built-in defaults.
+    env_file:
+      - path: ../config.env
+        required: false
     # Localhost-only so the admin endpoints (unauthenticated) aren't
     # exposed to the LAN. Lets you curl it and point a native client at it.
     ports:
@@ -21,6 +26,11 @@ services:
     build:
       context: ..
       dockerfile: client/Dockerfile
+    # Shared settings (see config.env.example). Optional: without it the
+    # binary uses its built-in defaults.
+    env_file:
+      - path: ../config.env
+        required: false
     profiles: ["client"] # started by dev.sh after a pairing code exists
     depends_on:
       - server

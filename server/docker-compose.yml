@@ -7,6 +7,11 @@ services:
       context: ..
       dockerfile: server/Dockerfile
     restart: unless-stopped
+    # Shared settings (see config.env.example). Optional: without it the
+    # binary uses its built-in defaults.
+    env_file:
+      - path: ../config.env
+        required: false
     volumes:
       - server-data:/app/data
     # Deliberately no `ports:` mapping — cloudflared reaches this
