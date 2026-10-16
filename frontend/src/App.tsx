@@ -134,7 +134,7 @@ export default function App() {
         )}
 
         {clients ? (
-          <ClientList clients={clients} />
+          <ClientList clients={clients} refresh={refresh} />
         ) : (
           !error && (
             <Box sx={{ display: 'flex', justifyContent: 'center', py: 6 }}>

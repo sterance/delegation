@@ -7,18 +7,18 @@ use axum::{
     },
     http::StatusCode,
     response::IntoResponse,
-    routing::{get, post},
+    routing::{get, patch, post},
     Json, Router,
 };
 use base64::{engine::general_purpose::STANDARD, Engine as _};
 use db::Db;
 use ed25519_dalek::{Signature, Verifier, VerifyingKey};
 use protocol::{
-    config::Config, ClientMessage, EnrollError, EnrollRequest, EnrollResponse, ServerMessage,
-    AUTH_FAILED_UNKNOWN_CLIENT,
+    config::Config, AuthFailedReason, ClientMessage, EnrollError, EnrollRequest, EnrollResponse, HardwareSpecs,
+    ServerMessage,
 };
 use rand::Rng;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::{
     collections::HashMap,
     sync::{Arc, Mutex},
@@ -88,7 +88,9 @@ async fn main() {
     // /app in the Docker image.
     let frontend_dir = config.string("FRONTEND_DIR", "frontend/dist");
     if !std::path::Path::new(&frontend_dir).join("index.html").is_file() {
-        log(format!("[dashboard] no index.html in {frontend_dir}, dashboard will 404 (build frontend/ first)"));
+        log(format!(
+            "[dashboard] no index.html in {frontend_dir}, dashboard will 404 (build frontend/ first)"
+        ));
     }
 
     let app = Router::new()
@@ -96,6 +98,7 @@ async fn main() {
         .route("/admin/pairing-code", post(create_pairing_code))
         .route("/admin/pairing-code/:code/status", get(pairing_code_status))
         .route("/clients", get(list_clients))
+        .route("/clients/:client_id", patch(update_client).delete(delete_client))
         .route("/ws", get(ws_upgrade))
         // Fallback, not a route: only requests no route above matched ever
         // reach the static files, so the dashboard can't shadow the API.
@@ -124,12 +127,19 @@ async fn enroll(State(state): State<AppState>, Json(req): Json<EnrollRequest>) -
         }
         Ok(db::EnrollOutcome::InvalidCode) => (
             StatusCode::FORBIDDEN,
-            Json(EnrollError { error: "invalid or expired pairing code".into() }),
+            Json(EnrollError {
+                error: "invalid or expired pairing code".into(),
+            }),
         )
             .into_response(),
         Err(e) => {
             log(format!("[enroll] error: {e:#}"));
-            (StatusCode::INTERNAL_SERVER_ERROR, Json(EnrollError { error: "internal error".into() }))
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(EnrollError {
+                    error: "internal error".into(),
+                }),
+            )
                 .into_response()
         }
     }
@@ -173,16 +183,16 @@ struct ClaimedClient {
 
 /// Polled by the "Add client" modal: once `claimed_by` is populated, the
 /// modal swaps from showing the code to showing the new client's info.
-async fn pairing_code_status(
-    State(state): State<AppState>,
-    Path(code): Path<String>,
-) -> impl IntoResponse {
+async fn pairing_code_status(State(state): State<AppState>, Path(code): Path<String>) -> impl IntoResponse {
     match db::pairing_code_status(&state.db, &code) {
         Ok(Some((used, Some(client_id)))) => {
             let claimed_by = db::get_client(&state.db, &client_id)
                 .ok()
                 .flatten()
-                .map(|c| ClaimedClient { client_id: c.client_id, hostname: c.hostname });
+                .map(|c| ClaimedClient {
+                    client_id: c.client_id,
+                    hostname: c.hostname,
+                });
             Json(PairingStatusResponse { used, claimed_by }).into_response()
         }
         Ok(Some((used, None))) => Json(PairingStatusResponse { used, claimed_by: None }).into_response(),
@@ -198,9 +208,17 @@ async fn pairing_code_status(
 struct ClientListEntry {
     client_id: String,
     hostname: String,
+    /// What the dashboard displays: set by the user, or the hostname.
+    friendly_name: String,
     enrolled_at: String,
     last_seen_at: Option<String>,
     connected: bool,
+    /// The rest come from the client's `info` message, so they're null
+    /// until a new-enough client has connected at least once.
+    os: Option<String>,
+    client_version: Option<String>,
+    specs: Option<HardwareSpecs>,
+    info_updated_at: Option<String>,
 }
 
 async fn list_clients(State(state): State<AppState>) -> impl IntoResponse {
@@ -213,14 +231,72 @@ async fn list_clients(State(state): State<AppState>) -> impl IntoResponse {
                     connected: connections.contains_key(&r.client_id),
                     client_id: r.client_id,
                     hostname: r.hostname,
+                    friendly_name: r.friendly_name,
                     enrolled_at: r.enrolled_at,
                     last_seen_at: r.last_seen_at,
+                    os: r.os,
+                    client_version: r.client_version,
+                    specs: r.specs_json.and_then(|json| serde_json::from_str(&json).ok()),
+                    info_updated_at: r.info_updated_at,
                 })
                 .collect();
             Json(entries).into_response()
         }
         Err(e) => {
             log(format!("[clients] error: {e:#}"));
+            StatusCode::INTERNAL_SERVER_ERROR.into_response()
+        }
+    }
+}
+
+const MAX_FRIENDLY_NAME_CHARS: usize = 64;
+
+#[derive(Deserialize)]
+struct UpdateClientRequest {
+    /// Blank or null resets to the hostname.
+    friendly_name: Option<String>,
+}
+
+async fn update_client(
+    State(state): State<AppState>,
+    Path(client_id): Path<String>,
+    Json(req): Json<UpdateClientRequest>,
+) -> impl IntoResponse {
+    let name = req.friendly_name.as_deref().map(str::trim).filter(|n| !n.is_empty());
+    if name.is_some_and(|n| n.chars().count() > MAX_FRIENDLY_NAME_CHARS) {
+        return (
+            StatusCode::BAD_REQUEST,
+            format!("friendly_name is longer than {MAX_FRIENDLY_NAME_CHARS} characters"),
+        )
+            .into_response();
+    }
+    match db::set_friendly_name(&state.db, &client_id, name) {
+        Ok(true) => {
+            log(format!("[admin] {client_id} friendly name set to {name:?}"));
+            StatusCode::NO_CONTENT.into_response()
+        }
+        Ok(false) => StatusCode::NOT_FOUND.into_response(),
+        Err(e) => {
+            log(format!("[admin] error renaming {client_id}: {e:#}"));
+            StatusCode::INTERNAL_SERVER_ERROR.into_response()
+        }
+    }
+}
+
+/// Removes the client from the database. If it's connected, its socket is
+/// closed at the next heartbeat or sweep (see handle_socket); it then
+/// reconnects, gets `unknown_client`, and clears its own identity.
+async fn delete_client(State(state): State<AppState>, Path(client_id): Path<String>) -> impl IntoResponse {
+    match db::delete_client(&state.db, &client_id) {
+        Ok(true) => {
+            // Dropping it from the map makes the next sweep treat it as stale.
+            state.connections.lock().unwrap().remove(&client_id);
+            log(format!("[admin] client {client_id} deleted"));
+            StatusCode::NO_CONTENT.into_response()
+        }
+        Ok(false) => StatusCode::NOT_FOUND.into_response(),
+        Err(e) => {
+            log(format!("[admin] error deleting {client_id}: {e:#}"));
             StatusCode::INTERNAL_SERVER_ERROR.into_response()
         }
     }
@@ -233,7 +309,9 @@ async fn ws_upgrade(ws: WebSocketUpgrade, State(state): State<AppState>) -> impl
 }
 
 async fn send(socket: &mut WebSocket, msg: &ServerMessage) -> bool {
-    let Ok(text) = serde_json::to_string(msg) else { return false };
+    let Ok(text) = serde_json::to_string(msg) else {
+        return false;
+    };
     socket.send(Message::Text(text)).await.is_ok()
 }
 
@@ -254,13 +332,26 @@ async fn handle_socket(mut socket: WebSocket, state: AppState) {
 
     let Ok(Some(record)) = db::get_client(&state.db, &client_id) else {
         log(format!("[ws] unknown client_id {client_id}"));
-        send(&mut socket, &ServerMessage::AuthFailed { reason: AUTH_FAILED_UNKNOWN_CLIENT.to_string() }).await;
+        send(
+            &mut socket,
+            &ServerMessage::AuthFailed {
+                reason: AuthFailedReason::UnknownClient,
+            },
+        )
+        .await;
         return;
     };
 
     let mut nonce = [0u8; 16];
     rand::thread_rng().fill(&mut nonce);
-    if !send(&mut socket, &ServerMessage::Challenge { nonce: STANDARD.encode(nonce) }).await {
+    if !send(
+        &mut socket,
+        &ServerMessage::Challenge {
+            nonce: STANDARD.encode(nonce),
+        },
+    )
+    .await
+    {
         return;
     }
 
@@ -282,13 +373,25 @@ async fn handle_socket(mut socket: WebSocket, state: AppState) {
 
     if !valid {
         log(format!("[ws] bad signature from {client_id}"));
-        send(&mut socket, &ServerMessage::AuthFailed { reason: "signature verification failed".into() }).await;
+        send(
+            &mut socket,
+            &ServerMessage::AuthFailed {
+                reason: AuthFailedReason::BadSignature,
+            },
+        )
+        .await;
         return;
     }
 
     log(format!("[ws] client {client_id} authenticated"));
+    // For log lines only; updated if the client reports a new name.
+    let mut hostname = record.hostname;
     send(&mut socket, &ServerMessage::AuthOk {}).await;
-    state.connections.lock().unwrap().insert(client_id.clone(), Instant::now());
+    state
+        .connections
+        .lock()
+        .unwrap()
+        .insert(client_id.clone(), Instant::now());
 
     let mut ticker = tokio::time::interval(state.timings.heartbeat_sweep_interval);
     ticker.tick().await; // first tick is immediate; consume it so we don't false-positive on the opening tick
@@ -309,9 +412,26 @@ async fn handle_socket(mut socket: WebSocket, state: AppState) {
                 match msg {
                     Some(Ok(Message::Text(text))) => {
                         match serde_json::from_str::<ClientMessage>(&text) {
-                            Ok(ClientMessage::Heartbeat { timestamp: _, hostname }) => {
+                            Ok(ClientMessage::Info { hostname: new_hostname, os, client_version, specs }) => {
+                                let specs_json = serde_json::to_string(&specs).unwrap_or_else(|_| "{}".into());
+                                match db::update_client_info(
+                                    &state.db, &client_id, &new_hostname, &os, &client_version, &specs_json,
+                                ) {
+                                    Ok(()) => log(format!(
+                                        "[info] {client_id} ({new_hostname}): {os}, client {client_version}"
+                                    )),
+                                    Err(e) => log(format!("[info] error saving info for {client_id}: {e:#}")),
+                                }
+                                hostname = new_hostname;
+                            }
+                            Ok(ClientMessage::Heartbeat { timestamp: _ }) => {
+                                // Checked before re-inserting into the map, so a
+                                // heartbeat can't resurrect a deleted client.
+                                if let Ok(false) = db::touch_last_seen(&state.db, &client_id) {
+                                    log(format!("[ws] client {client_id} was deleted, closing"));
+                                    break;
+                                }
                                 state.connections.lock().unwrap().insert(client_id.clone(), Instant::now());
-                                let _ = db::touch_last_seen(&state.db, &client_id);
                                 log(format!("[heartbeat] {client_id} ({hostname})"));
                                 if !send(&mut socket, &ServerMessage::HeartbeatAck {}).await {
                                     break;
@@ -335,7 +455,5 @@ async fn handle_socket(mut socket: WebSocket, state: AppState) {
 fn random_code() -> String {
     const CHARS: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
     let mut rng = rand::thread_rng();
-    (0..8)
-        .map(|_| CHARS[rng.gen_range(0..CHARS.len())] as char)
-        .collect()
+    (0..8).map(|_| CHARS[rng.gen_range(0..CHARS.len())] as char).collect()
 }

@@ -8,7 +8,7 @@ The repo has four parts:
 | Path        | What it is                                                                        |
 | ----------- | --------------------------------------------------------------------------------- |
 | `server/`   | Rust (axum) coordinator: enrollment, WebSocket auth and heartbeats, SQLite store  |
-| `client/`   | Rust client: enrolls once, then keeps an authenticated WebSocket open (Linux only)  |
+| `client/`   | Rust client library with two front ends: the headless `delegation-client` (Linux, Docker) and the `delegation-tray` Windows tray app. Enrolls once, then keeps an authenticated WebSocket open and reports the machine's hardware |
 | `protocol/` | Message types shared by the server and client                                      |
 | `frontend/` | React + MUI dashboard. Built into static files that the server binary serves       |
 
@@ -190,7 +190,9 @@ Nothing is tied to particular hardware, but a few constraints apply:
 - **OS:** any Linux distro that runs Docker for the server. Native clients
   must be Linux; the identity file relies on Unix permission bits. Windows and
   macOS hosts can run the client only in Docker.
-- **CPU architecture:** no prebuilt images are published. Every image is built
+- **CPU architecture:** only the server image is prebuilt, by the Deploy
+  workflow (§2.8), for `linux/amd64` unless you add more platforms. Otherwise
+  every image is built
   from source, normally on the machine that runs it. This works the same on
   `x86_64` and `arm64` (for example a Raspberry Pi 4/5) because the base images
   (`rust:1-slim-bookworm`, `debian:bookworm-slim`, `node:20-alpine`) are
@@ -307,6 +309,23 @@ docker compose logs -f     # expect: enrolled, client_id=... / authenticated / h
 To tune client timings, put a `config.env` in the repo root (`cp
 config.env.example config.env`). Compose passes it to the container.
 
+**Hardware report.** The compose file mounts the host's `/` read-only at
+`/hostfs` and its SMBIOS table at `/hostdmi`, so the dashboard shows the
+host's disks, free space, OS and RAM type rather than the container's.
+This gives code in the container read access to everything on the host,
+SSH keys included. It is only the client binary, but if you'd rather not,
+delete the `/:/hostfs:ro` volume and the `DELEGATION_HOST_ROOT` variable;
+the client then reports the container's view of disks and OS.
+
+GPUs need an override file on top of the base one:
+
+```bash
+# NVIDIA (needs the NVIDIA Container Toolkit on the host)
+docker compose -f docker-compose.yml -f docker-compose.gpu.yml up -d --build
+# AMD
+docker compose -f docker-compose.yml -f docker-compose.amd.yml up -d --build
+```
+
 The identity is stored in the named volume `client-identity`. You can leave
 `PAIRING_CODE` in `.env` after enrollment because the client ignores it once
 an identity exists. **Don't run `docker compose down -v`**: deleting the
@@ -332,6 +351,11 @@ delegation-client --server https://llm.smith-c.com --pairing-code ABC12345
 # 4. Optional: client timings (CLIENT_* keys, see §1.8)
 cp config.env.example ~/.config/delegation-client/config.env
 ```
+
+Running as a normal user, the hardware report can't read the SMBIOS table,
+so the dashboard shows RAM size but not its type or speed. Everything else
+(CPU, GPUs, disks) works without root. `delegation-client --dump-specs`
+prints what would be reported.
 
 Then run it as a systemd user service so it survives logouts and reboots:
 
@@ -361,8 +385,37 @@ journalctl --user -u delegation-client -f
 Back up `~/.config/delegation-client/identity.json` like an SSH private key.
 It is the client's whole identity.
 
+#### Option C: Windows tray app
+
+The installer is built by the **Windows** GitHub Actions workflow on every
+push to `main` and every PR (or run it by hand from the Actions tab).
+Download `DelegationTray-Setup-<version>` from the run's Artifacts.
+
+It installs per user into `%LOCALAPPDATA%\Programs\Delegation` (no admin
+prompt), starts at login, and offers to launch at the end. It isn't code
+signed, so SmartScreen warns: choose **More info → Run anyway**.
+
+On first launch the "Add server" window opens: enter the server URL, then
+the pairing code. The tray menu lists every saved server; the active one
+has a green (connected) or red (disconnected) dot. Click it to toggle,
+click another server to switch to it, or use **Add server…** for more.
+
+Files:
+
+| Path                                          | What                                          |
+| --------------------------------------------- | --------------------------------------------- |
+| `%APPDATA%\delegation-client\servers.json`    | Saved servers with their private keys         |
+| `%APPDATA%\delegation-client\config.env`      | Optional client timings (see §1.8)            |
+| `%LOCALAPPDATA%\delegation-client\tray.log`   | Log (rotated at 1 MB)                         |
+
+Uninstalling removes the app and the login entry but deliberately leaves
+`servers.json`, since it holds the keys; delete the folder by hand to
+forget all pairings. To remove one saved server, quit the tray and edit
+`servers.json`. `delegation-tray.exe --dump-specs` prints the hardware
+report.
+
 **Verify:** the client shows up on the dashboard with a green status dot
-within a few seconds.
+within a few seconds, and its card's details list its hardware.
 
 ### 2.4 Low-memory or slow hosts: build elsewhere
 
@@ -407,8 +460,13 @@ than a native build.
 
 ### 2.5 Updating
 
+**Update the server before the clients** whenever the protocol changes.
+A new server accepts old clients, but an old server doesn't understand a
+new client's heartbeats and never acks them, so the client keeps timing out
+and reconnecting.
+
 ```bash
-# server host
+# server host (skip this if the Deploy workflow is set up; see §2.8)
 cd delegation && git pull
 cd server && docker compose up -d --build     # DB persists in the server-data volume
 
@@ -454,5 +512,123 @@ pairing code: wipe its identity file or volume, then enroll again.
 | Client authenticates then loops reconnecting      | `/ws` is behind Access, or WebSockets are disabled for the zone (Cloudflare → Network → WebSockets)            |
 | Enroll rejected                                   | Code is expired (10 min), already used, or mistyped. Mint a new one                                            |
 | Client's `client_id` unknown at handshake         | Server DB was wiped or replaced. Delete the client's identity and re-enroll                                    |
+| Card says "No hardware info yet"                  | The client predates hardware reporting, or hasn't connected since the server was updated. Update the client    |
+| RAM type/speed shows `—`                          | Native Linux client running as a normal user (no SMBIOS access). Expected; run as root or in Docker to get it  |
+| New client keeps reconnecting after "authenticated" | The server is older than the client. Update the server first (§2.5)                                          |
 | `cargo build` fails with "edition 2024" errors    | Toolchain is too old. Use rustup stable, not the distro `rustc`                                                |
 | Build killed with no error on small hosts         | Out of memory. See §2.4                                                                                        |
+
+### 2.8 Automated server deploys (GitHub Actions)
+
+`.github/workflows/deploy.yml` deploys the server once CI passes on `main`:
+
+1. **publish** builds `server/Dockerfile` and pushes it to the private GHCR
+   package `ghcr.io/sterance/delegation-server`, tagged with the commit SHA
+   and `latest`.
+2. **deploy** runs in the `production` environment. It SSHes to the host
+   through the Cloudflare Tunnel, authenticating to Access with a service
+   token, and runs `server/deploy.sh deploy <sha>`. The job's `GITHUB_TOKEN`
+   is sent over stdin so the host can pull the private image. It is used for
+   that one pull and never stored on the host.
+3. **`deploy.sh`** pulls the image, records it in `server/.env`
+   (`DELEGATION_IMAGE`, `DELEGATION_TAG`), recreates the stack without
+   building, and probes `/clients` for up to 60 s. If the probe fails, it
+   switches back to the previous image and the job fails. It keeps the
+   current and previous image and deletes older tags.
+
+The host never opens an inbound port. The SSH key can only run `deploy.sh`.
+
+To redeploy or roll back from GitHub, run the workflow manually (**Actions →
+Deploy → Run workflow**). Leave `image_tag` empty to build and deploy the
+selected branch, or enter an already-published commit SHA. On the host,
+`server/deploy.sh rollback` swaps back to the previous image, and
+`server/deploy.sh status` shows what is running.
+
+**What CI does not update:** `deploy.sh` deploys only the image. Changes to
+`server/docker-compose.yml`, `deploy.sh` itself or `config.env` still need
+`git pull` on the host, followed by `server/deploy.sh deploy <current sha>`
+or `docker compose up -d`. This is deliberate. A compose file can mount the
+host's filesystem, so letting CI push one would turn the restricted key back
+into full host access.
+
+#### Host setup (one time)
+
+Do this on top of §2.2, in the same checkout.
+
+```bash
+# 1. A dedicated deploy key, with no passphrase (generate it anywhere, keep the private half for GitHub)
+ssh-keygen -t ed25519 -N '' -C delegation-deploy -f deploy_key
+
+# 2. Allow it to run deploy.sh and nothing else. Add one line to
+#    ~/.ssh/authorized_keys of the user that owns the checkout and is in the
+#    docker group (adjust the path):
+command="/home/<user>/delegation/server/deploy.sh",restrict ssh-ed25519 AAAA... delegation-deploy
+
+# 3. The host key that CI will pin (the part after the hostname is DEPLOY_HOST_KEY)
+cat /etc/ssh/ssh_host_ed25519_key.pub
+
+# 4. Pick up the compose change that lets cloudflared reach sshd
+cd ~/delegation && git pull && cd server && docker compose up -d
+```
+
+`restrict` turns off port forwarding, agent forwarding and PTY allocation for
+that key. Your own login keys are unaffected.
+
+sshd must accept connections from the Docker bridge, because cloudflared
+reaches it at `host.docker.internal:22`. The default `ListenAddress` does. If
+a firewall such as ufw is enabled, allow port 22 from the Docker subnets
+(for example `sudo ufw allow from 172.16.0.0/12 to any port 22`). sshd
+doesn't have to be reachable from the internet or the LAN.
+
+To run deploy.sh as a separate `deploy` user instead, add that user to the
+`docker` group and give it write access to `server/` (deploy.sh writes
+`.env`, `.deploy-previous` and `.deploy.lock`). Membership in the `docker`
+group is root-equivalent either way. The forced command is the real limit.
+
+#### Cloudflare setup (one time)
+
+1. In the tunnel from §2.1, add a public hostname such as
+   `ssh.smith-c.com`, with service type **SSH** and URL
+   `host.docker.internal:22`.
+2. **Access → Service Auth → Service Tokens:** create a token (for example
+   `github-deploy`). Copy the Client ID and Client Secret.
+3. **Access → Applications:** add a self-hosted application for
+   `ssh.smith-c.com` with a single **Service Auth** policy that includes only
+   that token. If your whole-site application from §2.1 uses a wildcard, make
+   sure it doesn't also cover this hostname.
+
+#### GitHub setup (one time)
+
+In **Settings → Environments**, create `production`. Under **Deployment
+branches and tags**, choose **Selected branches** and add `main`. Optionally
+add yourself as a required reviewer. Then add these to the environment, not
+to the repository:
+
+| Kind     | Name                      | Value                                                   |
+| -------- | ------------------------- | ------------------------------------------------------- |
+| Secret   | `DEPLOY_SSH_KEY`          | Contents of the private `deploy_key`                     |
+| Secret   | `CF_ACCESS_CLIENT_ID`     | Service token Client ID                                  |
+| Secret   | `CF_ACCESS_CLIENT_SECRET` | Service token Client Secret                              |
+| Variable | `DEPLOY_HOST`             | `ssh.smith-c.com`                                        |
+| Variable | `DEPLOY_USER`             | The user whose `authorized_keys` has the deploy key      |
+| Variable | `DEPLOY_HOST_KEY`         | `ssh-ed25519 AAAA...` from step 3 (no hostname, no comment) |
+
+Optional repository variable: `DEPLOY_PLATFORMS`, for example
+`linux/amd64,linux/arm64` for an ARM host. Non-native platforms build under
+QEMU and take much longer.
+
+The first publish creates the package as private and links it to this repo,
+so this repo's workflows can pull it with `GITHUB_TOKEN`. Check
+**Package settings → Manage Actions access** if a pull is ever denied.
+
+**Test the path from a dev machine** before the first run (needs
+`cloudflared` locally):
+
+```bash
+ssh -i deploy_key \
+  -o ProxyCommand="cloudflared access ssh --hostname %h --service-token-id <ID> --service-token-secret <SECRET>" \
+  <user>@ssh.smith-c.com status
+```
+
+It should print the deployed image and `docker compose ps` output, and
+nothing else. An interactive shell must not be possible with this key.

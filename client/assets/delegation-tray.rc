@@ -1,0 +1,3 @@
+// Resources for delegation-tray.exe. Icon ID 1 is both the exe's icon in
+// Explorer and the one the tray loads with Icon::from_resource(1, ..).
+1 ICON "delegation.ico"

@@ -19,6 +19,10 @@ config.env
 # Local docker overrides
 docker-compose.override.yml
 
+# deploy.sh state (server/.deploy-previous, server/.deploy.lock)
+.deploy-previous
+.deploy.lock
+
 # Logs
 *.log
 

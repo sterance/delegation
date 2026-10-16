@@ -1,0 +1,160 @@
+# Builds the server image, pushes it to GHCR (private package), and deploys
+# it to the production host after CI passes on main. The deploy SSHes in
+# through the Cloudflare Tunnel with an Access service token, so the host
+# opens no inbound ports. The host side is server/deploy.sh; setup is in
+# docs/DEV-USAGE-AND-DEPLOYMENT.md §2.8.
+#
+# Run it manually to redeploy: leave image_tag empty to build and deploy the
+# selected branch, or give a commit SHA that was already published to deploy
+# that image again (for example to roll back).
+name: Deploy
+
+on:
+  workflow_run:
+    workflows: [CI]
+    types: [completed]
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      image_tag:
+        description: Full commit SHA of an already-published image (empty = build the selected branch)
+        required: false
+        default: ""
+
+permissions: {}
+
+# One deploy at a time; a queued one waits rather than cancelling a
+# running one halfway through.
+concurrency:
+  group: deploy-production
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    # Only CI runs from pushes to this repo's main, never PRs or forks.
+    if: >-
+      (github.event_name == 'workflow_run'
+        && github.event.workflow_run.conclusion == 'success'
+        && github.event.workflow_run.event == 'push'
+        && github.event.workflow_run.head_repository.full_name == github.repository)
+      || (github.event_name == 'workflow_dispatch' && inputs.image_tag == '')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    outputs:
+      tag: ${{ steps.vars.outputs.tag }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.workflow_run.head_sha || github.sha }}
+          persist-credentials: false
+
+      - id: vars
+        run: |
+          echo "image=ghcr.io/${GITHUB_REPOSITORY_OWNER,,}/delegation-server" >> "$GITHUB_OUTPUT"
+          echo "tag=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+
+      # Only needed when DEPLOY_PLATFORMS includes a non-native arch, for
+      # example "linux/amd64,linux/arm64" for a Raspberry Pi host.
+      - if: contains(vars.DEPLOY_PLATFORMS, 'arm')
+        uses: docker/setup-qemu-action@v3
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: server/Dockerfile
+          platforms: ${{ vars.DEPLOY_PLATFORMS || 'linux/amd64' }}
+          push: true
+          tags: |
+            ${{ steps.vars.outputs.image }}:${{ steps.vars.outputs.tag }}
+            ${{ steps.vars.outputs.image }}:latest
+          # Links the package to this repo, so this repo's workflows can
+          # pull it with GITHUB_TOKEN while it stays private.
+          labels: |
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+            org.opencontainers.image.revision=${{ steps.vars.outputs.tag }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  deploy:
+    needs: publish
+    if: >-
+      always()
+      && (needs.publish.result == 'success'
+        || (needs.publish.result == 'skipped'
+          && github.event_name == 'workflow_dispatch'
+          && inputs.image_tag != ''))
+    runs-on: ubuntu-latest
+    # Holds the deploy secrets. Restrict it to the main branch (and
+    # optionally require a reviewer) in Settings → Environments.
+    environment: production
+    permissions:
+      packages: read
+    env:
+      TAG: ${{ needs.publish.outputs.tag || inputs.image_tag }}
+    steps:
+      - name: Validate tag
+        run: |
+          [[ $TAG =~ ^[0-9a-f]{40}$ ]] || { echo "::error::image tag must be a full commit SHA"; exit 1; }
+
+      - name: Install cloudflared
+        run: |
+          curl -fsSL https://pkg.cloudflare.com/cloudflare-main.gpg \
+            | sudo tee /usr/share/keyrings/cloudflare-main.gpg >/dev/null
+          echo 'deb [signed-by=/usr/share/keyrings/cloudflare-main.gpg] https://pkg.cloudflare.com/cloudflared any main' \
+            | sudo tee /etc/apt/sources.list.d/cloudflared.list >/dev/null
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq cloudflared
+
+      - name: Configure SSH
+        env:
+          DEPLOY_SSH_KEY: ${{ secrets.DEPLOY_SSH_KEY }}
+          DEPLOY_HOST: ${{ vars.DEPLOY_HOST }}
+          DEPLOY_USER: ${{ vars.DEPLOY_USER }}
+          DEPLOY_HOST_KEY: ${{ vars.DEPLOY_HOST_KEY }}
+        run: |
+          for v in DEPLOY_SSH_KEY DEPLOY_HOST DEPLOY_USER DEPLOY_HOST_KEY; do
+            [[ -n ${!v} ]] || { echo "::error::$v is not set on the production environment"; exit 1; }
+          done
+          install -m 700 -d ~/.ssh
+          printf '%s\n' "$DEPLOY_SSH_KEY" > ~/.ssh/deploy_key
+          chmod 600 ~/.ssh/deploy_key
+          # Pinned host key: the connection fails rather than trusting a
+          # key it hasn't seen.
+          printf '%s %s\n' "$DEPLOY_HOST" "$DEPLOY_HOST_KEY" > ~/.ssh/known_hosts
+          # The service token stays in the environment; the ProxyCommand
+          # shell expands it at connect time.
+          cat > ~/.ssh/config <<EOF
+          Host deploy-target
+            HostName $DEPLOY_HOST
+            User $DEPLOY_USER
+            IdentityFile ~/.ssh/deploy_key
+            IdentitiesOnly yes
+            BatchMode yes
+            StrictHostKeyChecking yes
+            ServerAliveInterval 15
+            ProxyCommand cloudflared access ssh --hostname %h --service-token-id "\$CF_ACCESS_CLIENT_ID" --service-token-secret "\$CF_ACCESS_CLIENT_SECRET"
+          EOF
+
+      # The job's GITHUB_TOKEN (packages: read) goes over stdin so the host
+      # can pull the private image. It expires when this job ends and is
+      # never stored on the host.
+      - name: Deploy
+        env:
+          CF_ACCESS_CLIENT_ID: ${{ secrets.CF_ACCESS_CLIENT_ID }}
+          CF_ACCESS_CLIENT_SECRET: ${{ secrets.CF_ACCESS_CLIENT_SECRET }}
+          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          printf '%s\n%s\n' "$GITHUB_ACTOR" "$GHCR_TOKEN" | ssh deploy-target "deploy $TAG"
+
+      - name: Clean up
+        if: always()
+        run: rm -rf ~/.ssh

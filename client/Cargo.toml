@@ -2,27 +2,70 @@
 name = "delegation-client"
 version = "0.1.0"
 edition = "2021"
+default-run = "delegation-client"
 
-# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+[lib]
+name = "delegation_client"
+path = "src/lib.rs"
+
+# The headless client (Linux, Docker). Name unchanged so the Dockerfile and
+# entrypoint keep working.
+[[bin]]
+name = "delegation-client"
+path = "src/bin/delegation-client.rs"
+
+# The Windows tray app. On other platforms this compiles to a stub that
+# exits immediately, so none of its dependencies are built there.
+[[bin]]
+name = "delegation-tray"
+path = "src/bin/delegation-tray/main.rs"
 
 [dependencies]
 protocol = { path = "../protocol" }
-# NOTE: several of these are pinned to older patch/minor versions purely
-# because this scaffold was prototyped against a distro-packaged Rust
-# 1.75 toolchain (see the guide's "hurdles" section). On a real dev
-# machine, install Rust via rustup instead of apt/dnf and these pins
-# almost certainly aren't necessary — try removing them first.
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "time", "io-util"] }
-tokio-tungstenite = { version = "=0.20.1", features = ["rustls-tls-webpki-roots"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "time", "io-util", "sync"] }
+tokio-tungstenite = "0.30"
 futures-util = "0.3"
-ed25519-dalek = { version = "=2.0.0", features = ["rand_core"] }
+ed25519-dalek = { version = "2", features = ["rand_core"] }
 rand = "0.8"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 base64 = "0.21"
-ureq = { version = "2", features = ["json", "tls"] }
+ureq = { version = "2", default-features = false, features = ["json"] }
 anyhow = "1"
-base64ct = "=1.6.0"
-zeroize = "=1.7.0"
-url = "=2.4.1"
-idna = "=0.4.0"
+log = { version = "0.4", features = ["std"] }
+gethostname = "1"
+sysinfo = { version = "0.38", default-features = false, features = ["system"] }
+# Loads libnvidia-ml.so.1 / nvml.dll at runtime; does nothing without NVIDIA.
+nvml-wrapper = "0.13"
+
+[target.'cfg(not(windows))'.dependencies]
+# rustls with bundled roots: no system CA store needed in the slim image.
+tokio-tungstenite = { version = "0.30", features = ["rustls-tls-webpki-roots"] }
+ureq = { version = "2", default-features = false, features = ["json", "tls"] }
+libc = "0.2"
+
+[target.'cfg(windows)'.dependencies]
+# SChannel on Windows: uses the system certificate store, and no C
+# compiler is needed for ring.
+tokio-tungstenite = { version = "0.30", features = ["native-tls"] }
+ureq = { version = "2", default-features = false, features = ["json", "native-tls"] }
+native-tls = "0.2"
+dirs = "7"
+wmi = "0.18"
+tray-icon = "0.26"
+# The version eframe uses, so there's only one winit in the build.
+winit = "0.30"
+eframe = { version = "0.35", default-features = false, features = ["glow", "default_fonts"] }
+windows = { version = "0.62", features = [
+    "Win32_Foundation",
+    "Win32_Graphics_Dxgi",
+    "Win32_Security",
+    "Win32_Storage_FileSystem",
+    "Win32_System_Console",
+    "Win32_System_Registry",
+    "Win32_System_SystemInformation",
+    "Win32_System_Threading",
+] }
+
+[target.'cfg(windows)'.build-dependencies]
+embed-resource = "3"

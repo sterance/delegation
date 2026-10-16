@@ -12,8 +12,21 @@ services:
     environment:
       DELEGATION_SERVER: ${DELEGATION_SERVER:-https://llm.smith-c.com}
       PAIRING_CODE: ${PAIRING_CODE:-}
+      # Read the host's mount table, disks and OS name from /hostfs
+      # instead of the container's own.
+      DELEGATION_HOST_ROOT: /hostfs
+      DELEGATION_DMI_PATH: /hostdmi/DMI
     volumes:
       - client-identity:/root/.config/delegation-client
+      # The host's filesystem, read-only, so the hardware report shows the
+      # host's disks and free space. NOTE: this exposes everything on the
+      # host (SSH keys included) to code running in this container. It is
+      # only our own client binary, but remove this line (and the env var
+      # above) if you'd rather report less than give it that access.
+      - /:/hostfs:ro
+      # Docker hides /sys/firmware; mounting the SMBIOS table elsewhere
+      # gives RAM type and speed (the container runs as root).
+      - /sys/firmware/dmi/tables:/hostdmi:ro
 
 volumes:
   client-identity:

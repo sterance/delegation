@@ -1,0 +1,15 @@
+# NVIDIA GPUs in the hardware report. Needs the NVIDIA Container Toolkit
+# on the host, which is why it's a separate file: the base compose file
+# must still start on machines without it.
+#   docker compose -f docker-compose.yml -f docker-compose.gpu.yml up -d
+# The `utility` capability is what mounts NVML (libnvidia-ml) into the
+# container.
+services:
+  delegation-client:
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu, utility]

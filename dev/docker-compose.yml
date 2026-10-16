@@ -22,6 +22,23 @@ services:
     volumes:
       - dev-server-data:/app/data
 
+  # Vite dev server with hot reload, proxying API calls to the server
+  # above. Source is bind-mounted so edits in frontend/ reload instantly;
+  # node_modules lives in a volume so it never mixes with the host's.
+  frontend:
+    image: node:22-slim
+    working_dir: /app
+    command: sh -c "npm install && exec npm run dev -- --host 0.0.0.0"
+    depends_on:
+      - server
+    environment:
+      API_TARGET: http://server:7070
+    ports:
+      - "127.0.0.1:5173:5173"
+    volumes:
+      - ../frontend:/app
+      - dev-frontend-modules:/app/node_modules
+
   client:
     build:
       context: ..
@@ -37,9 +54,16 @@ services:
     environment:
       DELEGATION_SERVER: http://server:7070
       PAIRING_CODE: ${PAIRING_CODE:-}
+      # Same host mounts as client/docker-compose.yml, so the dev client
+      # reports this machine's real hardware.
+      DELEGATION_HOST_ROOT: /hostfs
+      DELEGATION_DMI_PATH: /hostdmi/DMI
     volumes:
       - dev-client-identity:/root/.config/delegation-client
+      - /:/hostfs:ro
+      - /sys/firmware/dmi/tables:/hostdmi:ro
 
 volumes:
   dev-server-data:
   dev-client-identity:
+  dev-frontend-modules:

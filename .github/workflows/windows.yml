@@ -1,0 +1,55 @@
+# Builds the Windows tray client and its installer on every push to main,
+# every PR, and on demand. Download the installer from the run's
+# "Artifacts" section to test on a real Windows machine.
+name: Windows
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  tray:
+    runs-on: windows-latest
+    env:
+      APP_VERSION: 0.1.0.${{ github.run_number }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Test
+        run: cargo test -p delegation-client
+
+      - name: Build
+        run: cargo build --release -p delegation-client --bin delegation-tray
+
+      # A quick check of the Windows collectors on the runner's (virtual)
+      # hardware. Piping makes PowerShell wait for the GUI-subsystem exe
+      # and capture its output.
+      - name: Hardware report
+        shell: pwsh
+        run: |
+          $json = & .\target\release\delegation-tray.exe --dump-specs | Out-String
+          Write-Output $json
+          $null = $json | ConvertFrom-Json
+
+      - name: Install Inno Setup
+        shell: pwsh
+        run: |
+          if (-not (Test-Path "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe")) {
+            choco install innosetup --no-progress -y
+          }
+
+      - name: Build installer
+        shell: pwsh
+        run: |
+          & "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe" /DAppVersion=$env:APP_VERSION installer\delegation.iss
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: DelegationTray-Setup-${{ env.APP_VERSION }}
+          path: installer/Output/DelegationTray-Setup-${{ env.APP_VERSION }}.exe
+          if-no-files-found: error

@@ -3,6 +3,9 @@
 # shared protocol/ crate, but the command-line usage doesn't change.
 services:
   delegation-server:
+    # deploy.sh sets DELEGATION_IMAGE/DELEGATION_TAG in .env to a CI-built
+    # GHCR image. Without them, `--build` builds locally as before.
+    image: ${DELEGATION_IMAGE:-delegation-server}:${DELEGATION_TAG:-latest}
     build:
       context: ..
       dockerfile: server/Dockerfile
@@ -27,6 +30,10 @@ services:
       # http://delegation-server:7070 still resolves to this same
       # service name on the compose network.
       TUNNEL_TOKEN: ${TUNNEL_TOKEN}
+    # Lets the tunnel's SSH route (ssh://host.docker.internal:22) reach the
+    # host's sshd for CI deploys (docs/DEV-USAGE-AND-DEPLOYMENT.md §2.8).
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     depends_on:
       - delegation-server
 
