@@ -216,10 +216,6 @@ export default function ClientCard({ client, onRename, onDelete }: Props) {
               label="Hostname"
               value={client.hostname}
             />
-            <DetailRow
-              label="Client ID"
-              value={client.client_id}
-            />
             <Timestamp
               label="Enrolled"
               iso={client.enrolled_at}
