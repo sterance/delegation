@@ -13,3 +13,4 @@ jobs:
       port: "7070"
       dockerfile: "server/Dockerfile"
       data_dir: "/app/data"
+      subdomain: "llm"
