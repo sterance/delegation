@@ -1,0 +1,15 @@
+# Managed by onboard-repo.sh — pipeline logic lives in sterance/infra
+name: deploy
+on:
+  push: { branches: [main] }
+  workflow_dispatch:
+permissions: { contents: read, packages: write, id-token: write }
+jobs:
+  backend:
+    uses: sterance/infra/.github/workflows/deploy-backend.yml@main
+    with:
+      bao_addr: ${{ vars.BAO_ADDR }}
+      target: ${{ vars.DEPLOY_TARGET }}
+      port: "7070"
+      dockerfile: "server/Dockerfile"
+      data_dir: "/app/data"
