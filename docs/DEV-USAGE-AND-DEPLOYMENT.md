@@ -211,7 +211,11 @@ file's default server. For a different domain, substitute it everywhere below.
 
 1. **Create the tunnel:** in Zero Trust, go to **Networks → Tunnels → Create
    a tunnel → Cloudflared** and pick the Docker connector. Copy the **tunnel
-   token** from the `docker run` command it shows.
+   token** from the `docker run` command it shows. Give this stack its **own**
+   tunnel, even on a host that already runs one for other services. If you
+   reuse another tunnel's token, its cloudflared and this one become replicas
+   of the same tunnel. Cloudflare then sends requests to either one, and the
+   other connector can't reach `delegation-server` or `host.docker.internal`.
 2. **Add a public hostname:** route `llm.smith-c.com` to service
    `http://delegation-server:7070`. That is the Compose service name, which
    resolves on the Compose network.
@@ -508,6 +512,7 @@ pairing code: wipe its identity file or volume, then enroll again.
 | ------------------------------------------------- | -------------------------------------------------------------------------------------------------------------- |
 | Dashboard 404s at `/`                             | Frontend wasn't built into the image. Rebuild with `--build`; the log warns `no index.html in ...`             |
 | Cloudflare 502 / 1033                             | Tunnel route doesn't point at `http://delegation-server:7070`, or cloudflared isn't running (`docker compose logs cloudflared`) |
+| 502 with nothing in this stack's cloudflared logs | The tunnel has a second replica, usually another stack that uses the same token. Give this stack its own tunnel (§2.1) |
 | Client enroll returns HTML or a redirect          | Access is intercepting `/enroll`. Add the Bypass application from §2.1                                         |
 | Client authenticates then loops reconnecting      | `/ws` is behind Access, or WebSockets are disabled for the zone (Cloudflare → Network → WebSockets)            |
 | Enroll rejected                                   | Code is expired (10 min), already used, or mistyped. Mint a new one                                            |
