@@ -9,6 +9,9 @@
 use serde::{Deserialize, Serialize};
 
 pub mod config;
+pub mod hardware;
+
+pub use hardware::HardwareSpecs;
 
 // ---- enrollment (HTTP) ----
 
@@ -38,8 +41,21 @@ pub enum ClientMessage {
     Hello { client_id: String },
     #[serde(rename = "challenge_response")]
     ChallengeResponse { signature: String },
+    /// Sent once after every successful `auth_ok`, and again if the
+    /// client's hardware scan finishes later than that. Not acked. The
+    /// hostname lives here rather than in every heartbeat so a renamed
+    /// machine shows its new name without re-enrolling.
+    #[serde(rename = "info")]
+    Info {
+        hostname: String,
+        os: String,
+        client_version: String,
+        specs: HardwareSpecs,
+    },
+    /// Old clients also send a `hostname` field here; serde ignores it, so
+    /// they keep working against a new server.
     #[serde(rename = "heartbeat")]
-    Heartbeat { timestamp: i64, hostname: String },
+    Heartbeat { timestamp: i64 },
 }
 
 // ---- WebSocket messages, server -> client ----
@@ -52,17 +68,36 @@ pub enum ServerMessage {
     #[serde(rename = "auth_ok")]
     AuthOk {},
     #[serde(rename = "auth_failed")]
-    AuthFailed { reason: String },
+    AuthFailed { reason: AuthFailedReason },
     #[serde(rename = "heartbeat_ack")]
     HeartbeatAck {},
 }
 
-/// A machine-readable reason string for auth failure. The client
-/// pattern-matches on this specific value to decide whether to wipe its
-/// local identity and fall back to asking for a new pairing code, rather
-/// than looping forever on a handshake that can never succeed (see the
-/// "server has forgotten this client_id" case from the planning notes).
-pub const AUTH_FAILED_UNKNOWN_CLIENT: &str = "unknown client_id";
+/// Why the server rejected a handshake. Serialized as the same strings
+/// the protocol has always used. The client matches on `UnknownClient` to
+/// decide whether to wipe its local identity and fall back to asking for a
+/// new pairing code, rather than looping forever on a handshake that can
+/// never succeed (the "server has forgotten this client_id" case).
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AuthFailedReason {
+    #[serde(rename = "unknown client_id")]
+    UnknownClient,
+    #[serde(rename = "signature verification failed")]
+    BadSignature,
+    /// Anything a newer server might send that this build doesn't know.
+    #[serde(other)]
+    Other,
+}
+
+impl std::fmt::Display for AuthFailedReason {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            AuthFailedReason::UnknownClient => "unknown client_id",
+            AuthFailedReason::BadSignature => "signature verification failed",
+            AuthFailedReason::Other => "unrecognized reason",
+        })
+    }
+}
 
 /// UTC timestamp for log lines, e.g. "2026-09-29T23:31:05Z". Hand-rolled
 /// (Howard Hinnant's civil_from_days algorithm) rather than pulling in a
@@ -89,4 +124,57 @@ pub fn ts() -> String {
     let year = if month <= 2 { y + 1 } else { y };
 
     format!("{year:04}-{month:02}-{d:02}T{hh:02}:{mm:02}:{ss:02}Z")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn old_heartbeat_with_hostname_still_parses() {
+        let msg: ClientMessage =
+            serde_json::from_str(r#"{"type":"heartbeat","timestamp":1,"hostname":"old-client"}"#).unwrap();
+        assert!(matches!(msg, ClientMessage::Heartbeat { timestamp: 1 }));
+    }
+
+    #[test]
+    fn auth_failed_reasons_keep_their_wire_strings() {
+        let json = serde_json::to_string(&ServerMessage::AuthFailed {
+            reason: AuthFailedReason::UnknownClient,
+        })
+        .unwrap();
+        assert_eq!(json, r#"{"type":"auth_failed","reason":"unknown client_id"}"#);
+        let json = serde_json::to_string(&ServerMessage::AuthFailed {
+            reason: AuthFailedReason::BadSignature,
+        })
+        .unwrap();
+        assert_eq!(
+            json,
+            r#"{"type":"auth_failed","reason":"signature verification failed"}"#
+        );
+        let msg: ServerMessage = serde_json::from_str(r#"{"type":"auth_failed","reason":"something new"}"#).unwrap();
+        assert!(matches!(
+            msg,
+            ServerMessage::AuthFailed {
+                reason: AuthFailedReason::Other
+            }
+        ));
+    }
+
+    #[test]
+    fn info_round_trips_with_missing_spec_fields() {
+        let msg: ClientMessage = serde_json::from_str(
+            r#"{"type":"info","hostname":"h","os":"Linux","client_version":"0.1.0",
+                "specs":{"cpu":{"model":"X"},"disks":[{"media":"ssd","interface":"thunderbolt"}]}}"#,
+        )
+        .unwrap();
+        let ClientMessage::Info { specs, .. } = msg else {
+            panic!("not info")
+        };
+        assert_eq!(specs.cpu.unwrap().model.as_deref(), Some("X"));
+        assert!(specs.memory.is_none());
+        assert!(specs.gpus.is_empty());
+        assert_eq!(specs.disks[0].media, hardware::DiskMedia::Ssd);
+        assert_eq!(specs.disks[0].interface, hardware::DiskInterface::Other);
+    }
 }

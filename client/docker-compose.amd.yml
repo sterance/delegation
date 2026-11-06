@@ -1,0 +1,11 @@
+# AMD (and Intel) GPUs in the hardware report: passes the DRM and ROCm
+# device nodes through.
+#   docker compose -f docker-compose.yml -f docker-compose.amd.yml up -d
+# The client finds GPUs through /sys/class/drm, which the container can
+# already read; these devices are for ROCm-based work later on, and make
+# the container's view match what a GPU workload would see.
+services:
+  delegation-client:
+    devices:
+      - /dev/dri:/dev/dri
+      - /dev/kfd:/dev/kfd

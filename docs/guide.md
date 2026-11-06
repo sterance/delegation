@@ -137,14 +137,28 @@ server-issued nonce, so a captured message can't be replayed.
 ### 3.3 Heartbeat (every `CLIENT_HEARTBEAT_INTERVAL_MS` once authenticated)
 
 ```
-client ── {type:"heartbeat", timestamp, hostname} ──▶ server
-client ◀──────── {type:"heartbeat_ack"} ─────────────── server
+client ── {type:"heartbeat", timestamp} ──▶ server
+client ◀──── {type:"heartbeat_ack"} ─────── server
 ```
 
 The server sweeps every `SERVER_HEARTBEAT_SWEEP_INTERVAL_MS` for any
 authenticated client whose last heartbeat is older than
 `SERVER_HEARTBEAT_TIMEOUT_MS` and closes that connection, logging it as
-timed out.
+timed out. (Older clients also send a `hostname` field here; the server
+ignores it.)
+
+### 3.4 Client info (once per connection, after `auth_ok`)
+
+```
+client ── {type:"info", hostname, os, client_version, specs} ──▶ server
+```
+
+Not acked. The server stores it on the client's row (the hostname replaces
+the one from enrollment, so renamed machines update) and `/clients`
+returns it for the dashboard. `specs` is `HardwareSpecs` from
+`protocol/src/hardware.rs`: CPU, RAM, GPUs and disks, every field optional
+and in raw units. If the client's hardware scan is still running when it
+authenticates, `info` follows as soon as the scan finishes.
 
 ---
 

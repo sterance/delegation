@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Local connectivity test: dockerized server <-> client, no Cloudflare.
-#   dev/dev.sh up       build + start server, enroll and start containerized client
+#   dev/dev.sh up       build + start server and vite (:5173), enroll and start containerized client
 #   dev/dev.sh logs     follow logs
 #   dev/dev.sh status   list enrolled clients as the server sees them
 #   dev/dev.sh native   run the client from source (cargo) against the dev server
@@ -24,7 +24,7 @@ mint_code() { curl -fsS -X POST "$URL/admin/pairing-code" | jq -r .code; }
 
 case "${1:-up}" in
   up)
-    $DC up -d --build server
+    $DC up -d --build server frontend
     wait_server
     if $DC run --rm --no-deps -T --entrypoint test client -f /root/.config/delegation-client/identity.json 2>/dev/null; then
       $DC --profile client up -d --build client
@@ -33,6 +33,8 @@ case "${1:-up}" in
     fi
     sleep 3
     "$SELF" status
+    echo "dashboard (built):        $URL/"
+    echo "dashboard (hot reload):   http://localhost:5173/"
     ;;
   logs)    $DC --profile client logs -f ;;
   status)  curl -fsS "$URL/clients" | jq . ;;

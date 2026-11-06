@@ -24,15 +24,25 @@ impl Config {
         let explicit = std::env::var_os("DELEGATION_CONFIG").map(PathBuf::from);
         if let Some(path) = &explicit {
             if !path.is_file() {
-                eprintln!("[{}] [config] DELEGATION_CONFIG={} not found, ignoring", crate::ts(), path.display());
+                eprintln!(
+                    "[{}] [config] DELEGATION_CONFIG={} not found, ignoring",
+                    crate::ts(),
+                    path.display()
+                );
             }
         }
         for path in explicit.iter().chain(candidates) {
             if let Ok(text) = std::fs::read_to_string(path) {
-                return Config { file: parse(&text), source: Some(path.clone()) };
+                return Config {
+                    file: parse(&text),
+                    source: Some(path.clone()),
+                };
             }
         }
-        Config { file: HashMap::new(), source: None }
+        Config {
+            file: HashMap::new(),
+            source: None,
+        }
     }
 
     /// The file values were read from, if any — for the startup log line.
@@ -59,7 +69,10 @@ impl Config {
             Some(raw) => match raw.parse::<u64>() {
                 Ok(n) if n > 0 => n,
                 _ => {
-                    eprintln!("[{}] [config] invalid {key}={raw:?}, using default {default}", crate::ts());
+                    eprintln!(
+                        "[{}] [config] invalid {key}={raw:?}, using default {default}",
+                        crate::ts()
+                    );
                     default
                 }
             },

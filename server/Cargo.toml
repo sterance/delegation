@@ -15,12 +15,5 @@ base64 = "0.21"
 ed25519-dalek = "2"
 rand = "0.8"
 anyhow = "1"
-uuid = { version = "=1.10.0", features = ["v4"] }
+uuid = { version = "1", features = ["v4"] }
 
-# Pinned purely because this is being prototyped against a distro-packaged
-# (apt) Rust 1.75 toolchain, which can't build crates that have since
-# moved to Rust's 2024 edition. On a rustup-installed current stable,
-# these pins almost certainly aren't necessary — see the hurdles writeup
-# from the earlier scaffold for the full story on why this keeps happening.
-hyper-util = "=0.1.10"
-getrandom = "=0.2.15"
