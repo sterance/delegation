@@ -152,6 +152,7 @@ cp config.env.example config.env
 | `DASHBOARD_GRAPH_WIDTH_PX` / `_HEIGHT_PX` / `_GRID_PX` | `120` / `40` / `10` | Usage graph size and grid cell |
 | `DASHBOARD_GRAPH_LINE_COLOR` / `_GRID_COLOR` / `_BG_COLOR` | `#00ff00` / `#008040` / `#000000` | Graph colours, `#rgb` or `#rrggbb`, unquoted (`docker run --env-file` would keep quotes) |
 | `DASHBOARD_COLLAPSED_MAX_GPUS` | `1` | GPUs graphed in a collapsed card; the rest show when it's expanded |
+| `DASHBOARD_BLINK_PERIOD_MS` | `1000` | One full bright/dim cycle of the blue dot beside each card's status dot |
 
 With the defaults, a value on screen is typically under a second old, and
 up to about 1.5–2 s in the worst case, plus network latency. Lower

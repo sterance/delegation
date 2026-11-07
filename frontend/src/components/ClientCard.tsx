@@ -1,3 +1,4 @@
+import { keyframes } from "@emotion/react";
 import { useState } from "react";
 import DeleteOutlinedIcon from "@mui/icons-material/DeleteOutlined";
 import ExpandMoreIcon from "@mui/icons-material/ExpandMore";
@@ -38,6 +39,29 @@ function StatusDot({ connected }: { connected: boolean }) {
         borderRadius: "50%",
         flexShrink: 0,
         bgcolor: connected ? "success.main" : "error.main",
+      }}
+    />
+  );
+}
+
+const blink = keyframes`
+  0%, 100% { background-color: #2196f3; }
+  50% { background-color: #0d2f52; }
+`;
+
+/** Cycles bright blue / dim blue, one full cycle per DASHBOARD_BLINK_PERIOD_MS. */
+function BlinkDot({ periodMs }: { periodMs: number }) {
+  return (
+    <Box
+      component="span"
+      aria-hidden
+      sx={{
+        width: 10,
+        height: 10,
+        borderRadius: "50%",
+        flexShrink: 0,
+        bgcolor: "#2196f3",
+        animation: `${blink} ${periodMs}ms ease-in-out infinite`,
       }}
     />
   );
@@ -167,44 +191,44 @@ export default function ClientCard({ client, history, config, onRename, onDelete
         sx={{
           display: "flex",
           alignItems: "center",
-          // Narrow: the graphs drop onto their own line below the name and
-          // buttons. Wide: they sit between the two, starting at the same
-          // place on every card (the name column has a fixed width) and
-          // wrapping within that space if there are more than fit.
-          flexWrap: { xs: "wrap", lg: "nowrap" },
           columnGap: 2,
-          rowGap: 1.5,
           "&:last-child": { pb: 2 },
         }}
       >
-        <StatusDot connected={client.connected} />
-        <Box sx={{ flex: { xs: "1 1 10rem", lg: "0 1 15rem" }, minWidth: { xs: 0, lg: "8rem" } }}>
-          <InlineTextEdit
-            value={client.friendly_name}
-            onSave={onRename}
-            label="Client name"
-            placeholder={`Blank resets to ${client.hostname}`}
-            maxLength={MAX_FRIENDLY_NAME_LENGTH}
-            typographyProps={{ variant: "body1", sx: { fontWeight: 500 } }}
+        <Box
+          sx={{
+            flex: "1 1 auto",
+            minWidth: 0,
+            display: "flex",
+            flexWrap: "wrap",
+            alignItems: "center",
+            columnGap: 2,
+            rowGap: 1.5,
+          }}
+        >
+          <Box sx={{ flex: "0 1 auto", minWidth: 0, display: "flex", alignItems: "center", columnGap: 1 }}>
+            <StatusDot connected={client.connected} />
+            <BlinkDot periodMs={config.blink_period_ms} />
+            <Box sx={{ flex: "0 1 15rem", minWidth: 0, ml: 1 }}>
+              <InlineTextEdit
+                value={client.friendly_name}
+                onSave={onRename}
+                label="Client name"
+                placeholder={`Blank resets to ${client.hostname}`}
+                maxLength={MAX_FRIENDLY_NAME_LENGTH}
+                typographyProps={{ variant: "body1", sx: { fontWeight: 500 } }}
+              />
+            </Box>
+          </Box>
+          <ClientUsage
+            history={history}
+            config={config}
+            system
+            gpuFrom={0}
+            gpuTo={collapsedGpus}
+            sx={{ flex: "1 1 auto" }}
           />
-          {summary && (
-            <Typography
-              variant="body2"
-              color="text.secondary"
-              noWrap
-            >
-              {summary}
-            </Typography>
-          )}
         </Box>
-        <ClientUsage
-          history={history}
-          config={config}
-          system
-          gpuFrom={0}
-          gpuTo={collapsedGpus}
-          sx={{ order: { xs: 1, lg: 0 }, flex: { xs: "1 1 100%", lg: "1 1 auto" } }}
-        />
         <Tooltip title="Delete client">
           <IconButton
             onClick={onDelete}

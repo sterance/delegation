@@ -128,6 +128,7 @@ pub struct DashboardConfig {
     pub graph_grid_color: String,
     pub graph_bg_color: String,
     pub collapsed_max_gpus: u64,
+    pub blink_period_ms: u64,
     pub metrics_history_samples: u64,
     pub tick_interval_ms: u64,
     pub pairing_code_ttl_secs: u64,
@@ -218,6 +219,7 @@ impl Settings {
         let grid_color = p.color("DASHBOARD_GRAPH_GRID_COLOR", "#008040");
         let bg_color = p.color("DASHBOARD_GRAPH_BG_COLOR", "#000000");
         let collapsed_max_gpus = p.int("DASHBOARD_COLLAPSED_MAX_GPUS", 1, 0);
+        let blink_period = p.int("DASHBOARD_BLINK_PERIOD_MS", 1_000, 1);
 
         // ---- cross-variable rules ----
         p.at_least_twice("SAMPLE_MAX_AGE_MS", max_age, "SAMPLER_INTERVAL_MS", sampler);
@@ -273,6 +275,7 @@ impl Settings {
                 graph_grid_color: grid_color,
                 graph_bg_color: bg_color,
                 collapsed_max_gpus,
+                blink_period_ms: blink_period,
                 metrics_history_samples: history,
                 tick_interval_ms: tick,
                 pairing_code_ttl_secs: pairing_ttl,
@@ -323,7 +326,7 @@ impl Settings {
             ),
             format!(
                 "dashboard: poll every {} ms, pause when hidden {}, graph {}x{} px grid {} px, \
-                 colours line {} grid {} bg {}, {} GPU(s) when collapsed",
+                 colours line {} grid {} bg {}, {} GPU(s) when collapsed, blink every {} ms",
                 d.poll_interval_ms,
                 d.pause_when_hidden,
                 d.graph_width_px,
@@ -332,7 +335,8 @@ impl Settings {
                 d.graph_line_color,
                 d.graph_grid_color,
                 d.graph_bg_color,
-                d.collapsed_max_gpus
+                d.collapsed_max_gpus,
+                d.blink_period_ms
             ),
         ]
     }
@@ -468,6 +472,7 @@ mod tests {
                 graph_grid_color: "#008040".into(),
                 graph_bg_color: "#000000".into(),
                 collapsed_max_gpus: 1,
+                blink_period_ms: 1_000,
                 metrics_history_samples: 60,
                 tick_interval_ms: 1_000,
                 pairing_code_ttl_secs: 600,

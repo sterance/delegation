@@ -72,6 +72,8 @@ export interface DashboardConfig {
   graph_grid_color: string
   graph_bg_color: string
   collapsed_max_gpus: number
+  /** One full bright-dim-bright cycle of the blue dot. */
+  blink_period_ms: number
   /** Samples kept per client, which is also each graph's width in samples. */
   metrics_history_samples: number
   tick_interval_ms: number
@@ -90,6 +92,7 @@ export const DEFAULT_DASHBOARD_CONFIG: DashboardConfig = {
   graph_grid_color: '#008040',
   graph_bg_color: '#000000',
   collapsed_max_gpus: 1,
+  blink_period_ms: 1000,
   metrics_history_samples: 60,
   tick_interval_ms: 1000,
   pairing_code_ttl_secs: 600,
