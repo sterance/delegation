@@ -1,7 +1,9 @@
 # Managed by onboard-repo.sh — pipeline logic lives in sterance/infra
 name: deploy
+# Pushes to main reach this through ci.yml's deploy job, after CI passes.
+# A manual run deploys straight away, without waiting for CI.
 on:
-  push: { branches: [main] }
+  workflow_call:
   workflow_dispatch:
 permissions: { contents: read, packages: write, id-token: write }
 jobs:

@@ -1,8 +1,15 @@
+# Tests every push and PR. The Windows build and the server deploy run as
+# the last jobs of this same workflow (they're reusable workflows called
+# below), so neither starts unless every check here passes, and a push to
+# main shows up as one run instead of three.
 name: CI
 
 on:
   push:
   pull_request:
+
+permissions:
+  contents: read
 
 jobs:
   rust:
@@ -41,3 +48,22 @@ jobs:
         run: docker build -f client/Dockerfile -t delegation-client .
       - name: Build server image
         run: docker build -f server/Dockerfile -t delegation-server .
+
+  # Builds the tray app and installer for PRs and pushes to main (not other
+  # branch pushes); on pushes to main it also publishes a GitHub Release,
+  # which needs contents: write.
+  windows:
+    needs: [rust, frontend, docker]
+    if: github.event_name == 'pull_request' || github.ref == 'refs/heads/main'
+    uses: ./.github/workflows/windows.yml
+    permissions:
+      contents: write
+
+  # A called workflow can't have more permissions than its caller grants,
+  # so these match deploy.yml's.
+  deploy:
+    needs: [rust, frontend, docker]
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    uses: ./.github/workflows/deploy.yml
+    permissions: { contents: read, packages: write, id-token: write }
+    secrets: inherit

@@ -40,3 +40,4 @@ Thumbs.db
 *.tmp
 *.temp
 dev/.native-home/
+/docs

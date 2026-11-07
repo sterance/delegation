@@ -1,13 +1,12 @@
-# Builds the Windows tray client and its installer on every push to main,
-# every PR, and on demand. Pushes to main also publish both as a GitHub
-# Release (tag v<APP_VERSION>), marked latest; for PRs and manual runs,
+# Builds the Windows tray client and its installer. ci.yml calls this after
+# its checks pass, for PRs and pushes to main; it can also be run by hand, which
+# skips CI. Pushes to main also publish both as a GitHub Release (tag
+# v<APP_VERSION>), marked latest; for PRs and manual runs,
 # download them from the run's "Artifacts" section instead.
 name: Windows
 
 on:
-  push:
-    branches: [main]
-  pull_request:
+  workflow_call:
   workflow_dispatch:
 
 # Read-only by default; only the release job below can write.
