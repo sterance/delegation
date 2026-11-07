@@ -3,6 +3,7 @@
 //! headless CLI (`bin/delegation-client.rs`, used natively on Linux and in
 //! Docker) and the Windows tray app (`bin/delegation-tray/`).
 
+pub mod chat;
 pub mod hardware;
 pub mod identity;
 pub mod log;

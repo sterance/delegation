@@ -18,9 +18,10 @@ interface Props {
   models: ModelOption[]
   modelId: string | null
   onSelectModel: (id: string) => void
+  onOpenModels?: () => void
 }
 
-export default function Composer({ onSend, disabled = false, models, modelId, onSelectModel }: Props) {
+export default function Composer({ onSend, disabled = false, models, modelId, onSelectModel, onOpenModels }: Props) {
   const [text, setText] = useState('')
   const canSend = !disabled && text.trim().length > 0
 
@@ -55,7 +56,7 @@ export default function Composer({ onSend, disabled = false, models, modelId, on
         sx={{ p: 0 }}
       />
       <Stack direction="row" sx={{ alignItems: 'center', justifyContent: 'space-between', mt: 1, ml: -1 }}>
-        <ModelPicker models={models} selectedId={modelId} onSelect={onSelectModel} />
+        <ModelPicker models={models} selectedId={modelId} onSelect={onSelectModel} onOpen={onOpenModels} />
         <Tooltip title="Send (Enter)">
           {/* span: Tooltip needs an element that fires events even when the button is disabled. */}
           <span>

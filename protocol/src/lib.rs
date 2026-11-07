@@ -9,9 +9,11 @@
 use serde::{Deserialize, Serialize};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+pub mod chat;
 pub mod hardware;
 pub mod telemetry;
 
+pub use chat::{ChatRole, ChatTurn, ModelInfo};
 pub use hardware::HardwareSpecs;
 pub use telemetry::{ClientSettings, GpuMetrics, Metrics, Tick};
 
@@ -58,6 +60,20 @@ pub enum ClientMessage {
     /// resource metrics. Also the liveness signal; never acked.
     #[serde(rename = "tick")]
     Tick(Tick),
+    /// The models this client can chat with. Sent after `info` on every
+    /// connection, and again whenever the set changes (a model loaded or
+    /// unloaded). Replaces the previous list. Not acked.
+    #[serde(rename = "models")]
+    Models { models: Vec<ModelInfo> },
+    /// The next piece of the reply to `chat_request` `request_id`.
+    #[serde(rename = "chat_chunk")]
+    ChatChunk { request_id: String, delta: String },
+    /// The reply to `request_id` is complete.
+    #[serde(rename = "chat_done")]
+    ChatDone { request_id: String },
+    /// The reply to `request_id` failed; no more chunks follow.
+    #[serde(rename = "chat_error")]
+    ChatError { request_id: String, error: String },
 }
 
 // ---- WebSocket messages, server -> client ----
@@ -73,6 +89,20 @@ pub enum ServerMessage {
     Welcome { settings: ClientSettings },
     #[serde(rename = "auth_failed")]
     AuthFailed { reason: AuthFailedReason },
+    /// Reply to `messages` (oldest first, ending with the user's new
+    /// message) using `model`, one of the ids from the client's `models`.
+    /// Answered with `chat_chunk`s, then `chat_done` or `chat_error`.
+    #[serde(rename = "chat_request")]
+    ChatRequest {
+        request_id: String,
+        model: String,
+        messages: Vec<ChatTurn>,
+    },
+    /// Nobody is waiting for `request_id` any more (the dashboard went
+    /// away, or the server timed it out): stop generating. Nothing needs
+    /// to be sent back.
+    #[serde(rename = "chat_cancel")]
+    ChatCancel { request_id: String },
 }
 
 /// Why the server rejected a handshake. Serialized as the same strings
@@ -263,6 +293,67 @@ mod tests {
                 reason: AuthFailedReason::Other
             }
         ));
+    }
+
+    #[test]
+    fn chat_messages_have_their_wire_forms() {
+        let request = ServerMessage::ChatRequest {
+            request_id: "r1".into(),
+            model: "echo".into(),
+            messages: vec![ChatTurn {
+                role: ChatRole::User,
+                content: "hi".into(),
+            }],
+        };
+        let json = serde_json::to_string(&request).unwrap();
+        assert_eq!(
+            json,
+            r#"{"type":"chat_request","request_id":"r1","model":"echo","messages":[{"role":"user","content":"hi"}]}"#
+        );
+        let ServerMessage::ChatRequest { messages, .. } = serde_json::from_str(&json).unwrap() else {
+            panic!("not a chat_request")
+        };
+        assert_eq!(messages[0].role, ChatRole::User);
+
+        let cases = [
+            (
+                ClientMessage::Models {
+                    models: vec![ModelInfo { id: "echo".into() }],
+                },
+                r#"{"type":"models","models":[{"id":"echo"}]}"#,
+            ),
+            (
+                ClientMessage::ChatChunk {
+                    request_id: "r1".into(),
+                    delta: "hi ".into(),
+                },
+                r#"{"type":"chat_chunk","request_id":"r1","delta":"hi "}"#,
+            ),
+            (
+                ClientMessage::ChatDone {
+                    request_id: "r1".into(),
+                },
+                r#"{"type":"chat_done","request_id":"r1"}"#,
+            ),
+            (
+                ClientMessage::ChatError {
+                    request_id: "r1".into(),
+                    error: "nope".into(),
+                },
+                r#"{"type":"chat_error","request_id":"r1","error":"nope"}"#,
+            ),
+        ];
+        for (msg, wire) in cases {
+            assert_eq!(serde_json::to_string(&msg).unwrap(), wire);
+            let back: ClientMessage = serde_json::from_str(wire).unwrap();
+            assert_eq!(serde_json::to_string(&back).unwrap(), wire);
+        }
+
+        let cancel = serde_json::to_string(&ServerMessage::ChatCancel {
+            request_id: "r1".into(),
+        })
+        .unwrap();
+        assert_eq!(cancel, r#"{"type":"chat_cancel","request_id":"r1"}"#);
     }
 
     #[test]

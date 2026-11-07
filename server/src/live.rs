@@ -7,13 +7,17 @@
 
 use crate::config::MetricsLimits;
 use crate::metrics;
-use protocol::{GpuMetrics, Metrics};
+use protocol::{GpuMetrics, Metrics, ModelInfo, ServerMessage};
 use rand::Rng;
 use serde::Serialize;
 use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex};
 use std::time::{Instant, SystemTime};
-use tokio::sync::Notify;
+use tokio::sync::{mpsc, Notify};
+
+/// Messages queued for one connection's socket beyond this are refused
+/// rather than buffered without bound.
+const OUTBOUND_QUEUE: usize = 64;
 
 /// One accepted sample, as `GET /api/clients` returns it.
 #[derive(Serialize, Debug, Clone, PartialEq)]
@@ -32,10 +36,20 @@ pub struct Sample {
 
 /// Handed to a connection task when it registers. `kick` fires when the
 /// connection must close: the same client connected again, or it was
-/// deleted from the dashboard.
+/// deleted from the dashboard. `outbound` carries messages other tasks
+/// (chat requests) want written to this connection's socket.
 pub struct ConnHandle {
     pub id: u64,
     pub kick: Arc<Notify>,
+    pub outbound: mpsc::Receiver<ServerMessage>,
+}
+
+/// Where to send a message for a connected client: its connection id (to
+/// match replies against) and its outbound queue.
+pub struct ConnSender {
+    pub conn_id: u64,
+    pub models: Vec<ModelInfo>,
+    pub tx: mpsc::Sender<ServerMessage>,
 }
 
 #[derive(Debug, PartialEq)]
@@ -75,6 +89,9 @@ struct Inner {
 struct Conn {
     id: u64,
     kick: Arc<Notify>,
+    outbound: mpsc::Sender<ServerMessage>,
+    /// From the client's latest `models` message; empty until it sends one.
+    models: Vec<ModelInfo>,
     samples: VecDeque<Sample>,
     last_accepted: Option<Instant>,
 }
@@ -109,11 +126,14 @@ impl Live {
         inner.next_conn_id += 1;
         let id = inner.next_conn_id;
         let kick = Arc::new(Notify::new());
+        let (outbound_tx, outbound) = mpsc::channel(OUTBOUND_QUEUE);
         let old = inner.conns.insert(
             client_id.to_string(),
             Conn {
                 id,
                 kick: kick.clone(),
+                outbound: outbound_tx,
+                models: Vec::new(),
                 samples: VecDeque::with_capacity(self.limits.history_samples),
                 last_accepted: None,
             },
@@ -124,7 +144,7 @@ impl Live {
             old.kick.notify_one();
         }
         touch(&mut inner, client_id);
-        ConnHandle { id, kick }
+        ConnHandle { id, kick, outbound }
     }
 
     /// Removes the connection and its history, if `conn_id` is still the
@@ -138,6 +158,39 @@ impl Live {
         } else {
             false
         }
+    }
+
+    /// Replaces the models `conn_id` advertises. Returns false if that
+    /// connection is no longer the client's current one.
+    pub fn set_models(&self, client_id: &str, conn_id: u64, models: Vec<ModelInfo>) -> bool {
+        let mut inner = self.lock();
+        match inner.conns.get_mut(client_id).filter(|c| c.id == conn_id) {
+            Some(conn) => {
+                conn.models = models;
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// The client's current connection, if it's connected.
+    pub fn sender(&self, client_id: &str) -> Option<ConnSender> {
+        let inner = self.lock();
+        inner.conns.get(client_id).map(|c| ConnSender {
+            conn_id: c.id,
+            models: c.models.clone(),
+            tx: c.outbound.clone(),
+        })
+    }
+
+    /// Every model a connected client advertises, as (client_id, model).
+    pub fn models(&self) -> Vec<(String, ModelInfo)> {
+        let inner = self.lock();
+        inner
+            .conns
+            .iter()
+            .flat_map(|(id, c)| c.models.iter().map(move |m| (id.clone(), m.clone())))
+            .collect()
     }
 
     /// Any inbound frame: proof of life.
@@ -381,6 +434,43 @@ mod tests {
 
         live.forget("c");
         assert!(!live.snapshot(0).last_seen.contains_key("c"));
+    }
+
+    #[test]
+    fn models_follow_the_current_connection() {
+        let live = live(60);
+        let first = live.register("c");
+        let echo = vec![ModelInfo { id: "echo".into() }];
+        assert!(live.set_models("c", first.id, echo.clone()));
+        assert_eq!(live.models(), vec![("c".to_string(), echo[0].clone())]);
+        assert_eq!(
+            live.sender("c").map(|s| (s.conn_id, s.models)),
+            Some((first.id, echo.clone()))
+        );
+
+        // A reconnect starts with no models, and the old connection can't set them.
+        let second = live.register("c");
+        assert!(live.models().is_empty());
+        assert!(!live.set_models("c", first.id, echo.clone()));
+        assert_eq!(live.sender("c").map(|s| s.conn_id), Some(second.id));
+
+        live.unregister("c", second.id);
+        assert!(live.sender("c").is_none());
+    }
+
+    #[tokio::test]
+    async fn sender_reaches_the_connections_outbound_queue() {
+        let live = live(60);
+        let mut conn = live.register("c");
+        live.sender("c")
+            .unwrap()
+            .tx
+            .try_send(ServerMessage::ChatCancel { request_id: "r".into() })
+            .unwrap();
+        assert!(matches!(
+            conn.outbound.recv().await,
+            Some(ServerMessage::ChatCancel { request_id }) if request_id == "r"
+        ));
     }
 
     /// Whether a `Notified` future is already complete (a stored permit).

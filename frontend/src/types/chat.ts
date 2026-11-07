@@ -27,10 +27,37 @@ export interface Conversation {
   messages: ChatMessage[]
 }
 
-/** One entry in the model picker. Will eventually be "a model on a client". */
+/** One entry in the model picker: a model offered by a connected client. */
 export interface ModelOption {
+  /** `${clientId}/${model}`: unique across clients offering the same model. */
   id: string
+  clientId: string
+  model: string
+  /** The model name. */
   label: string
-  /** Secondary line, e.g. which client hosts it. */
+  /** Secondary line: which client hosts it. */
   detail?: string
+}
+
+// ---- wire types: mirror server/src/chat.rs and protocol/src/chat.rs ----
+
+/** One message of the history sent with a request. */
+export interface ChatTurn {
+  role: Role
+  content: string
+}
+
+/** `POST /api/chat` body. `messages` is the whole conversation, ending with the new message. */
+export interface ChatRequest {
+  client_id: string
+  model: string
+  messages: ChatTurn[]
+}
+
+/** One entry of `GET /api/chat/models`. */
+export interface ChatModel {
+  client_id: string
+  /** The client's friendly name (or hostname). */
+  client_name: string
+  model: string
 }

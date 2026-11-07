@@ -101,6 +101,8 @@ pub struct Settings {
     pub last_seen_flush_interval: Duration,
     pub metrics: MetricsLimits,
     pub pairing_code_ttl_secs: u64,
+    /// The longest a chat reply may go without a chunk (or its first one) before it's abandoned.
+    pub chat_idle_timeout: Duration,
     pub dashboard: DashboardConfig,
 }
 
@@ -209,6 +211,10 @@ impl Settings {
         let pairing_ttl = p.int("PAIRING_CODE_TTL_SECS", 600, 1);
         let pairing_poll = p.int("DASHBOARD_PAIRING_POLL_INTERVAL_MS", 1_500, 1);
 
+        // ---- chat ----
+        // Generous: a model's first token can take a while if it has to load.
+        let chat_idle = p.int("CHAT_IDLE_TIMEOUT_MS", 120_000, 1);
+
         // ---- dashboard ----
         let poll = p.int("DASHBOARD_POLL_INTERVAL_MS", 1_000, 1);
         let pause_when_hidden = p.bool("DASHBOARD_PAUSE_WHEN_HIDDEN", true);
@@ -264,6 +270,7 @@ impl Settings {
                 max_string_len: max_string_len as usize,
             },
             pairing_code_ttl_secs: pairing_ttl,
+            chat_idle_timeout: Duration::from_millis(chat_idle),
             dashboard: DashboardConfig {
                 poll_interval_ms: poll,
                 pause_when_hidden,
@@ -324,6 +331,7 @@ impl Settings {
                 "pairing: code TTL {} s, dashboard polls its status every {} ms",
                 self.pairing_code_ttl_secs, d.pairing_poll_interval_ms
             ),
+            format!("chat: idle timeout {} ms", self.chat_idle_timeout.as_millis()),
             format!(
                 "dashboard: poll every {} ms, pause when hidden {}, graph {}x{} px grid {} px, \
                  colours line {} grid {} bg {}, {} GPU(s) when collapsed, blink every {} ms",
@@ -459,6 +467,7 @@ mod tests {
             }
         );
         assert_eq!(s.pairing_code_ttl_secs, 600);
+        assert_eq!(s.chat_idle_timeout, Duration::from_millis(120_000));
         assert_eq!(
             s.dashboard,
             DashboardConfig {

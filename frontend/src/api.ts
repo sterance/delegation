@@ -5,6 +5,8 @@
 // No auth here on purpose — Cloudflare Access sits in front of the whole
 // origin, and same-origin fetches already carry its cookie.
 
+import type { ChatModel, ChatRequest } from './types/chat'
+
 export interface Client {
   client_id: string
   hostname: string
@@ -214,6 +216,64 @@ export async function createPairingCode(): Promise<string> {
 /** Throws an ApiError with status 404 if the server doesn't know the code. */
 export function getPairingCodeStatus(code: string): Promise<PairingCodeStatus> {
   return request<PairingCodeStatus>('GET', `/api/admin/pairing-code/${encodeURIComponent(code)}/status`)
+}
+
+/** Every model offered by a connected client. */
+export function listChatModels(): Promise<ChatModel[]> {
+  return request<ChatModel[]>('GET', '/api/chat/models')
+}
+
+/**
+ * `POST /api/chat`: streams the reply, calling `onDelta` with each piece as
+ * it arrives. Resolves once the reply is complete; rejects with the
+ * server's or client's error, or if the stream breaks off. Aborting
+ * `signal` stops it, and the server then cancels the request on the client.
+ */
+export async function streamChat(req: ChatRequest, onDelta: (delta: string) => void, signal?: AbortSignal): Promise<void> {
+  const res = await fetch('/api/chat', {
+    method: 'POST',
+    headers: { Accept: 'text/event-stream', 'Content-Type': 'application/json' },
+    body: JSON.stringify(req),
+    signal,
+    cache: 'no-store',
+  })
+  if (!res.ok) {
+    // Errors found before the reply starts come back as JSON `{error}`.
+    const body = (await res.json().catch(() => null)) as { error?: string } | null
+    throw new ApiError(res.status, body?.error ?? `POST /api/chat failed: ${res.status} ${res.statusText}`)
+  }
+  if (!res.body) throw new Error('The reply had no body')
+
+  // Server-sent events: blocks separated by a blank line, each with an
+  // `event:` and a `data:` line. Lines starting with `:` are keep-alives.
+  // EventSource can't POST, so this parses them by hand.
+  const reader = res.body.pipeThrough(new TextDecoderStream()).getReader()
+  let buffer = ''
+  try {
+    for (;;) {
+      const { value, done } = await reader.read()
+      if (done) throw new Error('The reply broke off before it finished')
+      buffer += value.replace(/\r/g, '')
+      let end: number
+      while ((end = buffer.indexOf('\n\n')) !== -1) {
+        const block = buffer.slice(0, end)
+        buffer = buffer.slice(end + 2)
+        let event = 'message'
+        let data = ''
+        for (const line of block.split('\n')) {
+          if (line.startsWith('event:')) event = line.slice(6).trim()
+          else if (line.startsWith('data:')) data += line.slice(5).trimStart()
+        }
+        if (!data) continue
+        const payload = JSON.parse(data) as { delta?: string; error?: string }
+        if (event === 'chunk') onDelta(payload.delta ?? '')
+        else if (event === 'done') return
+        else if (event === 'error') throw new Error(payload.error ?? 'The reply failed')
+      }
+    }
+  } finally {
+    reader.cancel().catch(() => {})
+  }
 }
 
 export function errorMessage(err: unknown): string {

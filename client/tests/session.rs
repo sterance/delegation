@@ -7,7 +7,7 @@ use delegation_client::identity::Identity;
 use delegation_client::sampler::{Reading, Sampler, Source};
 use delegation_client::session::{self, ClientInfo, ServerIdentity, SessionCmd, SessionStatus};
 use futures_util::{SinkExt, StreamExt};
-use protocol::{ClientMessage, ClientSettings, ServerMessage, Tick};
+use protocol::{ChatRole, ChatTurn, ClientMessage, ClientSettings, ServerMessage, Tick};
 use std::time::Duration;
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{mpsc, watch};
@@ -160,12 +160,14 @@ async fn ticks_keep_coming_without_metrics_when_the_sampler_stalls() {
     });
 
     let mut ticks: Vec<Tick> = Vec::new();
+    let mut models = Vec::new();
     let mut pongs = 0;
     let deadline = tokio::time::Instant::now() + Duration::from_millis(1_500);
     while let Ok(Some(frame)) = tokio::time::timeout_at(deadline, stream.next()).await {
         match frame.unwrap() {
             Message::Text(text) => match serde_json::from_str(&text).unwrap() {
                 ClientMessage::Tick(tick) => ticks.push(tick),
+                ClientMessage::Models { models: m } => models.push(m),
                 other => panic!("unexpected {other:?}"),
             },
             Message::Pong(_) => pongs += 1,
@@ -192,6 +194,8 @@ async fn ticks_keep_coming_without_metrics_when_the_sampler_stalls() {
         "once the reading is older than sample_max_age_ms, ticks carry no metrics"
     );
     assert!(pongs >= 5, "pings were answered with pongs ({pongs})");
+    assert_eq!(models.len(), 1, "models advertised once per connection");
+    assert_eq!(models[0], delegation_client::chat::models());
     assert!(
         h.statuses.try_recv().is_err(),
         "the client never dropped the connection"
@@ -227,4 +231,84 @@ async fn a_silent_server_is_dropped_and_reconnected() {
     let _second = accept_and_welcome(&h.listener, pushed).await;
     assert_eq!(expect_status(&mut h.statuses).await, SessionStatus::Connected(pushed));
     silent.abort();
+}
+
+/// The chat messages the client sends, skipping ticks and models.
+async fn next_chat_message(ws: &mut Ws) -> ClientMessage {
+    loop {
+        match tokio::time::timeout(Duration::from_secs(5), next_client_message(ws))
+            .await
+            .expect("no chat message")
+        {
+            ClientMessage::Tick(_) | ClientMessage::Models { .. } | ClientMessage::Info { .. } => {}
+            other => return other,
+        }
+    }
+}
+
+fn echo_request(request_id: &str, text: &str) -> ServerMessage {
+    ServerMessage::ChatRequest {
+        request_id: request_id.into(),
+        model: delegation_client::chat::ECHO_MODEL.into(),
+        messages: vec![ChatTurn {
+            role: ChatRole::User,
+            content: text.into(),
+        }],
+    }
+}
+
+#[tokio::test]
+async fn chat_requests_are_echoed_back_and_can_be_cancelled() {
+    let sampler = Sampler::spawn_with(Duration::from_millis(200), || StallsAfterFirst(false));
+    let h = start(sampler).await;
+    // Slow ticks and a long silence timeout: this test doesn't send pings.
+    let settings = ClientSettings {
+        tick_interval_ms: 1_000,
+        server_silence_timeout_ms: 10_000,
+        ..fast_settings()
+    };
+    let mut ws = accept_and_welcome(&h.listener, settings).await;
+
+    send(&mut ws, &echo_request("r1", "hello there world")).await;
+    let mut reply = String::new();
+    loop {
+        match next_chat_message(&mut ws).await {
+            ClientMessage::ChatChunk { request_id, delta } => {
+                assert_eq!(request_id, "r1");
+                reply.push_str(&delta);
+            }
+            ClientMessage::ChatDone { request_id } => {
+                assert_eq!(request_id, "r1");
+                break;
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+    }
+    assert_eq!(reply, "hello there world");
+
+    // Cancelled after the first word: no more of r2 arrives.
+    let long: String = (0..40).map(|i| format!("w{i} ")).collect();
+    send(&mut ws, &echo_request("r2", &long)).await;
+    assert!(matches!(
+        next_chat_message(&mut ws).await,
+        ClientMessage::ChatChunk { request_id, .. } if request_id == "r2"
+    ));
+    send(
+        &mut ws,
+        &ServerMessage::ChatCancel {
+            request_id: "r2".into(),
+        },
+    )
+    .await;
+    // At most one chunk was already in flight; after that, nothing.
+    let mut after_cancel = 0;
+    let deadline = tokio::time::Instant::now() + Duration::from_millis(500);
+    while let Ok(msg) = tokio::time::timeout_at(deadline, next_client_message(&mut ws)).await {
+        match msg {
+            ClientMessage::ChatChunk { .. } => after_cancel += 1,
+            ClientMessage::ChatDone { .. } | ClientMessage::ChatError { .. } => panic!("a cancelled reply finished"),
+            _ => {}
+        }
+    }
+    assert!(after_cancel <= 1, "{after_cancel} chunks arrived after the cancel");
 }

@@ -1,3 +1,4 @@
+mod chat;
 mod config;
 mod db;
 mod live;
@@ -14,6 +15,7 @@ use axum::{
     Json, Router,
 };
 use base64::{engine::general_purpose::STANDARD, Engine as _};
+use chat::{ChatEvent, Chats};
 use config::{ConfigFile, Settings};
 use db::Db;
 use ed25519_dalek::{Signature, Verifier, VerifyingKey};
@@ -40,6 +42,8 @@ struct AppState {
     /// Connections, metric history and unflushed `last_seen_at` values.
     live: Arc<Live>,
     settings: Arc<Settings>,
+    /// Chat requests sent to clients and still waiting on their replies.
+    chats: Arc<Chats>,
 }
 
 static DEBUG_LOGGING: AtomicBool = AtomicBool::new(false);
@@ -89,7 +93,12 @@ async fn main() {
     let live = Arc::new(Live::new(settings.metrics));
     log(format!("[live] epoch {}", live.epoch));
     let settings = Arc::new(settings);
-    let state = AppState { db, live, settings };
+    let state = AppState {
+        db,
+        live,
+        settings,
+        chats: Arc::new(Chats::default()),
+    };
 
     tokio::spawn(flush_loop(state.clone()));
 
@@ -112,13 +121,14 @@ async fn main() {
         .route("/admin/dashboard-config", get(dashboard_config))
         .route("/clients", get(list_clients))
         .route("/clients/:client_id", patch(update_client).delete(delete_client))
+        .route("/chat", post(chat::post_chat))
+        .route("/chat/models", get(chat::list_models))
         .fallback(|| async { StatusCode::NOT_FOUND });
 
     // Any path that isn't a real file gets index.html, so deep links and
     // reloads of client-side routes load the app, which then routes itself.
-    let spa = ServeDir::new(&frontend_dir).fallback(ServeFile::new(
-        std::path::Path::new(&frontend_dir).join("index.html"),
-    ));
+    let spa =
+        ServeDir::new(&frontend_dir).fallback(ServeFile::new(std::path::Path::new(&frontend_dir).join("index.html")));
 
     let app = Router::new()
         // Used by the client binary, so these stay at the root.
@@ -516,17 +526,19 @@ async fn handle_socket(mut socket: WebSocket, state: AppState) {
         return;
     }
     log(format!("[ws] client {client_id} authenticated"));
-    let conn = state.live.register(&client_id);
+    let mut conn = state.live.register(&client_id);
+    let conn_id = conn.id;
     let mut session = Session {
         state: &state,
         client_id: &client_id,
         hostname: record.hostname,
-        conn: &conn,
+        conn: &mut conn,
         next_seq: 0,
     };
     let reason = session.run(&mut socket).await;
 
-    state.live.unregister(&client_id, conn.id);
+    state.live.unregister(&client_id, conn_id);
+    state.chats.fail_conn(conn_id, "the client disconnected");
     flush_last_seen(&state, Some(&client_id));
     log(format!("[ws] client {client_id} disconnected: {reason}"));
 }
@@ -537,7 +549,7 @@ struct Session<'a> {
     client_id: &'a str,
     /// For log lines only; updated when the client reports a new name.
     hostname: String,
-    conn: &'a ConnHandle,
+    conn: &'a mut ConnHandle,
     /// The tick seq we expect next, to log drops at debug level.
     next_seq: u64,
 }
@@ -577,6 +589,15 @@ impl Session<'_> {
                         Ok(Ok(())) => {}
                         Ok(Err(e)) => return format!("ping failed: {e}"),
                         Err(_) => return "ping send timed out".into(),
+                    }
+                }
+                // Chat requests and cancels queued by HTTP handlers.
+                Some(out) = self.conn.outbound.recv() => {
+                    let Ok(text) = serde_json::to_string(&out) else { continue };
+                    match tokio::time::timeout(liveness_timeout, socket.send(Message::Text(text))).await {
+                        Ok(Ok(())) => {}
+                        Ok(Err(e)) => return format!("send failed: {e}"),
+                        Err(_) => return "send timed out".into(),
                     }
                 }
                 msg = socket.recv() => {
@@ -620,10 +641,38 @@ impl Session<'_> {
                 }
                 self.hostname = hostname;
             }
+            Ok(ClientMessage::Models { models }) => {
+                let ids: Vec<&str> = models.iter().map(|m| m.id.as_str()).collect();
+                log(format!("[models] {client_id} ({}): {}", self.hostname, ids.join(", ")));
+                self.state.live.set_models(client_id, self.conn.id, models);
+            }
+            Ok(ClientMessage::ChatChunk { request_id, delta }) => {
+                self.deliver_chat(&request_id, ChatEvent::Chunk(delta))
+            }
+            Ok(ClientMessage::ChatDone { request_id }) => {
+                debug(|| format!("[chat] {request_id} done"));
+                self.deliver_chat(&request_id, ChatEvent::Done)
+            }
+            Ok(ClientMessage::ChatError { request_id, error }) => {
+                log(format!("[chat] {request_id} failed on {client_id}: {error}"));
+                self.deliver_chat(&request_id, ChatEvent::Error(error))
+            }
             Ok(ClientMessage::Hello { .. } | ClientMessage::ChallengeResponse { .. }) => {
                 log(format!("[ws] unexpected handshake message from {client_id}"))
             }
             Err(e) => debug(|| format!("[ws] unparseable message from {client_id}: {e}")),
+        }
+    }
+
+    fn deliver_chat(&self, request_id: &str, event: ChatEvent) {
+        if !self.state.chats.deliver(self.conn.id, request_id, event) {
+            // Normal after a cancel: chunks already in flight still arrive.
+            debug(|| {
+                format!(
+                    "[chat] {} sent a reply for unknown request {request_id}",
+                    self.client_id
+                )
+            });
         }
     }
 

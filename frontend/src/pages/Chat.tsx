@@ -100,10 +100,12 @@ export default function Chat() {
           <Box sx={{ maxWidth: CHAT_COLUMN_MAX_WIDTH, mx: 'auto' }}>
             <Composer
               onSend={chat.send}
-              disabled={chat.busy}
+              // No model: nowhere to send it.
+              disabled={chat.busy || chat.modelId === null}
               models={chat.models}
               modelId={chat.modelId}
               onSelectModel={chat.selectModel}
+              onOpenModels={chat.refreshModels}
             />
           </Box>
         </Box>

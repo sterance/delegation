@@ -3,6 +3,7 @@
 //! `controller`, sending commands in and getting status updates back, so
 //! the CLI and the tray share exactly the same connection logic.
 
+use crate::chat;
 use crate::hardware::MachineInfo;
 use crate::identity::Identity;
 use crate::sampler::Sampler;
@@ -12,6 +13,7 @@ use ed25519_dalek::Signer;
 use futures_util::{SinkExt, StreamExt};
 use log::{debug, info, warn};
 use protocol::{AuthFailedReason, ClientMessage, ClientSettings, ServerMessage, Tick};
+use std::collections::HashMap;
 use std::future::Future;
 use std::sync::Arc;
 use std::time::Duration;
@@ -308,6 +310,13 @@ async fn run_session(
         send(&mut write, &info_message(&m)).await?;
         info_sent = true;
     }
+    send(&mut write, &ClientMessage::Models { models: chat::models() }).await?;
+
+    // Chat replies are generated on their own tasks and queued here for
+    // this loop to send. Dropping `chats` (however the session ends) aborts
+    // any still running, so nothing keeps generating for a dead socket.
+    let (chat_tx, mut chat_rx) = mpsc::channel::<ClientMessage>(64);
+    let mut chats = ChatTasks::default();
 
     // Scheduled from a fixed start, so ticks don't drift; after a stall
     // (a suspended laptop, a blocked send) the missed ones are skipped
@@ -331,6 +340,9 @@ async fn run_session(
                 within(silence, "sending a tick", send(&mut write, &ClientMessage::Tick(Tick { seq, metrics }))).await??;
                 debug!(target: "tick", "sent {seq} (metrics: {has_metrics})");
                 seq += 1;
+            }
+            Some(out) = chat_rx.recv() => {
+                within(silence, "sending a chat reply", send(&mut write, &out)).await??;
             }
             _ = tokio::time::sleep_until(last_inbound + silence) => {
                 bail!("nothing from the server in {} ms, treating the connection as dead", silence.as_millis());
@@ -359,6 +371,16 @@ async fn run_session(
                 last_inbound = Instant::now();
                 match msg {
                     Message::Text(text) => match serde_json::from_str::<ServerMessage>(&text) {
+                        Ok(ServerMessage::ChatRequest { request_id, model, messages }) => {
+                            info!(target: "chat", "request {request_id}: {model}, {} message(s)", messages.len());
+                            let task = tokio::spawn(chat::respond(request_id.clone(), model, messages, chat_tx.clone()));
+                            chats.start(request_id, task);
+                        }
+                        Ok(ServerMessage::ChatCancel { request_id }) => {
+                            if chats.cancel(&request_id) {
+                                info!(target: "chat", "request {request_id} cancelled");
+                            }
+                        }
                         Ok(other) => info!(target: "ws", "unexpected message after welcome: {other:?}"),
                         Err(e) => info!(target: "ws", "couldn't parse server message: {e}"),
                     },
@@ -366,6 +388,38 @@ async fn run_session(
                     _ => {}
                 }
             }
+        }
+    }
+}
+
+/// The chat replies being generated, by request_id. Aborts them all when
+/// dropped.
+#[derive(Default)]
+struct ChatTasks(HashMap<String, tokio::task::AbortHandle>);
+
+impl ChatTasks {
+    fn start(&mut self, request_id: String, task: tokio::task::JoinHandle<()>) {
+        // Finished ones are only pruned here, so the map stays as small as
+        // the number of replies in progress.
+        self.0.retain(|_, handle| !handle.is_finished());
+        self.0.insert(request_id, task.abort_handle());
+    }
+
+    /// Stops a reply; returns whether it was still running.
+    fn cancel(&mut self, request_id: &str) -> bool {
+        let Some(handle) = self.0.remove(request_id) else {
+            return false;
+        };
+        let running = !handle.is_finished();
+        handle.abort();
+        running
+    }
+}
+
+impl Drop for ChatTasks {
+    fn drop(&mut self) {
+        for handle in self.0.values() {
+            handle.abort();
         }
     }
 }

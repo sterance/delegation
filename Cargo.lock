@@ -757,6 +757,7 @@ dependencies = [
  "axum",
  "base64 0.21.7",
  "ed25519-dalek",
+ "futures-util",
  "protocol",
  "rand 0.8.8",
  "rusqlite",

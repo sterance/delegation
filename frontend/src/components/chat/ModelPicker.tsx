@@ -12,9 +12,11 @@ interface Props {
   models: ModelOption[]
   selectedId: string | null
   onSelect: (id: string) => void
+  /** Called each time the menu opens, to refresh the list. */
+  onOpen?: () => void
 }
 
-export default function ModelPicker({ models, selectedId, onSelect }: Props) {
+export default function ModelPicker({ models, selectedId, onSelect, onOpen }: Props) {
   const [anchor, setAnchor] = useState<HTMLElement | null>(null)
   const selected = models.find((m) => m.id === selectedId)
 
@@ -24,12 +26,15 @@ export default function ModelPicker({ models, selectedId, onSelect }: Props) {
         size="small"
         color="inherit"
         endIcon={<KeyboardArrowDownIcon />}
-        onClick={(e) => setAnchor(e.currentTarget)}
+        onClick={(e) => {
+          setAnchor(e.currentTarget)
+          onOpen?.()
+        }}
         aria-haspopup="menu"
         aria-expanded={anchor ? 'true' : undefined}
         sx={{ textTransform: 'none', color: 'text.secondary' }}
       >
-        {selected?.label ?? 'Model'}
+        {selected ? `${selected.label}${selected.detail ? ` · ${selected.detail}` : ''}` : 'Model'}
       </Button>
       <Menu
         anchorEl={anchor}
@@ -39,6 +44,7 @@ export default function ModelPicker({ models, selectedId, onSelect }: Props) {
         anchorOrigin={{ vertical: 'top', horizontal: 'left' }}
         transformOrigin={{ vertical: 'bottom', horizontal: 'left' }}
       >
+        {models.length === 0 && <MenuItem disabled>No models available, connect a client</MenuItem>}
         {models.map((m) => (
           <MenuItem
             key={m.id}
