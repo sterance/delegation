@@ -1,6 +1,7 @@
 # Builds the Windows tray client and its installer on every push to main,
-# every PR, and on demand. Download the installer from the run's
-# "Artifacts" section to test on a real Windows machine.
+# every PR, and on demand. Pushes to main also publish both as a GitHub
+# Release (tag v<APP_VERSION>), marked latest; for PRs and manual runs,
+# download them from the run's "Artifacts" section instead.
 name: Windows
 
 on:
@@ -8,6 +9,10 @@ on:
     branches: [main]
   pull_request:
   workflow_dispatch:
+
+# Read-only by default; only the release job below can write.
+permissions:
+  contents: read
 
 jobs:
   tray:
@@ -53,3 +58,51 @@ jobs:
           name: DelegationTray-Setup-${{ env.APP_VERSION }}
           path: installer/Output/DelegationTray-Setup-${{ env.APP_VERSION }}.exe
           if-no-files-found: error
+
+      # The tray is a single exe, so it also runs without installing.
+      - name: Portable exe
+        shell: pwsh
+        run: Copy-Item target\release\delegation-tray.exe "installer\Output\DelegationTray-$env:APP_VERSION-portable.exe"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: DelegationTray-${{ env.APP_VERSION }}-portable
+          path: installer/Output/DelegationTray-${{ env.APP_VERSION }}-portable.exe
+          if-no-files-found: error
+
+  # Only pushes to main publish a release: PR builds and manual runs stay as
+  # artifacts. Kept as a separate job so the build job (which runs PR code)
+  # never gets write access.
+  release:
+    needs: tray
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    env:
+      # Same run, so the same number as the build job's APP_VERSION.
+      VERSION: 0.1.0.${{ github.run_number }}
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: DelegationTray-*
+          merge-multiple: true
+          path: dist
+
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        # A re-run keeps the same run_number, so the release may already
+        # exist: then replace its files instead of failing on the tag.
+        run: |
+          if gh release view "v$VERSION" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release upload "v$VERSION" dist/*.exe --repo "$GITHUB_REPOSITORY" --clobber
+            gh release edit "v$VERSION" --repo "$GITHUB_REPOSITORY" --latest
+          else
+            gh release create "v$VERSION" dist/*.exe \
+              --repo "$GITHUB_REPOSITORY" \
+              --target "$GITHUB_SHA" \
+              --title "Delegation tray $VERSION" \
+              --notes "Windows tray client built from $GITHUB_SHA. Install with DelegationTray-Setup-$VERSION.exe, or run the portable exe without installing. Not code signed: SmartScreen will warn (More info, then Run anyway)." \
+              --latest
+          fi

@@ -405,9 +405,17 @@ It is the client's whole identity.
 
 #### Option C: Windows tray app
 
-The installer is built by the **Windows** GitHub Actions workflow on every
-push to `main` and every PR (or run it by hand from the Actions tab).
-Download `DelegationTray-Setup-<version>` from the run's Artifacts.
+The **Windows** GitHub Actions workflow builds the tray app on every push
+to `main` and every PR (or run it by hand from the Actions tab). Each push
+to `main` publishes a GitHub Release, tagged `v0.1.0.<run number>` and
+marked latest, with two files:
+
+- `DelegationTray-Setup-<version>.exe`, the installer (recommended).
+- `DelegationTray-<version>-portable.exe`, the bare app, which runs without
+  installing but doesn't start at login.
+
+Download them from the repo's **Releases** page. For PR builds, use the
+run's Artifacts instead.
 
 It installs per user into `%LOCALAPPDATA%\Programs\Delegation` (no admin
 prompt), starts at login, and offers to launch at the end. It isn't code
