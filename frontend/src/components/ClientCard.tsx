@@ -12,7 +12,7 @@ import Stack from "@mui/material/Stack";
 import Tooltip from "@mui/material/Tooltip";
 import Typography from "@mui/material/Typography";
 import { MAX_FRIENDLY_NAME_LENGTH, type Client, type DashboardConfig, type HardwareSpecs } from "../api";
-import { MISSING, formatCpu, formatDisk, formatGib, formatGpu, formatMemory, specsSummary } from "../format";
+import { MISSING, formatCpu, formatDisk, formatGib, formatGpu, formatMemory } from "../format";
 import { latestSample, metricsGpuCount, type History } from "../useClients";
 import ClientUsage from "./ClientUsage";
 import InlineTextEdit from "./InlineTextEdit";
@@ -178,7 +178,6 @@ interface Props {
 export default function ClientCard({ client, history, config, onRename, onDelete }: Props) {
   const [expanded, setExpanded] = useState(false);
   const detailsId = `client-${client.client_id}-details`;
-  const summary = specsSummary(client.specs);
   const gpuCount = metricsGpuCount(history, client.specs);
   const collapsedGpus = Math.min(gpuCount, config.collapsed_max_gpus);
 
