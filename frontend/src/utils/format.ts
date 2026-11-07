@@ -1,7 +1,7 @@
 // Display formatting for the hardware specs clients report. The server
 // passes raw units through untouched; everything human-readable is here.
 
-import type { Cpu, Disk, Gpu, HardwareSpecs, Memory } from './api'
+import type { Cpu, Disk, Gpu, HardwareSpecs, Memory } from '../api'
 
 export const MISSING = '—'
 

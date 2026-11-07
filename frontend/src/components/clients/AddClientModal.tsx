@@ -13,8 +13,8 @@ import Stack from '@mui/material/Stack'
 import Tooltip from '@mui/material/Tooltip'
 import Typography from '@mui/material/Typography'
 import { useEffect, useState } from 'react'
-import { ApiError, createPairingCode, errorMessage, getPairingCodeStatus, type ClaimedBy } from '../api'
-import { formatDuration } from '../format'
+import { ApiError, createPairingCode, errorMessage, getPairingCodeStatus, type ClaimedBy } from '../../api'
+import { formatDuration } from '../../utils/format'
 
 const MONOSPACE = 'ui-monospace, SFMono-Regular, Menlo, Consolas, "Liberation Mono", monospace'
 

@@ -15,7 +15,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Instant, SystemTime};
 use tokio::sync::Notify;
 
-/// One accepted sample, as `GET /clients` returns it.
+/// One accepted sample, as `GET /api/clients` returns it.
 #[derive(Serialize, Debug, Clone, PartialEq)]
 pub struct Sample {
     /// Server-wide: one counter across all clients, +1 per accepted sample.
@@ -48,7 +48,7 @@ pub enum SampleOutcome {
     NotConnected,
 }
 
-/// What `GET /clients` needs, read under one lock so `latest_seq` and the
+/// What `GET /api/clients` needs, read under one lock so `latest_seq` and the
 /// samples agree: a sample is never newer than the cursor the dashboard
 /// gets back, so it can't be skipped on the next poll.
 pub struct Snapshot {

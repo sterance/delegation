@@ -15,16 +15,20 @@ URL="http://127.0.0.1:7070"
 
 wait_server() {
   for _ in $(seq 1 60); do
-    curl -fsS "$URL/clients" >/dev/null 2>&1 && return 0
+    curl -fsS "$URL/api/clients" >/dev/null 2>&1 && return 0
     sleep 1
   done
   echo "server did not become ready" >&2; exit 1
 }
-mint_code() { curl -fsS -X POST "$URL/admin/pairing-code" | jq -r .code; }
+mint_code() { curl -fsS -X POST "$URL/api/admin/pairing-code" | jq -r .code; }
 
 case "${1:-up}" in
   up)
-    $DC up -d --build server frontend
+    $DC up -d --build server
+    # Recreated every time: it only runs `npm install` on start, and its
+    # node_modules lives in a volume, so new frontend deps would otherwise
+    # never get installed into an already-running container.
+    $DC up -d --force-recreate frontend
     wait_server
     if $DC run --rm --no-deps -T --entrypoint test client -f /root/.config/delegation-client/identity.json 2>/dev/null; then
       $DC --profile client up -d --build client
@@ -38,7 +42,7 @@ case "${1:-up}" in
     ;;
   logs)    $DC --profile client logs -f ;;
   status)
-    curl -fsS "$URL/clients" | jq '{epoch, latest_seq, clients: [.clients[] |
+    curl -fsS "$URL/api/clients" | jq '{epoch, latest_seq, clients: [.clients[] |
       {friendly_name, hostname, connected, last_seen_at, samples: (.samples | length),
        latest: (.samples[-1] // null | if . then {cpu_percent, gpus: [.gpus[].name]} else null end)}]}'
     ;;

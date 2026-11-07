@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
-import { errorMessage, listClients, type Client, type DashboardConfig, type HardwareSpecs, type Sample } from './api'
+import { errorMessage, listClients, type Client, type DashboardConfig, type HardwareSpecs, type Sample } from '../api'
 
 /** One client's graph data, built up from successive polls. */
 export interface History {
@@ -77,7 +77,7 @@ interface State {
 }
 
 /**
- * Polls `GET /clients?since=<cursor>` every `poll_interval_ms`, each poll
+ * Polls `GET /api/clients?since=<cursor>` every `poll_interval_ms`, each poll
  * scheduled only once the previous one has finished, and keeps each
  * client's sample history. `refresh` polls immediately and resolves once
  * data fetched after the call has been applied. Nothing runs until

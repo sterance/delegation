@@ -22,7 +22,7 @@ set -euo pipefail
 readonly DEFAULT_IMAGE=ghcr.io/sterance/delegation-server
 readonly SERVICE=delegation-server
 readonly CURL_IMAGE=curlimages/curl:8.10.1
-readonly HEALTH_URL=http://127.0.0.1:7070/clients
+readonly HEALTH_URL=http://127.0.0.1:7070/api/clients
 readonly HEALTH_TIMEOUT=60 # seconds
 
 cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")"

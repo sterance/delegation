@@ -1,9 +1,9 @@
 import Box from '@mui/material/Box'
 import type { SxProps, Theme } from '@mui/material/styles'
 import { useMemo } from 'react'
-import type { DashboardConfig, Sample } from '../api'
-import { NO_VALUE, formatGib } from '../format'
-import { latestSample, type History } from '../useClients'
+import type { DashboardConfig, Sample } from '../../api'
+import { NO_VALUE, formatGib } from '../../utils/format'
+import { latestSample, type History } from '../../hooks/useClients'
 import UsageGraph from './UsageGraph'
 
 interface GraphSpec {

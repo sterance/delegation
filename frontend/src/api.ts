@@ -24,7 +24,7 @@ export interface Client {
   samples: Sample[]
 }
 
-/** `GET /clients?since=<seq>`. */
+/** `GET /api/clients?since=<seq>`. */
 export interface ClientsResponse {
   /** Random per server start. A change means the server restarted and `seq` numbering began again. */
   epoch: string
@@ -80,7 +80,7 @@ export interface DashboardConfig {
   pairing_code_ttl_secs: number
 }
 
-/** Used if `/admin/dashboard-config` can't be loaded. Matches the server's compiled defaults. */
+/** Used if `/api/admin/dashboard-config` can't be loaded. Matches the server's compiled defaults. */
 export const DEFAULT_DASHBOARD_CONFIG: DashboardConfig = {
   poll_interval_ms: 1000,
   pause_when_hidden: true,
@@ -183,12 +183,12 @@ async function request<T>(method: 'GET' | 'POST' | 'PATCH' | 'DELETE', path: str
 
 /** `since` 0 returns each connected client's full sample history. */
 export function listClients(since: number): Promise<ClientsResponse> {
-  return request<ClientsResponse>('GET', `/clients?since=${since}`)
+  return request<ClientsResponse>('GET', `/api/clients?since=${since}`)
 }
 
 /** Fields missing from the response (an older server) fall back to the defaults. */
 export async function getDashboardConfig(): Promise<DashboardConfig> {
-  const config = await request<Partial<DashboardConfig>>('GET', '/admin/dashboard-config')
+  const config = await request<Partial<DashboardConfig>>('GET', '/api/admin/dashboard-config')
   return { ...DEFAULT_DASHBOARD_CONFIG, ...config }
 }
 
@@ -197,23 +197,23 @@ export const MAX_FRIENDLY_NAME_LENGTH = 64
 
 /** A blank name resets it to the client's hostname. */
 export function renameClient(clientId: string, friendlyName: string): Promise<void> {
-  return request<void>('PATCH', `/clients/${encodeURIComponent(clientId)}`, { friendly_name: friendlyName })
+  return request<void>('PATCH', `/api/clients/${encodeURIComponent(clientId)}`, { friendly_name: friendlyName })
 }
 
 /** If the client is connected, the server drops it and the client forgets its identity. */
 export function deleteClient(clientId: string): Promise<void> {
-  return request<void>('DELETE', `/clients/${encodeURIComponent(clientId)}`)
+  return request<void>('DELETE', `/api/clients/${encodeURIComponent(clientId)}`)
 }
 
 /** Mints a new one-time pairing code, valid for `pairing_code_ttl_secs`. */
 export async function createPairingCode(): Promise<string> {
-  const { code } = await request<{ code: string }>('POST', '/admin/pairing-code')
+  const { code } = await request<{ code: string }>('POST', '/api/admin/pairing-code')
   return code
 }
 
 /** Throws an ApiError with status 404 if the server doesn't know the code. */
 export function getPairingCodeStatus(code: string): Promise<PairingCodeStatus> {
-  return request<PairingCodeStatus>('GET', `/admin/pairing-code/${encodeURIComponent(code)}/status`)
+  return request<PairingCodeStatus>('GET', `/api/admin/pairing-code/${encodeURIComponent(code)}/status`)
 }
 
 export function errorMessage(err: unknown): string {

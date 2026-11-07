@@ -12,8 +12,7 @@ export default defineConfig({
     // Point these at the local axum instance from dev/dev.sh. API_TARGET is
     // set by the dev compose stack, where the server is reachable as `server`.
     proxy: {
-      '/clients': apiTarget,
-      '/admin': apiTarget,
+      '/api': apiTarget,
     },
   },
 })

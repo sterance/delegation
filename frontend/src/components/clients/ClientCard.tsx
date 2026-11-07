@@ -11,11 +11,11 @@ import IconButton from "@mui/material/IconButton";
 import Stack from "@mui/material/Stack";
 import Tooltip from "@mui/material/Tooltip";
 import Typography from "@mui/material/Typography";
-import { MAX_FRIENDLY_NAME_LENGTH, type Client, type DashboardConfig, type HardwareSpecs } from "../api";
-import { MISSING, formatCpu, formatDisk, formatGib, formatGpu, formatMemory } from "../format";
-import { latestSample, metricsGpuCount, type History } from "../useClients";
+import { MAX_FRIENDLY_NAME_LENGTH, type Client, type DashboardConfig, type HardwareSpecs } from "../../api";
+import { MISSING, formatCpu, formatDisk, formatGib, formatGpu, formatMemory } from "../../utils/format";
+import { latestSample, metricsGpuCount, type History } from "../../hooks/useClients";
 import ClientUsage from "./ClientUsage";
-import InlineTextEdit from "./InlineTextEdit";
+import InlineTextEdit from "../common/InlineTextEdit";
 
 const timestampFormat = new Intl.DateTimeFormat(undefined, { dateStyle: "medium", timeStyle: "medium" });
 

@@ -9,7 +9,7 @@ import TextField from '@mui/material/TextField'
 import Tooltip from '@mui/material/Tooltip'
 import Typography, { type TypographyProps } from '@mui/material/Typography'
 import { useState, type KeyboardEvent } from 'react'
-import { errorMessage } from '../api'
+import { errorMessage } from '../../api'
 
 interface Props {
   value: string

@@ -2,10 +2,10 @@ import Paper from '@mui/material/Paper'
 import Stack from '@mui/material/Stack'
 import Typography from '@mui/material/Typography'
 import { useState } from 'react'
-import { deleteClient, renameClient, type Client, type DashboardConfig } from '../api'
-import type { History } from '../useClients'
+import { deleteClient, renameClient, type Client, type DashboardConfig } from '../../api'
+import type { History } from '../../hooks/useClients'
 import ClientCard from './ClientCard'
-import ConfirmationModal from './ConfirmationModal'
+import ConfirmationModal from '../common/ConfirmationModal'
 
 interface Props {
   clients: Client[]

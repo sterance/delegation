@@ -113,7 +113,7 @@ pub struct MetricsLimits {
     pub max_string_len: usize,
 }
 
-/// What `GET /admin/dashboard-config` returns. Field names are the
+/// What `GET /api/admin/dashboard-config` returns. Field names are the
 /// variable names, lowercased, minus the `DASHBOARD_` prefix; mirrored by
 /// hand in `frontend/src/api.ts`.
 #[derive(Debug, Clone, Serialize, PartialEq)]

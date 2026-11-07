@@ -31,7 +31,7 @@ use std::{
     time::{Duration, Instant},
 };
 use tokio::time::MissedTickBehavior;
-use tower_http::services::ServeDir;
+use tower_http::services::{ServeDir, ServeFile};
 use uuid::Uuid;
 
 #[derive(Clone)]
@@ -103,17 +103,31 @@ async fn main() {
         ));
     }
 
-    let app = Router::new()
-        .route("/enroll", post(enroll))
+    // Dashboard-facing endpoints live under /api so they never collide with
+    // the dashboard's own client-side routes (/clients, /chat, ...). Unknown
+    // /api paths 404 here instead of falling through to index.html.
+    let api = Router::new()
         .route("/admin/pairing-code", post(create_pairing_code))
         .route("/admin/pairing-code/:code/status", get(pairing_code_status))
         .route("/admin/dashboard-config", get(dashboard_config))
         .route("/clients", get(list_clients))
         .route("/clients/:client_id", patch(update_client).delete(delete_client))
+        .fallback(|| async { StatusCode::NOT_FOUND });
+
+    // Any path that isn't a real file gets index.html, so deep links and
+    // reloads of client-side routes load the app, which then routes itself.
+    let spa = ServeDir::new(&frontend_dir).fallback(ServeFile::new(
+        std::path::Path::new(&frontend_dir).join("index.html"),
+    ));
+
+    let app = Router::new()
+        // Used by the client binary, so these stay at the root.
+        .route("/enroll", post(enroll))
         .route("/ws", get(ws_upgrade))
+        .nest("/api", api)
         // Fallback, not a route: only requests no route above matched ever
         // reach the static files, so the dashboard can't shadow the API.
-        .fallback_service(ServeDir::new(&frontend_dir))
+        .fallback_service(spa)
         .with_state(state.clone());
 
     let port = state.settings.port;

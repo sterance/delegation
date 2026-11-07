@@ -235,7 +235,7 @@ pub struct ClientListRow {
 /// Backs the dashboard's client list. Connected/disconnected and the
 /// metric samples are deliberately NOT part of this: they're live state in
 /// `live.rs`, never persisted. `last_seen_at` here can be up to one flush
-/// interval old; `GET /clients` prefers the in-memory value.
+/// interval old; `GET /api/clients` prefers the in-memory value.
 pub fn list_clients(db: &Db) -> Result<Vec<ClientListRow>> {
     let conn = db.lock().unwrap();
     let mut stmt = conn.prepare(
