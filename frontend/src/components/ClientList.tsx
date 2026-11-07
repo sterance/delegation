@@ -2,17 +2,21 @@ import Paper from '@mui/material/Paper'
 import Stack from '@mui/material/Stack'
 import Typography from '@mui/material/Typography'
 import { useState } from 'react'
-import { deleteClient, renameClient, type Client } from '../api'
+import { deleteClient, renameClient, type Client, type DashboardConfig } from '../api'
+import type { History } from '../useClients'
 import ClientCard from './ClientCard'
 import ConfirmationModal from './ConfirmationModal'
 
 interface Props {
   clients: Client[]
+  /** Usage history by client_id; connected clients only. */
+  history: Record<string, History>
+  config: DashboardConfig
   /** Refetches the list; awaited after a change so the UI never shows stale data in between. */
   refresh: () => Promise<void>
 }
 
-export default function ClientList({ clients, refresh }: Props) {
+export default function ClientList({ clients, history, config, refresh }: Props) {
   // Kept separate from `open` so the dialog's text survives its close
   // animation, and lives here rather than in the card so it isn't torn
   // down when the deleted card disappears from the list.
@@ -44,6 +48,8 @@ export default function ClientList({ clients, refresh }: Props) {
             <ClientCard
               key={client.client_id}
               client={client}
+              history={history[client.client_id]}
+              config={config}
               onRename={(name) => rename(client, name)}
               onDelete={() => {
                 setToDelete(client)

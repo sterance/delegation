@@ -1,44 +1,23 @@
-//! The connection to one server: handshake, heartbeats, reconnect with
-//! backoff. Front ends drive it through `controller`, sending commands in
-//! and getting status updates back, so the CLI and the tray share exactly
-//! the same connection logic.
+//! The connection to one server: handshake, ticks, server-silence
+//! detection, reconnect with backoff. Front ends drive it through
+//! `controller`, sending commands in and getting status updates back, so
+//! the CLI and the tray share exactly the same connection logic.
 
 use crate::hardware::MachineInfo;
 use crate::identity::Identity;
+use crate::sampler::Sampler;
 use anyhow::{bail, Context, Result};
 use base64::{engine::general_purpose::STANDARD, Engine as _};
 use ed25519_dalek::Signer;
 use futures_util::{SinkExt, StreamExt};
-use log::{info, warn};
-use protocol::{config::Config, AuthFailedReason, ClientMessage, ServerMessage};
+use log::{debug, info, warn};
+use protocol::{AuthFailedReason, ClientMessage, ClientSettings, ServerMessage, Tick};
+use std::future::Future;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 use tokio::sync::{mpsc, watch};
+use tokio::time::{Instant, MissedTickBehavior};
 use tokio_tungstenite::tungstenite::Message;
-
-/// The CLIENT_*_MS values from config.env.
-#[derive(Clone, Copy, Debug)]
-pub struct Timings {
-    /// How long we'll tolerate going without a heartbeat_ack before treating
-    /// the connection as dead and forcing a reconnect. This is what catches
-    /// a silently dropped connection (dead wifi, out-of-range client) that
-    /// never produces a transport-level error — see the hurdles writeup.
-    pub ack_timeout: Duration,
-    pub heartbeat_interval: Duration,
-    pub reconnect_initial_backoff: Duration,
-    pub reconnect_max_backoff: Duration,
-}
-
-impl Timings {
-    pub fn from_config(config: &Config) -> Self {
-        Timings {
-            ack_timeout: config.ms("CLIENT_ACK_TIMEOUT_MS", 30_000),
-            heartbeat_interval: config.ms("CLIENT_HEARTBEAT_INTERVAL_MS", 10_000),
-            reconnect_initial_backoff: config.ms("CLIENT_RECONNECT_INITIAL_BACKOFF_MS", 1_000),
-            reconnect_max_backoff: config.ms("CLIENT_RECONNECT_MAX_BACKOFF_MS", 30_000),
-        }
-    }
-}
 
 /// A server and the identity this machine holds for it.
 #[derive(Clone)]
@@ -46,14 +25,21 @@ pub struct ServerIdentity {
     /// HTTP base URL, e.g. "https://llm.smith-c.com".
     pub url: String,
     pub identity: Identity,
+    /// The settings this server last sent in `welcome` (the front end
+    /// persists them), or the defaults if it never has. Only the reconnect
+    /// backoff and the first connection's timeouts use these; every
+    /// `welcome` replaces them for the rest of the session.
+    pub settings: ClientSettings,
 }
 
-/// What gets reported in the `info` message after each successful auth.
-/// The hardware scan runs once in the background; until it finishes this
-/// holds `None` and the session sends `info` as soon as it does.
+/// What gets reported to the server. The hardware scan runs once in the
+/// background; until it finishes `machine` holds `None` and the session
+/// sends `info` as soon as it does. The sampler runs for the life of the
+/// process, feeding every tick.
 #[derive(Clone)]
 pub struct ClientInfo {
     pub machine: watch::Receiver<Option<Arc<MachineInfo>>>,
+    pub sampler: Sampler,
 }
 
 // Commands are rare, so the size of an inline identity doesn't matter.
@@ -68,7 +54,9 @@ pub enum SessionCmd {
 #[derive(Debug, Clone, PartialEq)]
 pub enum SessionStatus {
     Connecting,
-    Connected,
+    /// Authenticated. Carries the settings from `welcome`, for the front end
+    /// to persist next to this server's saved entry.
+    Connected(ClientSettings),
     Disconnected {
         error: Option<String>,
     },
@@ -108,7 +96,6 @@ const STOP_GRACE: Duration = Duration::from_secs(2);
 pub async fn controller(
     mut cmds: mpsc::Receiver<SessionCmd>,
     status: impl Fn(&str, SessionStatus) + Send + Sync + 'static,
-    timings: Timings,
     info: ClientInfo,
 ) {
     let status: StatusFn = Arc::new(status);
@@ -122,7 +109,7 @@ pub async fn controller(
             SessionCmd::Connect(server) => {
                 let (stop_tx, stop_rx) = watch::channel(false);
                 let url = server.url.clone();
-                let task = tokio::spawn(reconnect_loop(server, timings, info.clone(), status.clone(), stop_rx));
+                let task = tokio::spawn(reconnect_loop(server, info.clone(), status.clone(), stop_rx));
                 current = Some(RunningSession {
                     url,
                     stop: stop_tx,
@@ -165,16 +152,11 @@ impl RunningSession {
 /// Basic reconnect-with-backoff loop. This is the piece worth stress
 /// testing hardest on a real home connection: kill the tunnel mid-session
 /// and confirm this recovers cleanly rather than spinning or silently dying.
-async fn reconnect_loop(
-    server: ServerIdentity,
-    timings: Timings,
-    info: ClientInfo,
-    status: StatusFn,
-    mut stop: watch::Receiver<bool>,
-) {
+async fn reconnect_loop(server: ServerIdentity, info: ClientInfo, status: StatusFn, mut stop: watch::Receiver<bool>) {
     let ws_url = ws_url_for(&server.url);
     let status = |s: SessionStatus| status(&server.url, s);
-    let mut backoff = timings.reconnect_initial_backoff;
+    let mut settings = server.settings.sanitized();
+    let mut backoff = settings.reconnect_backoff_initial();
     loop {
         info!(target: "ws", "connecting to {ws_url} ...");
         status(SessionStatus::Connecting);
@@ -182,10 +164,10 @@ async fn reconnect_loop(
         let result = run_session(
             &ws_url,
             &server.identity,
-            &timings,
             &info,
             &status,
             &mut stop,
+            &mut settings,
             &mut authenticated,
         )
         .await;
@@ -194,9 +176,10 @@ async fn reconnect_loop(
             return;
         }
         // A session that got as far as authenticating proves the server is
-        // reachable again, so the next drop starts from a short backoff.
+        // reachable again, so the next drop starts from a short backoff
+        // (and from the settings it just sent).
         if authenticated {
-            backoff = timings.reconnect_initial_backoff;
+            backoff = settings.reconnect_backoff_initial();
         }
         match result {
             Err(e) if matches!(e.downcast_ref(), Some(SessionError::UnknownClient)) => {
@@ -219,7 +202,7 @@ async fn reconnect_loop(
                 return;
             }
         }
-        backoff = std::cmp::min(backoff * 2, timings.reconnect_max_backoff);
+        backoff = std::cmp::min(backoff * 2, settings.reconnect_backoff_max());
     }
 }
 
@@ -237,14 +220,18 @@ pub fn ws_url_for(server_http_base: &str) -> String {
 async fn run_session(
     ws_url: &str,
     identity: &Identity,
-    timings: &Timings,
     info: &ClientInfo,
     status: &impl Fn(SessionStatus),
     stop: &mut watch::Receiver<bool>,
+    settings: &mut ClientSettings,
     authenticated: &mut bool,
 ) -> Result<()> {
-    let (ws_stream, _) = tokio_tungstenite::connect_async(ws_url)
-        .await
+    // Until `welcome`, the cached silence timeout bounds each step, so a
+    // dead network can't leave the connect or handshake hanging on TCP's
+    // own (minutes-long) timeouts.
+    let silence = settings.server_silence_timeout();
+    let (ws_stream, _) = within(silence, "websocket connect", tokio_tungstenite::connect_async(ws_url))
+        .await?
         .context("websocket connect failed")?;
     let (mut write, mut read) = ws_stream.split();
 
@@ -265,7 +252,7 @@ async fn run_session(
     // the first attempt at this fix silently never triggered, and the
     // client looped on "expected challenge, got AuthFailed" forever
     // instead of self-healing.
-    let challenge_msg = next_message(&mut read).await?;
+    let challenge_msg = within(silence, "challenge", next_message(&mut read)).await??;
     let nonce = match challenge_msg {
         ServerMessage::Challenge { nonce } => nonce,
         ServerMessage::AuthFailed {
@@ -283,19 +270,35 @@ async fn run_session(
     )
     .await?;
 
-    let auth_result = next_message(&mut read).await?;
+    let auth_result = within(silence, "welcome", next_message(&mut read)).await??;
     match auth_result {
-        ServerMessage::AuthOk {} => info!(target: "ws", "authenticated"),
+        ServerMessage::Welcome { settings: pushed } => {
+            *settings = pushed.sanitized();
+            info!(target: "ws", "authenticated");
+            info!(
+                target: "ws",
+                "server settings: tick {} ms, sampler {} ms, sample max age {} ms, silence timeout {} ms, \
+                 backoff {}..{} ms",
+                settings.tick_interval_ms,
+                settings.sampler_interval_ms,
+                settings.sample_max_age_ms,
+                settings.server_silence_timeout_ms,
+                settings.reconnect_backoff_initial_ms,
+                settings.reconnect_backoff_max_ms
+            );
+        }
         ServerMessage::AuthFailed {
             reason: AuthFailedReason::UnknownClient,
         } => return Err(SessionError::UnknownClient.into()),
         ServerMessage::AuthFailed { reason } => bail!("server rejected auth: {reason}"),
-        other => bail!("expected auth_ok, got {other:?}"),
+        other => bail!("expected welcome, got {other:?}"),
     }
     *authenticated = true;
-    status(SessionStatus::Connected);
+    let settings = *settings;
+    info.sampler.set_interval(settings.sampler_interval());
+    status(SessionStatus::Connected(settings));
 
-    // --- authenticated: info, then the heartbeat loop ---
+    // --- authenticated: info, then ticks until the connection ends ---
     let mut machine = info.machine.clone();
     let mut info_sent = false;
     // Clone out first: the borrow guard isn't Send and must not be held
@@ -306,25 +309,31 @@ async fn run_session(
         info_sent = true;
     }
 
-    // Baseline set right after auth, so a server that never acks even the
-    // first heartbeat gets caught by the same timeout rather than waiting
-    // indefinitely for a "last" ack that never came.
-    let mut last_ack = Instant::now();
+    // Scheduled from a fixed start, so ticks don't drift; after a stall
+    // (a suspended laptop, a blocked send) the missed ones are skipped
+    // rather than sent as a burst. The first tick is immediate.
+    let mut ticker = tokio::time::interval(settings.tick_interval());
+    ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
+    let mut seq: u64 = 0;
 
-    let mut ticker = tokio::time::interval(timings.heartbeat_interval);
+    // Any frame from the server counts, including its pings. This is what
+    // catches a silently dropped connection (dead Wi-Fi, a server that's
+    // gone) that never produces a transport-level error.
+    let silence = settings.server_silence_timeout();
+    let mut last_inbound = Instant::now();
+
     loop {
         tokio::select! {
             _ = ticker.tick() => {
-                // Self-heal on a silently dead connection: if the transport
-                // hasn't told us anything is wrong but we also haven't heard
-                // an ack in a while, the server has likely already given up
-                // on us (its own heartbeat-timeout sweep) — don't wait for
-                // an OS-level TCP error that may never come.
-                if last_ack.elapsed() > timings.ack_timeout {
-                    bail!("no heartbeat_ack received in {:?}, treating connection as dead", last_ack.elapsed());
-                }
-                send(&mut write, &ClientMessage::Heartbeat { timestamp: now_ms() }).await?;
-                info!(target: "heartbeat", "sent");
+                // Never waits on the sampler: this copies its latest reading.
+                let metrics = info.sampler.metrics_for_tick(settings.sample_max_age());
+                let has_metrics = metrics.is_some();
+                within(silence, "sending a tick", send(&mut write, &ClientMessage::Tick(Tick { seq, metrics }))).await??;
+                debug!(target: "tick", "sent {seq} (metrics: {has_metrics})");
+                seq += 1;
+            }
+            _ = tokio::time::sleep_until(last_inbound + silence) => {
+                bail!("nothing from the server in {} ms, treating the connection as dead", silence.as_millis());
             }
             // The hardware scan finished after we authenticated.
             Ok(()) = machine.changed(), if !info_sent => {
@@ -338,24 +347,34 @@ async fn run_session(
                 let _ = write.send(Message::Close(None)).await;
                 return Ok(());
             }
+            // Reading continuously also keeps pongs flowing: tungstenite
+            // queues a pong for every ping it reads and writes it out on the
+            // next read or write.
             msg = read.next() => {
-                match msg {
-                    Some(Ok(Message::Text(text))) => {
-                        match serde_json::from_str::<ServerMessage>(&text) {
-                            Ok(ServerMessage::HeartbeatAck {}) => {
-                                last_ack = Instant::now();
-                                info!(target: "heartbeat", "acked");
-                            }
-                            Ok(other) => info!(target: "ws", "unexpected message during heartbeat loop: {other:?}"),
-                            Err(e) => info!(target: "ws", "couldn't parse server message: {e}"),
-                        }
-                    }
-                    Some(Ok(Message::Close(_))) | None => bail!("server closed connection"),
+                let msg = match msg {
+                    Some(Ok(msg)) => msg,
                     Some(Err(e)) => bail!("websocket error: {e}"),
+                    None => bail!("server closed connection"),
+                };
+                last_inbound = Instant::now();
+                match msg {
+                    Message::Text(text) => match serde_json::from_str::<ServerMessage>(&text) {
+                        Ok(other) => info!(target: "ws", "unexpected message after welcome: {other:?}"),
+                        Err(e) => info!(target: "ws", "couldn't parse server message: {e}"),
+                    },
+                    Message::Close(_) => bail!("server closed connection"),
                     _ => {}
                 }
             }
         }
+    }
+}
+
+/// `fut`, or an error naming `what` if it takes longer than `limit`.
+async fn within<T>(limit: Duration, what: &str, fut: impl Future<Output = T>) -> Result<T> {
+    match tokio::time::timeout(limit, fut).await {
+        Ok(value) => Ok(value),
+        Err(_) => bail!("{what} timed out after {} ms", limit.as_millis()),
     }
 }
 
@@ -379,20 +398,17 @@ async fn send(
         .context("sending websocket message")
 }
 
+/// The next text message during the handshake, skipping control frames.
 async fn next_message(
     read: &mut (impl StreamExt<Item = Result<Message, tokio_tungstenite::tungstenite::Error>> + Unpin),
 ) -> Result<ServerMessage> {
-    match read.next().await {
-        Some(Ok(Message::Text(text))) => serde_json::from_str(&text).context("parsing server message"),
-        Some(Ok(other)) => bail!("expected text message, got {other:?}"),
-        Some(Err(e)) => bail!("websocket error: {e}"),
-        None => bail!("connection closed before handshake completed"),
+    loop {
+        match read.next().await {
+            Some(Ok(Message::Text(text))) => return serde_json::from_str(&text).context("parsing server message"),
+            Some(Ok(Message::Ping(_) | Message::Pong(_))) => continue,
+            Some(Ok(other)) => bail!("expected text message, got {other:?}"),
+            Some(Err(e)) => bail!("websocket error: {e}"),
+            None => bail!("connection closed before handshake completed"),
+        }
     }
-}
-
-fn now_ms() -> i64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_millis() as i64)
-        .unwrap_or(0)
 }

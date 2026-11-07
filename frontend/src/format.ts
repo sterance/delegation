@@ -5,7 +5,23 @@ import type { Cpu, Disk, Gpu, HardwareSpecs, Memory } from './api'
 
 export const MISSING = '—'
 
+/** Usage graph captions with no value to show (disconnected, or no samples yet). */
+export const NO_VALUE = '–'
+
 const GIB = 1024 ** 3
+
+/** Binary GB with one decimal, for usage captions: 12025908428 -> "11.2". */
+export function formatGib(bytes: number): string {
+  return (bytes / GIB).toFixed(1)
+}
+
+/** 600 -> "10 minutes", 90 -> "90 seconds", 3600 -> "1 hour". */
+export function formatDuration(totalSeconds: number): string {
+  const plural = (n: number, unit: string) => `${n} ${unit}${n === 1 ? '' : 's'}`
+  if (totalSeconds >= 3600 && totalSeconds % 3600 === 0) return plural(totalSeconds / 3600, 'hour')
+  if (totalSeconds >= 60 && totalSeconds % 60 === 0) return plural(totalSeconds / 60, 'minute')
+  return plural(totalSeconds, 'second')
+}
 
 function trimNumber(value: number, decimals: number): string {
   return value.toFixed(decimals).replace(/\.?0+$/, '')

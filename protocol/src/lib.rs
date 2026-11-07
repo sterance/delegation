@@ -7,11 +7,13 @@
 //! didn't update, instead of a silent "unexpected message" at runtime.
 
 use serde::{Deserialize, Serialize};
+use std::time::{SystemTime, UNIX_EPOCH};
 
-pub mod config;
 pub mod hardware;
+pub mod telemetry;
 
 pub use hardware::HardwareSpecs;
+pub use telemetry::{ClientSettings, GpuMetrics, Metrics, Tick};
 
 // ---- enrollment (HTTP) ----
 
@@ -41,10 +43,10 @@ pub enum ClientMessage {
     Hello { client_id: String },
     #[serde(rename = "challenge_response")]
     ChallengeResponse { signature: String },
-    /// Sent once after every successful `auth_ok`, and again if the
-    /// client's hardware scan finishes later than that. Not acked. The
-    /// hostname lives here rather than in every heartbeat so a renamed
-    /// machine shows its new name without re-enrolling.
+    /// Sent once after every `welcome`, and again if the client's hardware
+    /// scan finishes later than that. Not acked. The hostname lives here
+    /// rather than in every tick so a renamed machine shows its new name
+    /// without re-enrolling.
     #[serde(rename = "info")]
     Info {
         hostname: String,
@@ -52,10 +54,10 @@ pub enum ClientMessage {
         client_version: String,
         specs: HardwareSpecs,
     },
-    /// Old clients also send a `hostname` field here; serde ignores it, so
-    /// they keep working against a new server.
-    #[serde(rename = "heartbeat")]
-    Heartbeat { timestamp: i64 },
+    /// Every `tick_interval_ms` once `welcome` has arrived, with the latest
+    /// resource metrics. Also the liveness signal; never acked.
+    #[serde(rename = "tick")]
+    Tick(Tick),
 }
 
 // ---- WebSocket messages, server -> client ----
@@ -65,12 +67,12 @@ pub enum ClientMessage {
 pub enum ServerMessage {
     #[serde(rename = "challenge")]
     Challenge { nonce: String }, // base64, 16 random bytes
-    #[serde(rename = "auth_ok")]
-    AuthOk {},
+    /// Authentication succeeded. Carries the settings the client must run
+    /// with; it sends no ticks until this arrives.
+    #[serde(rename = "welcome")]
+    Welcome { settings: ClientSettings },
     #[serde(rename = "auth_failed")]
     AuthFailed { reason: AuthFailedReason },
-    #[serde(rename = "heartbeat_ack")]
-    HeartbeatAck {},
 }
 
 /// Why the server rejected a handshake. Serialized as the same strings
@@ -99,14 +101,17 @@ impl std::fmt::Display for AuthFailedReason {
     }
 }
 
-/// UTC timestamp for log lines, e.g. "2026-09-29T23:31:05Z". Hand-rolled
-/// (Howard Hinnant's civil_from_days algorithm) rather than pulling in a
-/// date/time crate — shared here so both binaries get identical,
-/// correlatable log timestamps for free.
+/// UTC timestamp for log lines, e.g. "2026-09-29T23:31:05Z". Shared here so
+/// both binaries get identical, correlatable log timestamps for free.
 pub fn ts() -> String {
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default();
+    utc_timestamp(SystemTime::now(), false)
+}
+
+/// RFC 3339 UTC, e.g. "2026-09-29T23:31:05Z", or with `millis`
+/// "2026-09-29T23:31:05.412Z". Hand-rolled (Howard Hinnant's
+/// civil_from_days algorithm) rather than pulling in a date/time crate.
+pub fn utc_timestamp(time: SystemTime, millis: bool) -> String {
+    let now = time.duration_since(UNIX_EPOCH).unwrap_or_default();
     let secs = now.as_secs();
     let days = (secs / 86400) as i64;
     let tod = secs % 86400;
@@ -123,18 +128,117 @@ pub fn ts() -> String {
     let month = if mp < 10 { mp + 3 } else { mp - 9 };
     let year = if month <= 2 { y + 1 } else { y };
 
-    format!("{year:04}-{month:02}-{d:02}T{hh:02}:{mm:02}:{ss:02}Z")
+    if millis {
+        let ms = now.subsec_millis();
+        format!("{year:04}-{month:02}-{d:02}T{hh:02}:{mm:02}:{ss:02}.{ms:03}Z")
+    } else {
+        format!("{year:04}-{month:02}-{d:02}T{hh:02}:{mm:02}:{ss:02}Z")
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    fn sample_metrics() -> Metrics {
+        Metrics {
+            sample_age_ms: 120,
+            cpu_percent: 37.5,
+            ram_total_bytes: 32 << 30,
+            ram_available_bytes: 20 << 30,
+            swap_total_bytes: Some(8 << 30),
+            swap_used_bytes: Some(0),
+            gpus: vec![GpuMetrics {
+                name: "NVIDIA GeForce RTX 3070".into(),
+                utilisation_percent: 63.0,
+                vram_used_bytes: 6 << 30,
+                vram_total_bytes: 8 << 30,
+                power_watts: None,
+            }],
+        }
+    }
+
     #[test]
-    fn old_heartbeat_with_hostname_still_parses() {
-        let msg: ClientMessage =
-            serde_json::from_str(r#"{"type":"heartbeat","timestamp":1,"hostname":"old-client"}"#).unwrap();
-        assert!(matches!(msg, ClientMessage::Heartbeat { timestamp: 1 }));
+    fn tick_without_metrics_has_its_wire_form() {
+        let tick = ClientMessage::Tick(Tick { seq: 7, metrics: None });
+        let json = serde_json::to_string(&tick).unwrap();
+        assert_eq!(json, r#"{"type":"tick","seq":7,"metrics":null}"#);
+        let back: ClientMessage = serde_json::from_str(&json).unwrap();
+        assert!(matches!(back, ClientMessage::Tick(Tick { seq: 7, metrics: None })));
+    }
+
+    #[test]
+    fn tick_with_metrics_round_trips() {
+        let tick = Tick {
+            seq: 0,
+            metrics: Some(sample_metrics()),
+        };
+        let json = serde_json::to_string(&ClientMessage::Tick(tick.clone())).unwrap();
+        assert!(json.starts_with(r#"{"type":"tick","seq":0,"metrics":{"sample_age_ms":120,"#));
+        let ClientMessage::Tick(back) = serde_json::from_str(&json).unwrap() else {
+            panic!("not a tick")
+        };
+        assert_eq!(back, tick);
+    }
+
+    #[test]
+    fn metrics_parse_without_optional_fields() {
+        // What a sender that never fills in an optional field looks like,
+        // e.g. once system power is added as a new Option.
+        let msg: ClientMessage = serde_json::from_str(
+            r#"{"type":"tick","seq":1,"metrics":{"sample_age_ms":0,"cpu_percent":1.5,
+                "ram_total_bytes":10,"ram_available_bytes":5,"gpus":[
+                {"name":"g","utilisation_percent":0,"vram_used_bytes":0,"vram_total_bytes":1}]}}"#,
+        )
+        .unwrap();
+        let ClientMessage::Tick(Tick {
+            metrics: Some(metrics), ..
+        }) = msg
+        else {
+            panic!("expected a tick with metrics")
+        };
+        assert_eq!(metrics.swap_total_bytes, None);
+        assert_eq!(metrics.gpus[0].power_watts, None);
+    }
+
+    #[test]
+    fn welcome_carries_settings() {
+        let json = serde_json::to_string(&ServerMessage::Welcome {
+            settings: ClientSettings::default(),
+        })
+        .unwrap();
+        assert_eq!(
+            json,
+            r#"{"type":"welcome","settings":{"tick_interval_ms":1000,"sampler_interval_ms":500,"sample_max_age_ms":3000,"server_silence_timeout_ms":6000,"reconnect_backoff_initial_ms":1000,"reconnect_backoff_max_ms":30000}}"#
+        );
+        let ServerMessage::Welcome { settings } = serde_json::from_str(&json).unwrap() else {
+            panic!("not welcome")
+        };
+        assert_eq!(settings, ClientSettings::default());
+    }
+
+    #[test]
+    fn sanitized_settings_never_hold_zero_or_inverted_values() {
+        let s = ClientSettings {
+            tick_interval_ms: 0,
+            sampler_interval_ms: 10,
+            sample_max_age_ms: 0,
+            server_silence_timeout_ms: 0,
+            reconnect_backoff_initial_ms: 5_000,
+            reconnect_backoff_max_ms: 1_000,
+        }
+        .sanitized();
+        assert_eq!(s.tick_interval_ms, 1);
+        assert_eq!(s.sampler_interval_ms, telemetry::MIN_SAMPLER_INTERVAL_MS);
+        assert_eq!(s.reconnect_backoff_max_ms, 5_000);
+        assert_eq!(ClientSettings::default().sanitized(), ClientSettings::default());
+    }
+
+    #[test]
+    fn timestamps_format_with_and_without_millis() {
+        let t = UNIX_EPOCH + std::time::Duration::from_millis(1_793_966_468_412);
+        assert_eq!(utc_timestamp(t, false), "2026-11-06T12:01:08Z");
+        assert_eq!(utc_timestamp(t, true), "2026-11-06T12:01:08.412Z");
     }
 
     #[test]

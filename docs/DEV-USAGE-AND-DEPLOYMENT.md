@@ -7,7 +7,7 @@ The repo has four parts:
 
 | Path        | What it is                                                                        |
 | ----------- | --------------------------------------------------------------------------------- |
-| `server/`   | Rust (axum) coordinator: enrollment, WebSocket auth and heartbeats, SQLite store  |
+| `server/`   | Rust (axum) coordinator: enrollment, WebSocket auth, ticks and liveness, live metrics in memory, SQLite store |
 | `client/`   | Rust client library with two front ends: the headless `delegation-client` (Linux, Docker) and the `delegation-tray` Windows tray app. Enrolls once, then keeps an authenticated WebSocket open and reports the machine's hardware |
 | `protocol/` | Message types shared by the server and client                                      |
 | `frontend/` | React + MUI dashboard. Built into static files that the server binary serves       |
@@ -119,9 +119,10 @@ dev stack instead, since it only binds to localhost.
 ### 1.6 Manual API checks
 
 ```bash
-curl -s -X POST http://127.0.0.1:7070/admin/pairing-code | jq          # {"code": "..."}, valid 10 min, single use
+curl -s -X POST http://127.0.0.1:7070/admin/pairing-code | jq          # {"code": "..."}, valid PAIRING_CODE_TTL_SECS, single use
 curl -s http://127.0.0.1:7070/admin/pairing-code/<CODE>/status | jq    # used / claimed_by
-curl -s http://127.0.0.1:7070/clients | jq                             # enrolled clients + live connected flag
+curl -s 'http://127.0.0.1:7070/clients?since=0' | jq                   # epoch, latest_seq, clients with live samples
+curl -s http://127.0.0.1:7070/admin/dashboard-config | jq              # the dashboard's runtime settings
 ```
 
 ### 1.7 Testing failure modes
@@ -130,11 +131,16 @@ curl -s http://127.0.0.1:7070/clients | jq                             # enrolle
   error, retries with backoff of 1s, 2s, 4s, and so on up to 30s, then
   re-authenticates.
 - **Silent network loss** (no FIN/RST, like dead Wi-Fi): drop the container's
-  packets with `iptables`, or `docker network disconnect` the client. The
-  server should drop the client after about 30s without heartbeats. The client
-  should give up after about 30s without a `heartbeat_ack` and reconnect.
+  packets with `iptables`, `docker network disconnect` the client, or freeze a
+  native client with `kill -STOP`. The server should drop the client within
+  about `LIVENESS_TIMEOUT_MS` plus a second (5s by default). The client should
+  give up after `SERVER_SILENCE_TIMEOUT_MS` (6s) without hearing anything,
+  pings included, and reconnect.
+- **Stalled sampler:** a client whose metrics sampler hangs keeps ticking
+  with `metrics: null` and stays connected. `cargo test -p delegation-client`
+  covers this against a stand-in server.
 - **Pairing code reuse or expiry:** enroll a second client with a used code, or
-  one older than 10 minutes. Enrollment should be rejected.
+  one older than `PAIRING_CODE_TTL_SECS`. Enrollment should be rejected.
 
 ### 1.8 Configuration (`config.env`)
 
@@ -142,42 +148,39 @@ curl -s http://127.0.0.1:7070/clients | jq                             # enrolle
 cp config.env.example config.env   # gitignored; every key is optional
 ```
 
-Each key is resolved in this order: **real environment variable**, then
-**config file**, then **built-in default** (the values in the example file).
-Both binaries log the file they loaded and the timings in effect at startup,
-so check the first lines of the log to confirm a change took effect.
+Only the server reads it. Every variable, with its default and what it does,
+is listed in `config.env.example` and in `docs/guide.md` (§2,
+Configuration). Each key is resolved in this order: **real environment
+variable**, then **config file**, then **built-in default**.
 
-Where the file is read from:
+| How the server runs | File                                                                          |
+| ------------------- | ----------------------------------------------------------------------------- |
+| Any Compose stack   | `config.env` in the repo root, passed in via `env_file` (optional)              |
+| Native              | `$DELEGATION_CONFIG`, else `./config.env` (relative to the working directory)   |
 
-| How it runs              | File                                                                                   |
-| ------------------------ | -------------------------------------------------------------------------------------- |
-| Any Compose stack        | `config.env` in the repo root, passed in via `env_file` (optional)                      |
-| Native server            | `$DELEGATION_CONFIG`, else `./config.env` (relative to the working directory)            |
-| Native client            | `$DELEGATION_CONFIG`, else `./config.env`, else `~/.config/delegation-client/config.env` |
+The server checks everything at startup, including the rules between
+variables (for example `LIVENESS_TIMEOUT_MS` must be at least twice
+`TICK_INTERVAL_MS`). An invalid value stops it with a `[config] invalid:`
+line naming the variable; it never falls back silently. The startup log
+then lists the effective configuration, so check its first lines to confirm
+a change took effect.
 
-| Key                                    | Default              | Used by |
-| -------------------------------------- | -------------------- | ------- |
-| `SERVER_PORT`                          | `7070`               | server  |
-| `SERVER_AUTH_TIMEOUT_MS`               | `5000`               | server  |
-| `SERVER_HEARTBEAT_TIMEOUT_MS`          | `30000`              | server  |
-| `SERVER_HEARTBEAT_SWEEP_INTERVAL_MS`   | `10000`              | server  |
-| `SERVER_PAIRING_CODE_TTL_MS`           | `600000`             | server  |
-| `DB_PATH`                              | `data/delegation.db` | server (Docker image sets `/app/data/delegation.db`) |
-| `FRONTEND_DIR`                         | `frontend/dist`      | server (Docker image sets `/app/frontend/dist`) |
-| `CLIENT_HEARTBEAT_INTERVAL_MS`         | `10000`              | client  |
-| `CLIENT_ACK_TIMEOUT_MS`                | `30000`              | client  |
-| `CLIENT_RECONNECT_INITIAL_BACKOFF_MS`  | `1000`               | client  |
-| `CLIENT_RECONNECT_MAX_BACKOFF_MS`      | `30000`              | client  |
+Clients have no config file. The tick, sampler, silence-timeout and
+backoff values are sent to each client in `welcome` when it connects, and
+it caches the last set for its reconnect backoff. After changing them,
+restart the server; clients pick the new values up as they reconnect.
+`DASHBOARD_*` values reach the dashboard through
+`GET /admin/dashboard-config`, so they need a server restart, not a
+frontend rebuild.
 
-A value that is invalid or `0` logs a warning and falls back to its default.
 `SERVER_PORT` changes only the port the server listens on. The dev port
 mapping, `dev/dev.sh` and the Cloudflare Tunnel route all assume `7070`, so
 update them too if you change it.
 
-To try timing changes quickly in dev, set short values (for example
-`SERVER_HEARTBEAT_TIMEOUT_MS=4000`, `CLIENT_HEARTBEAT_INTERVAL_MS=1500`), run
-`dev/dev.sh up`, and watch `dev/dev.sh logs`. Compose recreates containers
-whose environment changed.
+To try timing changes quickly in dev, edit `config.env` (for example
+`TICK_INTERVAL_MS=2000`, and `SERVER_LOG_LEVEL=debug` to see each tick),
+run `dev/dev.sh up`, and watch `dev/dev.sh logs`. Compose recreates
+containers whose environment changed.
 
 ---
 
@@ -307,11 +310,21 @@ DELEGATION_SERVER=https://llm.smith-c.com
 PAIRING_CODE=ABC12345
 EOF
 docker compose up -d --build
-docker compose logs -f     # expect: enrolled, client_id=... / authenticated / heartbeat acked
+docker compose logs -f     # expect: enrolled, client_id=... / authenticated / server settings: tick ...
 ```
 
-To tune client timings, put a `config.env` in the repo root (`cp
-config.env.example config.env`). Compose passes it to the container.
+The client's timings come from the server when it connects; there's
+nothing to configure here.
+
+**GPU metrics.** On a host with an NVIDIA GPU and the NVIDIA Container
+Toolkit, add the GPU override so the container can reach NVML:
+
+```bash
+docker compose -f docker-compose.yml -f docker-compose.gpu.yml up -d --build
+```
+
+Without it (and on hosts without a GPU) the client runs normally and
+reports CPU and RAM only; it logs once that NVML isn't available.
 
 **Hardware report.** The compose file mounts the host's `/` read-only at
 `/hostfs` and its SMBIOS table at `/hostdmi`, so the dashboard shows the
@@ -351,10 +364,11 @@ sudo install -m 755 target/release/delegation-client /usr/local/bin/
 # 3. Enroll once, interactively (writes ~/.config/delegation-client/identity.json, mode 0600)
 delegation-client --server https://llm.smith-c.com --pairing-code ABC12345
 #   wait for "authenticated", then Ctrl-C
-
-# 4. Optional: client timings (CLIENT_* keys, see §1.8)
-cp config.env.example ~/.config/delegation-client/config.env
 ```
+
+Timings come from the server; the client caches the last set it received in
+`~/.config/delegation-client/server-settings.json`. GPU metrics need the
+NVIDIA driver (NVML); without it the client reports CPU and RAM only.
 
 Running as a normal user, the hardware report can't read the SMBIOS table,
 so the dashboard shows RAM size but not its type or speed. Everything else
@@ -408,8 +422,7 @@ Files:
 
 | Path                                          | What                                          |
 | --------------------------------------------- | --------------------------------------------- |
-| `%APPDATA%\delegation-client\servers.json`    | Saved servers with their private keys         |
-| `%APPDATA%\delegation-client\config.env`      | Optional client timings (see §1.8)            |
+| `%APPDATA%\delegation-client\servers.json`    | Saved servers with their private keys, and each server's last pushed settings |
 | `%LOCALAPPDATA%\delegation-client\tray.log`   | Log (rotated at 1 MB)                         |
 
 Uninstalling removes the app and the login entry but deliberately leaves
@@ -464,10 +477,13 @@ than a native build.
 
 ### 2.5 Updating
 
-**Update the server before the clients** whenever the protocol changes.
-A new server accepts old clients, but an old server doesn't understand a
-new client's heartbeats and never acks them, so the client keeps timing out
-and reconnecting.
+**Update the server and every client together when the protocol changes.**
+The project keeps no backwards compatibility: the tick/welcome protocol
+replaced heartbeat/auth_ok outright, so a client and a server from either
+side of that change can't complete a connection and the client just keeps
+reconnecting. Update the server first, then the clients, and check each one
+turns green on the dashboard. If you add or change `config.env` variables,
+update the server host's own copy too (§1.8); it isn't part of the deploy.
 
 ```bash
 # server host (skip this if the Deploy workflow is set up; see §2.8)

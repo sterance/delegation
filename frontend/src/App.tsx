@@ -15,13 +15,12 @@ import Toolbar from '@mui/material/Toolbar'
 import Tooltip from '@mui/material/Tooltip'
 import Typography from '@mui/material/Typography'
 import useMediaQuery from '@mui/material/useMediaQuery'
-import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
-import { errorMessage, listClients, type Client } from './api'
+import { useCallback, useEffect, useMemo, useState } from 'react'
+import { DEFAULT_DASHBOARD_CONFIG, errorMessage, getDashboardConfig, type DashboardConfig } from './api'
 import AddClientModal from './components/AddClientModal'
 import ClientList from './components/ClientList'
 import { buildTheme, readStoredMode, storeMode, type ThemeMode } from './theme'
-
-const CLIENTS_POLL_MS = 4000
+import { useClients } from './useClients'
 
 /**
  * Follows the browser/OS preference live until the user explicitly toggles,
@@ -44,45 +43,35 @@ function useThemeMode(): [ThemeMode, () => void] {
   return [mode, toggle]
 }
 
-/** Polls GET /clients; `refresh` fetches immediately without waiting for the next tick. */
-function useClients() {
-  const [clients, setClients] = useState<Client[] | null>(null)
-  const [error, setError] = useState<string | null>(null)
-  // Requests can overlap (slow server, or a manual refresh mid-poll), so
-  // never let an older response overwrite a newer one.
-  const issued = useRef(0)
-  const applied = useRef(0)
-
-  const refresh = useCallback(async () => {
-    const id = ++issued.current
-    try {
-      const result = await listClients()
-      if (id < applied.current) return
-      applied.current = id
-      setClients(result)
-      setError(null)
-    } catch (err) {
-      if (id < applied.current) return
-      applied.current = id
-      setError(errorMessage(err))
+/**
+ * The server's DASHBOARD_* settings, fetched once. Null until loaded; if
+ * that fails, the built-in defaults (the same values the server defaults to).
+ */
+function useDashboardConfig(): DashboardConfig | null {
+  const [config, setConfig] = useState<DashboardConfig | null>(null)
+  useEffect(() => {
+    let cancelled = false
+    getDashboardConfig().then(
+      (loaded) => {
+        if (!cancelled) setConfig(loaded)
+      },
+      (err: unknown) => {
+        console.error(`Couldn't load /admin/dashboard-config, using defaults: ${errorMessage(err)}`)
+        if (!cancelled) setConfig(DEFAULT_DASHBOARD_CONFIG)
+      },
+    )
+    return () => {
+      cancelled = true
     }
   }, [])
-
-  useEffect(() => {
-    // refresh() only sets state after its fetch resolves, never synchronously.
-    // oxlint-disable-next-line react/set-state-in-effect
-    void refresh()
-    const timer = setInterval(() => void refresh(), CLIENTS_POLL_MS)
-    return () => clearInterval(timer)
-  }, [refresh])
-
-  return { clients, error, refresh }
+  return config
 }
 
 export default function App() {
   const [mode, toggleMode] = useThemeMode()
   const theme = useMemo(() => buildTheme(mode), [mode])
-  const { clients, error, refresh } = useClients()
+  const config = useDashboardConfig()
+  const { clients, history, error, refresh } = useClients(config)
   const [addOpen, setAddOpen] = useState(false)
 
   const handleAddClose = (clientAdded: boolean) => {
@@ -133,8 +122,8 @@ export default function App() {
           </Alert>
         )}
 
-        {clients ? (
-          <ClientList clients={clients} refresh={refresh} />
+        {clients && config ? (
+          <ClientList clients={clients} history={history} config={config} refresh={refresh} />
         ) : (
           !error && (
             <Box sx={{ display: 'flex', justifyContent: 'center', py: 6 }}>
@@ -144,7 +133,12 @@ export default function App() {
         )}
       </Container>
 
-      <AddClientModal open={addOpen} onClose={handleAddClose} />
+      <AddClientModal
+        open={addOpen}
+        onClose={handleAddClose}
+        codeTtlSecs={(config ?? DEFAULT_DASHBOARD_CONFIG).pairing_code_ttl_secs}
+        statusPollMs={(config ?? DEFAULT_DASHBOARD_CONFIG).pairing_poll_interval_ms}
+      />
     </ThemeProvider>
   )
 }

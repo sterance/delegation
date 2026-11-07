@@ -14,8 +14,8 @@ import Tooltip from '@mui/material/Tooltip'
 import Typography from '@mui/material/Typography'
 import { useEffect, useState } from 'react'
 import { ApiError, createPairingCode, errorMessage, getPairingCodeStatus, type ClaimedBy } from '../api'
+import { formatDuration } from '../format'
 
-const STATUS_POLL_MS = 1500
 const MONOSPACE = 'ui-monospace, SFMono-Regular, Menlo, Consolas, "Liberation Mono", monospace'
 
 // loading -> code -> claimed. That's the whole flow; there is deliberately
@@ -31,9 +31,13 @@ interface Props {
   open: boolean
   /** `clientAdded` is true if a client claimed the code before the dialog closed. */
   onClose: (clientAdded: boolean) => void
+  /** PAIRING_CODE_TTL_SECS, for the "valid for" text. */
+  codeTtlSecs: number
+  /** DASHBOARD_PAIRING_POLL_INTERVAL_MS. */
+  statusPollMs: number
 }
 
-export default function AddClientModal({ open, onClose }: Props) {
+export default function AddClientModal({ open, onClose, codeTtlSecs, statusPollMs }: Props) {
   const [flow, setFlow] = useState<Flow>({ step: 'loading' })
   // Bumped by "Try again" to mint a fresh code without closing the dialog.
   const [attempt, setAttempt] = useState(0)
@@ -91,12 +95,12 @@ export default function AddClientModal({ open, onClose }: Props) {
         }
         // Anything else (network blip, server restarting) is transient: keep polling.
       }
-    }, STATUS_POLL_MS)
+    }, statusPollMs)
     return () => {
       cancelled = true
       clearInterval(timer)
     }
-  }, [code])
+  }, [code, statusPollMs])
 
   const clientAdded = flow.step === 'claimed'
   const close = () => onClose(clientAdded)
@@ -118,7 +122,8 @@ export default function AddClientModal({ open, onClose }: Props) {
         {flow.step === 'code' && (
           <>
             <Typography variant="body2" color="text.secondary">
-              Enroll the new machine's client with this pairing code. It's single-use and valid for 10 minutes.
+              Enroll the new machine's client with this pairing code. It's single-use and valid for{' '}
+              {formatDuration(codeTtlSecs)}.
             </Typography>
             <Stack direction="row" spacing={1} sx={{ alignItems: 'center', justifyContent: 'center', my: 3 }}>
               <Typography

@@ -10,8 +10,9 @@ services:
       context: ..
       dockerfile: server/Dockerfile
     restart: unless-stopped
-    # Shared settings (see config.env.example). Optional: without it the
-    # binary uses its built-in defaults.
+    # Every setting, including the ones pushed to clients (see
+    # config.env.example). Optional: without it the server uses its
+    # defaults. On the deploy host this is that host's own copy.
     env_file:
       - path: ../config.env
         required: false

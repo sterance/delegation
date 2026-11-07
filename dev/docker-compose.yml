@@ -10,8 +10,8 @@ services:
     build:
       context: ..
       dockerfile: server/Dockerfile
-    # Shared settings (see config.env.example). Optional: without it the
-    # binary uses its built-in defaults.
+    # Every setting, including the ones pushed to clients (see
+    # config.env.example). Optional: without it the server uses its defaults.
     env_file:
       - path: ../config.env
         required: false
@@ -43,11 +43,7 @@ services:
     build:
       context: ..
       dockerfile: client/Dockerfile
-    # Shared settings (see config.env.example). Optional: without it the
-    # binary uses its built-in defaults.
-    env_file:
-      - path: ../config.env
-        required: false
+    # No env_file: the client takes its timings from the server's welcome.
     profiles: ["client"] # started by dev.sh after a pairing code exists
     depends_on:
       - server

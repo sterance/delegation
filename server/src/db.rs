@@ -162,15 +162,23 @@ pub fn get_client(db: &Db, client_id: &str) -> Result<Option<ClientRecord>> {
     Ok(result)
 }
 
-/// Returns false if the client no longer exists (deleted from the
-/// dashboard while connected).
-pub fn touch_last_seen(db: &Db, client_id: &str) -> Result<bool> {
-    let conn = db.lock().unwrap();
-    let updated = conn.execute(
-        "UPDATE clients SET last_seen_at = ?1 WHERE client_id = ?2",
-        (protocol::ts(), client_id),
-    )?;
-    Ok(updated > 0)
+/// Writes in-memory `last_seen_at` values, given as (client_id, timestamp),
+/// in one transaction. Returns the ids that matched no row: clients deleted
+/// from the dashboard since they last connected.
+pub fn write_last_seen(db: &Db, rows: &[(String, String)]) -> Result<Vec<String>> {
+    let mut conn = db.lock().unwrap();
+    let tx = conn.transaction()?;
+    let mut missing = Vec::new();
+    {
+        let mut stmt = tx.prepare_cached("UPDATE clients SET last_seen_at = ?1 WHERE client_id = ?2")?;
+        for (client_id, at) in rows {
+            if stmt.execute((at, client_id))? == 0 {
+                missing.push(client_id.clone());
+            }
+        }
+    }
+    tx.commit()?;
+    Ok(missing)
 }
 
 /// `None` clears the friendly name so the dashboard falls back to the
@@ -224,9 +232,10 @@ pub struct ClientListRow {
     pub info_updated_at: Option<String>,
 }
 
-/// Backs the future dashboard's client list. Connected/disconnected is
-/// deliberately NOT part of this query — that's live state owned by the
-/// in-memory connection map in main.rs, not something persisted to disk.
+/// Backs the dashboard's client list. Connected/disconnected and the
+/// metric samples are deliberately NOT part of this: they're live state in
+/// `live.rs`, never persisted. `last_seen_at` here can be up to one flush
+/// interval old; `GET /clients` prefers the in-memory value.
 pub fn list_clients(db: &Db) -> Result<Vec<ClientListRow>> {
     let conn = db.lock().unwrap();
     let mut stmt = conn.prepare(
@@ -343,12 +352,21 @@ mod tests {
     }
 
     #[test]
-    fn delete_client_removes_it_and_stops_heartbeats_matching() {
-        let (db, dir) = test_db("delete");
-        assert!(touch_last_seen(&db, "c1").unwrap());
+    fn last_seen_flush_writes_rows_and_reports_deleted_clients() {
+        let (db, dir) = test_db("last-seen");
+        let rows = vec![
+            ("c1".to_string(), "2026-11-06T12:00:00Z".to_string()),
+            ("gone".to_string(), "2026-11-06T12:00:00Z".to_string()),
+        ];
+        assert_eq!(write_last_seen(&db, &rows).unwrap(), vec!["gone".to_string()]);
+        assert_eq!(
+            list_clients(&db).unwrap()[0].last_seen_at.as_deref(),
+            Some("2026-11-06T12:00:00Z")
+        );
+
         assert!(delete_client(&db, "c1").unwrap());
         assert!(list_clients(&db).unwrap().is_empty());
-        assert!(!touch_last_seen(&db, "c1").unwrap());
+        assert_eq!(write_last_seen(&db, &rows[..1]).unwrap(), vec!["c1".to_string()]);
         assert!(!delete_client(&db, "c1").unwrap());
         let _ = std::fs::remove_dir_all(&dir);
     }

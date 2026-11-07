@@ -7,10 +7,11 @@ use crate::form::FormResult;
 use crate::menu::{self, MenuAction, TrayMenu};
 use crate::store::Store;
 use delegation_client::identity::Identity;
-use delegation_client::session::{self, ClientInfo, ServerIdentity, SessionCmd, SessionStatus, Timings};
+use delegation_client::sampler::Sampler;
+use delegation_client::session::{self, ClientInfo, ServerIdentity, SessionCmd, SessionStatus};
 use delegation_client::{hardware, paths};
 use log::{error, info, warn};
-use protocol::config::Config;
+use protocol::ClientSettings;
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use std::sync::Mutex;
@@ -40,9 +41,12 @@ pub fn run() {
     let _ = delegation_client::log::init_file(&paths::log_dir().join("tray.log"));
     info!(target: "tray", "starting, version {}", env!("CARGO_PKG_VERSION"));
 
-    let config = Config::load(&[paths::config_dir().join("config.env")]);
-    let timings = Timings::from_config(&config);
-    let machine = hardware::spawn_collect();
+    // Timings come from the server in `welcome`; servers.json caches the
+    // last set each server sent, for the reconnect backoff.
+    let info = ClientInfo {
+        machine: hardware::spawn_collect(),
+        sampler: Sampler::spawn(ClientSettings::default().sampler_interval()),
+    };
 
     let event_loop = match EventLoop::<UserEvent>::with_user_event().build() {
         Ok(event_loop) => event_loop,
@@ -80,7 +84,7 @@ pub fn run() {
                 let _ = proxy.send_event(UserEvent::Session(url.to_string(), status));
             }
         };
-        runtime.block_on(session::controller(cmd_rx, status, timings, ClientInfo { machine }));
+        runtime.block_on(session::controller(cmd_rx, status, info));
     });
 
     let store_path = Store::default_path();
@@ -202,7 +206,12 @@ impl App {
             return;
         }
         match status {
-            SessionStatus::Connected => self.connected = true,
+            SessionStatus::Connected(settings) => {
+                self.connected = true;
+                if self.store.set_settings(self.store.active, settings) {
+                    self.save();
+                }
+            }
             SessionStatus::UnknownClient => {
                 warn!(target: "tray", "{url} no longer recognizes this machine, clearing its identity");
                 self.connected = false;
@@ -272,7 +281,12 @@ impl App {
     fn connect(&mut self, url: String, identity: Identity) {
         self.connected = false;
         self.refresh();
-        self.send(SessionCmd::Connect(ServerIdentity { url, identity }));
+        let settings = self.store.settings_for(&url);
+        self.send(SessionCmd::Connect(ServerIdentity {
+            url,
+            identity,
+            settings,
+        }));
     }
 
     fn send(&self, cmd: SessionCmd) {

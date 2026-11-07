@@ -11,15 +11,88 @@ export interface Client {
   /** What to display: the name set from the dashboard, or the hostname if none is. */
   friendly_name: string
   enrolled_at: string
+  /** The server's in-memory value, so it's current even between its database flushes. */
   last_seen_at: string | null
   /** Live: true only while the client has an authenticated WebSocket open. */
   connected: boolean
-  // From the client's `info` message: null until a client new enough to
-  // send one has connected.
+  // From the client's `info` message: null until the client has connected once.
   os: string | null
   client_version: string | null
   specs: HardwareSpecs | null
   info_updated_at: string | null
+  /** Samples newer than the request's `since`, oldest first. Always empty when disconnected. */
+  samples: Sample[]
+}
+
+/** `GET /clients?since=<seq>`. */
+export interface ClientsResponse {
+  /** Random per server start. A change means the server restarted and `seq` numbering began again. */
+  epoch: string
+  /** Newest sample seq across all clients: the next poll's `since`. */
+  latest_seq: number
+  clients: Client[]
+}
+
+// Mirror of `Sample` in server/src/live.rs (built from the tick `Metrics`
+// in protocol/src/telemetry.rs). Raw units.
+export interface Sample {
+  /** Server-wide sequence number, shared by all clients. */
+  seq: number
+  /** When the server received it, e.g. "2026-11-06T12:01:08.412Z". */
+  received_at: string
+  cpu_percent: number
+  ram_total_bytes: number
+  ram_available_bytes: number
+  swap_total_bytes: number | null
+  swap_used_bytes: number | null
+  /** NVIDIA GPUs only; empty when there are none. */
+  gpus: GpuSample[]
+}
+
+export interface GpuSample {
+  name: string
+  utilisation_percent: number
+  vram_used_bytes: number
+  vram_total_bytes: number
+  /** Null when the driver doesn't report power for this GPU. */
+  power_watts: number | null
+}
+
+// Mirror of `DashboardConfig` in server/src/config.rs: the DASHBOARD_* values
+// from config.env (prefix dropped, lowercased) plus a few others the
+// dashboard needs.
+export interface DashboardConfig {
+  poll_interval_ms: number
+  pause_when_hidden: boolean
+  pairing_poll_interval_ms: number
+  graph_width_px: number
+  graph_height_px: number
+  graph_grid_px: number
+  graph_line_color: string
+  graph_grid_color: string
+  graph_bg_color: string
+  collapsed_max_gpus: number
+  /** Samples kept per client, which is also each graph's width in samples. */
+  metrics_history_samples: number
+  tick_interval_ms: number
+  pairing_code_ttl_secs: number
+}
+
+/** Used if `/admin/dashboard-config` can't be loaded. Matches the server's compiled defaults. */
+export const DEFAULT_DASHBOARD_CONFIG: DashboardConfig = {
+  poll_interval_ms: 1000,
+  pause_when_hidden: true,
+  pairing_poll_interval_ms: 1500,
+  graph_width_px: 120,
+  graph_height_px: 40,
+  graph_grid_px: 10,
+  graph_line_color: '#00ff00',
+  graph_grid_color: '#008040',
+  graph_bg_color: '#000000',
+  collapsed_max_gpus: 1,
+  metrics_history_samples: 60,
+  tick_interval_ms: 1000,
+  pairing_code_ttl_secs: 600,
 }
 
 // Hand-written mirror of `HardwareSpecs` in protocol/src/hardware.rs; keep
@@ -105,8 +178,15 @@ async function request<T>(method: 'GET' | 'POST' | 'PATCH' | 'DELETE', path: str
   return (await res.json()) as T
 }
 
-export function listClients(): Promise<Client[]> {
-  return request<Client[]>('GET', '/clients')
+/** `since` 0 returns each connected client's full sample history. */
+export function listClients(since: number): Promise<ClientsResponse> {
+  return request<ClientsResponse>('GET', `/clients?since=${since}`)
+}
+
+/** Fields missing from the response (an older server) fall back to the defaults. */
+export async function getDashboardConfig(): Promise<DashboardConfig> {
+  const config = await request<Partial<DashboardConfig>>('GET', '/admin/dashboard-config')
+  return { ...DEFAULT_DASHBOARD_CONFIG, ...config }
 }
 
 /** Must match MAX_FRIENDLY_NAME_CHARS in server/src/main.rs. */
@@ -122,7 +202,7 @@ export function deleteClient(clientId: string): Promise<void> {
   return request<void>('DELETE', `/clients/${encodeURIComponent(clientId)}`)
 }
 
-/** Mints a new one-time pairing code, valid for 10 minutes. */
+/** Mints a new one-time pairing code, valid for `pairing_code_ttl_secs`. */
 export async function createPairingCode(): Promise<string> {
   const { code } = await request<{ code: string }>('POST', '/admin/pairing-code')
   return code

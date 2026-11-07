@@ -4,11 +4,9 @@ services:
       context: ..
       dockerfile: client/Dockerfile
     restart: unless-stopped
-    # Shared settings (see config.env.example). Optional: without it the
-    # binary uses its built-in defaults.
-    env_file:
-      - path: ../config.env
-        required: false
+    # No config.env here: the server sends its timings when the client
+    # connects (see config.env.example). For GPU metrics on an NVIDIA host,
+    # add docker-compose.gpu.yml.
     environment:
       DELEGATION_SERVER: ${DELEGATION_SERVER:-https://llm.smith-c.com}
       PAIRING_CODE: ${PAIRING_CODE:-}

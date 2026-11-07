@@ -5,7 +5,7 @@ edition = "2021"
 
 [dependencies]
 protocol = { path = "../protocol" }
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "time", "sync"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "time", "sync", "signal"] }
 axum = { version = "0.7", features = ["ws"] }
 tower-http = { version = "0.7.1", features = ["fs"] }
 rusqlite = { version = "0.31", features = ["bundled"] }

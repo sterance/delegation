@@ -2,7 +2,7 @@
 # Local connectivity test: dockerized server <-> client, no Cloudflare.
 #   dev/dev.sh up       build + start server and vite (:5173), enroll and start containerized client
 #   dev/dev.sh logs     follow logs
-#   dev/dev.sh status   list enrolled clients as the server sees them
+#   dev/dev.sh status   list enrolled clients as the server sees them (sample counts, not samples)
 #   dev/dev.sh native   run the client from source (cargo) against the dev server
 #   dev/dev.sh restart-server   bounce the server to test client reconnect
 #   dev/dev.sh down     stop containers (keeps data/identity)
@@ -37,7 +37,11 @@ case "${1:-up}" in
     echo "dashboard (hot reload):   http://localhost:5173/"
     ;;
   logs)    $DC --profile client logs -f ;;
-  status)  curl -fsS "$URL/clients" | jq . ;;
+  status)
+    curl -fsS "$URL/clients" | jq '{epoch, latest_seq, clients: [.clients[] |
+      {friendly_name, hostname, connected, last_seen_at, samples: (.samples | length),
+       latest: (.samples[-1] // null | if . then {cpu_percent, gpus: [.gpus[].name]} else null end)}]}'
+    ;;
   native)
     wait_server
     cd ..

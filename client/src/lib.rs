@@ -1,13 +1,15 @@
-//! The delegation client as a library: enrollment, the session controller
-//! and hardware collection. Two front ends use it: the headless CLI
-//! (`bin/delegation-client.rs`, used natively on Linux and in Docker) and
-//! the Windows tray app (`bin/delegation-tray/`).
+//! The delegation client as a library: enrollment, the session controller,
+//! the metrics sampler and hardware collection. Two front ends use it: the
+//! headless CLI (`bin/delegation-client.rs`, used natively on Linux and in
+//! Docker) and the Windows tray app (`bin/delegation-tray/`).
 
 pub mod hardware;
 pub mod identity;
 pub mod log;
 pub mod paths;
+pub mod sampler;
 pub mod session;
+pub mod settings;
 
 /// This machine's hostname, read fresh each call so a rename shows up on
 /// the next connection.

@@ -4,6 +4,7 @@
 
 use anyhow::{bail, Context, Result};
 use delegation_client::identity::Identity;
+use protocol::ClientSettings;
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
@@ -23,6 +24,9 @@ pub struct SavedServer {
     /// so it can be re-paired without losing its place in the list.
     pub client_id: Option<String>,
     pub signing_key_b64: Option<String>,
+    /// What this server last sent in `welcome`, so the reconnect backoff
+    /// follows its values before the tray has connected this run.
+    pub settings: Option<ClientSettings>,
 }
 
 impl SavedServer {
@@ -84,15 +88,19 @@ impl Store {
     }
 
     /// Saves a freshly enrolled identity, replacing that server's old one
-    /// if it's already in the list, and makes it the active server.
+    /// if it's already in the list (its cached settings are kept, since
+    /// they're the server's, not the identity's), and makes it the active
+    /// server.
     pub fn upsert(&mut self, url: &str, identity: &Identity) -> usize {
-        let entry = SavedServer {
+        let mut entry = SavedServer {
             url: url.to_string(),
             client_id: Some(identity.client_id.clone()),
             signing_key_b64: Some(identity.signing_key_b64()),
+            settings: None,
         };
         let index = match self.find(url) {
             Some(i) => {
+                entry.settings = self.servers[i].settings;
                 self.servers[i] = entry;
                 i
             }
@@ -104,6 +112,25 @@ impl Store {
         self.active = index;
         self.manually_disconnected = false;
         index
+    }
+
+    /// The settings to connect to `url` with: its cached ones, or defaults.
+    pub fn settings_for(&self, url: &str) -> ClientSettings {
+        self.find(url)
+            .and_then(|i| self.servers[i].settings)
+            .unwrap_or_default()
+    }
+
+    /// Records the settings a server sent. Returns whether anything changed
+    /// (and so needs saving).
+    pub fn set_settings(&mut self, index: usize, settings: ClientSettings) -> bool {
+        match self.servers.get_mut(index) {
+            Some(server) if server.settings != Some(settings) => {
+                server.settings = Some(settings);
+                true
+            }
+            _ => false,
+        }
     }
 
     pub fn forget_identity(&mut self, index: usize) {
@@ -185,6 +212,27 @@ mod tests {
         store.forget_identity(0);
         assert!(store.servers[0].identity().is_none());
         assert_eq!(store.servers[1].identity().unwrap().client_id, "id-1");
+    }
+
+    #[test]
+    fn settings_are_cached_per_server_and_survive_re_pairing() {
+        let identity = Identity::from_b64("id-1".into(), "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=").unwrap();
+        let mut store = Store::default();
+        store.upsert("https://a.example", &identity);
+        assert_eq!(store.settings_for("https://a.example"), ClientSettings::default());
+
+        let pushed = ClientSettings {
+            reconnect_backoff_max_ms: 5_000,
+            ..ClientSettings::default()
+        };
+        assert!(store.set_settings(0, pushed));
+        assert!(!store.set_settings(0, pushed), "unchanged settings don't need saving");
+        assert_eq!(store.settings_for("A.EXAMPLE"), pushed);
+
+        store.forget_identity(0);
+        store.upsert("https://a.example", &identity);
+        assert_eq!(store.settings_for("https://a.example"), pushed);
+        assert_eq!(store.settings_for("https://unknown.example"), ClientSettings::default());
     }
 
     #[test]

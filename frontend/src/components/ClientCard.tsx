@@ -10,8 +10,10 @@ import IconButton from "@mui/material/IconButton";
 import Stack from "@mui/material/Stack";
 import Tooltip from "@mui/material/Tooltip";
 import Typography from "@mui/material/Typography";
-import { MAX_FRIENDLY_NAME_LENGTH, type Client, type HardwareSpecs } from "../api";
-import { MISSING, formatCpu, formatDisk, formatGpu, formatMemory, specsSummary } from "../format";
+import { MAX_FRIENDLY_NAME_LENGTH, type Client, type DashboardConfig, type HardwareSpecs } from "../api";
+import { MISSING, formatCpu, formatDisk, formatGib, formatGpu, formatMemory, specsSummary } from "../format";
+import { latestSample, metricsGpuCount, type History } from "../useClients";
+import ClientUsage from "./ClientUsage";
 import InlineTextEdit from "./InlineTextEdit";
 
 const timestampFormat = new Intl.DateTimeFormat(undefined, { dateStyle: "medium", timeStyle: "medium" });
@@ -131,25 +133,52 @@ function Hardware({ specs }: { specs: HardwareSpecs | null }) {
   );
 }
 
+/** Live swap use from the newest sample, e.g. "0.3 / 8.0 GiB". */
+function formatSwap(history: History | undefined): string {
+  const latest = latestSample(history);
+  const total = latest?.swap_total_bytes;
+  if (total == null) return MISSING;
+  if (total === 0) return "None";
+  return `${formatGib(latest?.swap_used_bytes ?? 0)} / ${formatGib(total)} GiB`;
+}
+
 interface Props {
   client: Client;
+  /** Undefined while disconnected. */
+  history: History | undefined;
+  config: DashboardConfig;
   onRename: (friendlyName: string) => Promise<void>;
   onDelete: () => void;
 }
 
-export default function ClientCard({ client, onRename, onDelete }: Props) {
+export default function ClientCard({ client, history, config, onRename, onDelete }: Props) {
   const [expanded, setExpanded] = useState(false);
   const detailsId = `client-${client.client_id}-details`;
   const summary = specsSummary(client.specs);
+  const gpuCount = metricsGpuCount(history, client.specs);
+  const collapsedGpus = Math.min(gpuCount, config.collapsed_max_gpus);
 
   return (
     <Card
       elevation={expanded ? 4 : 2}
       sx={{ transition: (theme) => theme.transitions.create("box-shadow") }}
     >
-      <CardContent sx={{ display: "flex", alignItems: "center", gap: 2, "&:last-child": { pb: 2 } }}>
+      <CardContent
+        sx={{
+          display: "flex",
+          alignItems: "center",
+          // Narrow: the graphs drop onto their own line below the name and
+          // buttons. Wide: they sit between the two, starting at the same
+          // place on every card (the name column has a fixed width) and
+          // wrapping within that space if there are more than fit.
+          flexWrap: { xs: "wrap", lg: "nowrap" },
+          columnGap: 2,
+          rowGap: 1.5,
+          "&:last-child": { pb: 2 },
+        }}
+      >
         <StatusDot connected={client.connected} />
-        <Box sx={{ flexGrow: 1, minWidth: 0 }}>
+        <Box sx={{ flex: { xs: "1 1 10rem", lg: "0 1 15rem" }, minWidth: { xs: 0, lg: "8rem" } }}>
           <InlineTextEdit
             value={client.friendly_name}
             onSave={onRename}
@@ -168,6 +197,14 @@ export default function ClientCard({ client, onRename, onDelete }: Props) {
             </Typography>
           )}
         </Box>
+        <ClientUsage
+          history={history}
+          config={config}
+          system
+          gpuFrom={0}
+          gpuTo={collapsedGpus}
+          sx={{ order: { xs: 1, lg: 0 }, flex: { xs: "1 1 100%", lg: "1 1 auto" } }}
+        />
         <Tooltip title="Delete client">
           <IconButton
             onClick={onDelete}
@@ -199,6 +236,16 @@ export default function ClientCard({ client, onRename, onDelete }: Props) {
         id={detailsId}
       >
         <CardContent sx={{ pt: 0, "&:last-child": { pb: 2 } }}>
+          <Divider sx={{ my: 1.5 }} />
+          {/* GPUs beyond the collapsed row's DASHBOARD_COLLAPSED_MAX_GPUS. */}
+          <ClientUsage
+            history={history}
+            config={config}
+            system={false}
+            gpuFrom={collapsedGpus}
+            gpuTo={gpuCount}
+            sx={{ mb: 1.5 }}
+          />
           <Stack spacing={0.5}>
             <Hardware specs={client.specs} />
             <DetailRow
@@ -208,6 +255,10 @@ export default function ClientCard({ client, onRename, onDelete }: Props) {
             <DetailRow
               label="Client version"
               value={client.client_version ?? MISSING}
+            />
+            <DetailRow
+              label="Swap in use"
+              value={formatSwap(history)}
             />
           </Stack>
           <Divider sx={{ my: 1.5 }} />

@@ -1,10 +1,11 @@
 //! The headless client: run natively on Linux or in the Docker image.
 
 use anyhow::{bail, Result};
-use delegation_client::session::{self, ClientInfo, ServerIdentity, SessionCmd, SessionStatus, Timings};
-use delegation_client::{hardware, identity, paths};
-use log::{error, info};
-use protocol::config::Config;
+use delegation_client::sampler::Sampler;
+use delegation_client::session::{self, ClientInfo, ServerIdentity, SessionCmd, SessionStatus};
+use delegation_client::{hardware, identity, settings};
+use log::{error, info, warn};
+use protocol::ClientSettings;
 use tokio::sync::mpsc;
 
 struct Args {
@@ -43,25 +44,18 @@ async fn main() -> Result<()> {
     }
     delegation_client::log::init_stdout();
 
-    // Natively the working directory is usually wherever the user ran it
-    // from (or $HOME under systemd), so also look next to the identity file.
-    let config = Config::load(&["config.env".into(), paths::config_dir().join("config.env")]);
-    let timings = Timings::from_config(&config);
-    match config.source() {
-        Some(path) => info!(target: "config", "loaded {}", path.display()),
-        None => info!(target: "config", "no config file, using environment and defaults"),
+    // Timings come from the server (`welcome`), not a local config file.
+    // The last set it sent is cached for the reconnect backoff.
+    let settings_path = settings::cli_path();
+    let mut cached = settings::load(&settings_path);
+    match &cached {
+        Some(_) => info!(target: "config", "using the settings the server last sent ({})", settings_path.display()),
+        None => info!(target: "config", "no cached server settings yet, using defaults until connected"),
     }
-    info!(
-        target: "config",
-        "heartbeat every {:?}, ack timeout {:?}, reconnect backoff {:?}..{:?}",
-        timings.heartbeat_interval,
-        timings.ack_timeout,
-        timings.reconnect_initial_backoff,
-        timings.reconnect_max_backoff
-    );
     let identity = identity::load_or_enroll(&args.server, args.pairing_code.as_deref())?;
     let info = ClientInfo {
         machine: hardware::spawn_collect(),
+        sampler: Sampler::spawn(ClientSettings::default().sampler_interval()),
     };
 
     let (cmd_tx, cmd_rx) = mpsc::channel(4);
@@ -71,18 +65,25 @@ async fn main() -> Result<()> {
         move |_url: &str, status| {
             let _ = status_tx.send(status);
         },
-        timings,
         info,
     ));
     cmd_tx
         .send(SessionCmd::Connect(ServerIdentity {
             url: args.server,
             identity,
+            settings: cached.unwrap_or_default(),
         }))
         .await?;
 
     while let Some(status) = status_rx.recv().await {
-        if status == SessionStatus::UnknownClient {
+        if let SessionStatus::Connected(pushed) = status {
+            if cached != Some(pushed) {
+                match settings::save(&settings_path, &pushed) {
+                    Ok(()) => cached = Some(pushed),
+                    Err(e) => warn!(target: "config", "couldn't cache server settings: {e:#}"),
+                }
+            }
+        } else if status == SessionStatus::UnknownClient {
             // Most likely the server's database was reset, or this identity
             // was enrolled against a different server instance. Retrying can
             // never succeed, so wipe the stale identity and tell the human
