@@ -14,7 +14,7 @@ use axum::{
     response::{IntoResponse, Response},
     Json,
 };
-use protocol::{EnrollError, EnrollRequest, EnrollResponse, HardwareSpecs};
+use protocol::{Backend, EnrollError, EnrollRequest, EnrollResponse, HardwareSpecs, ModelState, Progress};
 use rand::Rng;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
@@ -64,6 +64,28 @@ pub struct ClientListEntry {
     info_updated_at: Option<String>,
     /// Samples newer than `since`, oldest first. Empty when disconnected.
     samples: Vec<Sample>,
+    /// What models it has and is pulling; the card's expanded view fetches
+    /// the details from `/api/clients/:id/models`.
+    models: ModelsSummary,
+}
+
+/// Counts by state (the built-in echo model left out), and pulls running.
+#[derive(Serialize, Default, Debug, PartialEq)]
+pub struct ModelsSummary {
+    available: usize,
+    loading: usize,
+    loaded: usize,
+    downloading: usize,
+    failed: usize,
+    active_pulls: Vec<ActivePull>,
+}
+
+#[derive(Serialize, Debug, PartialEq)]
+pub struct ActivePull {
+    command_id: String,
+    model_id: String,
+    model_name: String,
+    progress: Option<Progress>,
 }
 
 #[derive(Deserialize)]
@@ -83,6 +105,7 @@ pub async fn list_clients(
     let since = query.since.unwrap_or(0);
     let mut snapshot = state.live.snapshot(since);
     let active_jobs = state.replies.active_jobs();
+    let mut active_pulls = state.model_commands.active_pulls();
     // The cursor only reflects samples this user gets, so it says nothing
     // about other people's clients.
     let mut latest_seq = since;
@@ -94,7 +117,31 @@ pub async fn list_clients(
             if let Some(last) = samples.as_ref().and_then(|s| s.last()) {
                 latest_seq = latest_seq.max(last.seq);
             }
+            let mut models = ModelsSummary::default();
+            if let Some(inventory) = state.live.inventory(&r.client_id) {
+                for m in inventory.models.iter().filter(|m| m.backend != Backend::Echo) {
+                    *match m.state {
+                        ModelState::Available => &mut models.available,
+                        ModelState::Loading => &mut models.loading,
+                        ModelState::Loaded => &mut models.loaded,
+                        ModelState::Downloading => &mut models.downloading,
+                        ModelState::Failed => &mut models.failed,
+                    } += 1;
+                }
+            }
+            models.active_pulls = active_pulls
+                .remove(&r.client_id)
+                .unwrap_or_default()
+                .into_iter()
+                .map(|c| ActivePull {
+                    command_id: c.command_id,
+                    model_id: c.model_id,
+                    model_name: c.model_name,
+                    progress: c.progress,
+                })
+                .collect();
             Some(ClientListEntry {
+                models,
                 connected: samples.is_some(),
                 samples: samples.unwrap_or_default(),
                 last_seen_at: snapshot.last_seen.remove(&r.client_id).or(r.last_seen_at),
@@ -126,7 +173,7 @@ pub async fn list_clients(
 
 /// 404 if the user can't see the client, 403 if they can but may not do
 /// `action`.
-async fn require(
+pub(crate) async fn require(
     state: &AppState,
     user: &crate::auth::User,
     client_id: &str,

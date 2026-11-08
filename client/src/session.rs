@@ -6,6 +6,7 @@
 use crate::chat;
 use crate::hardware::MachineInfo;
 use crate::identity::Identity;
+use crate::inference::{CommandStatus, Inference};
 use crate::sampler::Sampler;
 use anyhow::{bail, Context, Result};
 use base64::{engine::general_purpose::STANDARD, Engine as _};
@@ -34,14 +35,16 @@ pub struct ServerIdentity {
     pub settings: ClientSettings,
 }
 
-/// What gets reported to the server. The hardware scan runs once in the
-/// background; until it finishes `machine` holds `None` and the session
-/// sends `info` as soon as it does. The sampler runs for the life of the
-/// process, feeding every tick.
+/// What lives for the whole process and every session uses. The hardware
+/// scan runs once in the background; until it finishes `machine` holds
+/// `None` and the session sends `info` as soon as it does. The sampler
+/// feeds every tick. `inference` owns models and `llama-server`, so a
+/// reconnect doesn't touch either.
 #[derive(Clone)]
 pub struct ClientInfo {
     pub machine: watch::Receiver<Option<Arc<MachineInfo>>>,
     pub sampler: Sampler,
+    pub inference: Inference,
 }
 
 // Commands are rare, so the size of an inline identity doesn't matter.
@@ -92,9 +95,13 @@ type StatusFn = Arc<dyn Fn(&str, SessionStatus) + Send + Sync>;
 /// simply aborted.
 const STOP_GRACE: Duration = Duration::from_secs(2);
 
+/// Inventory changes are batched for this long before one is sent.
+const INVENTORY_DEBOUNCE: Duration = Duration::from_millis(500);
+
 /// Runs at most one session at a time until `Shutdown` arrives or the
 /// command channel closes. `Connect` replaces whatever session is running,
-/// `Disconnect` ends it; either way the server sees the socket close.
+/// `Disconnect` ends it; either way the server sees the socket close. On
+/// the way out it stops `llama-server`.
 pub async fn controller(
     mut cmds: mpsc::Receiver<SessionCmd>,
     status: impl Fn(&str, SessionStatus) + Send + Sync + 'static,
@@ -123,12 +130,16 @@ pub async fn controller(
                     status(&url, SessionStatus::Disconnected { error: None });
                 }
             }
-            SessionCmd::Shutdown => return,
+            SessionCmd::Shutdown => {
+                info.inference.shutdown().await;
+                return;
+            }
         }
     }
     if let Some(session) = current.take() {
         session.stop().await;
     }
+    info.inference.shutdown().await;
 }
 
 struct RunningSession {
@@ -288,6 +299,20 @@ async fn run_session(
                 settings.reconnect_backoff_initial_ms,
                 settings.reconnect_backoff_max_ms
             );
+            let i = &settings.inference;
+            info!(
+                target: "ws",
+                "inference settings: {} at once, max {} tokens, context {} by default, {} threads, unload after \
+                 {} s idle, load timeout {} ms, {} MiB disk reserve, echo model {}",
+                i.max_concurrent,
+                i.max_tokens,
+                i.default_context,
+                if i.threads == 0 { "auto".to_string() } else { i.threads.to_string() },
+                i.idle_unload_secs,
+                i.model_load_timeout_ms,
+                i.disk_reserve_mb,
+                if i.echo_model_enabled { "on" } else { "off" }
+            );
         }
         ServerMessage::AuthFailed {
             reason: AuthFailedReason::UnknownClient,
@@ -298,6 +323,7 @@ async fn run_session(
     *authenticated = true;
     let settings = *settings;
     info.sampler.set_interval(settings.sampler_interval());
+    info.inference.apply_settings(&settings.inference);
     status(SessionStatus::Connected(settings));
 
     // --- authenticated: info, then ticks until the connection ends ---
@@ -310,7 +336,15 @@ async fn run_session(
         send(&mut write, &info_message(&m)).await?;
         info_sent = true;
     }
-    send(&mut write, &ClientMessage::Models { models: chat::models() }).await?;
+    let inference = &info.inference;
+    let mut inventory_changes = inference.subscribe();
+    inventory_changes.borrow_and_update();
+    send(&mut write, &ClientMessage::ModelInventory(inference.inventory())).await?;
+    let mut inventory_due: Option<Instant> = None;
+
+    // Model command statuses, from commands that may well outlive this
+    // session (their later statuses then go nowhere).
+    let (command_tx, mut command_rx) = mpsc::channel::<CommandStatus>(64);
 
     // Chat replies are generated on their own tasks and queued here for
     // this loop to send. Dropping `chats` (however the session ends) aborts
@@ -344,6 +378,19 @@ async fn run_session(
             Some(out) = chat_rx.recv() => {
                 within(silence, "sending a chat reply", send(&mut write, &out)).await??;
             }
+            Some(command) = command_rx.recv() => {
+                debug!(target: "models", "command {} is {:?}", command.command_id, command.state);
+                within(silence, "sending a command status", send(&mut write, &command.into_message())).await??;
+            }
+            Ok(()) = inventory_changes.changed() => {
+                inventory_due.get_or_insert_with(|| Instant::now() + INVENTORY_DEBOUNCE);
+            }
+            _ = tokio::time::sleep_until(inventory_due.unwrap_or_else(Instant::now)), if inventory_due.is_some() => {
+                inventory_due = None;
+                inventory_changes.borrow_and_update();
+                let inventory = ClientMessage::ModelInventory(inference.inventory());
+                within(silence, "sending the inventory", send(&mut write, &inventory)).await??;
+            }
             _ = tokio::time::sleep_until(last_inbound + silence) => {
                 bail!("nothing from the server in {} ms, treating the connection as dead", silence.as_millis());
             }
@@ -371,10 +418,21 @@ async fn run_session(
                 last_inbound = Instant::now();
                 match msg {
                     Message::Text(text) => match serde_json::from_str::<ServerMessage>(&text) {
-                        Ok(ServerMessage::ChatRequest { request_id, model, messages }) => {
+                        Ok(ServerMessage::ChatRequest { request_id, model, messages, temperature }) => {
                             info!(target: "chat", "request {request_id}: {model}, {} message(s)", messages.len());
-                            let task = tokio::spawn(chat::respond(request_id.clone(), model, messages, chat_tx.clone()));
+                            let task = tokio::spawn(chat::respond(
+                                request_id.clone(),
+                                model,
+                                messages,
+                                temperature,
+                                inference.clone(),
+                                chat_tx.clone(),
+                            ));
                             chats.start(request_id, task);
+                        }
+                        Ok(ServerMessage::ModelCommand { command_id, command }) => {
+                            info!(target: "models", "command {command_id}: {}", command_summary(&command));
+                            inference.execute(command_id, command, command_tx.clone());
                         }
                         Ok(ServerMessage::ChatCancel { request_id }) => {
                             if chats.cancel(&request_id) {
@@ -421,6 +479,16 @@ impl Drop for ChatTasks {
         for handle in self.0.values() {
             handle.abort();
         }
+    }
+}
+
+fn command_summary(command: &protocol::ModelCommandKind) -> String {
+    use protocol::ModelCommandKind;
+    match command {
+        ModelCommandKind::Pull { model } => format!("pull {} ({} bytes)", model.id, model.source.size_bytes),
+        ModelCommandKind::Delete { model_id } => format!("delete {model_id}"),
+        ModelCommandKind::Cancel { target_command_id } => format!("cancel {target_command_id}"),
+        ModelCommandKind::Unknown => "a kind this client doesn't know".into(),
     }
 }
 

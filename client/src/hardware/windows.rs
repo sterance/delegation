@@ -213,6 +213,15 @@ fn bus_type(code: u16) -> DiskInterface {
     }
 }
 
+/// Free space for this user on the volume holding `path` (which must exist).
+pub(super) fn free_bytes_at(path: &std::path::Path) -> Option<u64> {
+    let mut available: u64 = 0;
+    let root = HSTRING::from(path.as_os_str());
+    // SAFETY: the out pointer is valid for a u64 for the whole call.
+    unsafe { GetDiskFreeSpaceExW(&root, Some(&mut available), None, None) }.ok()?;
+    Some(available)
+}
+
 fn free_bytes(letter: char) -> Option<u64> {
     let mut available: u64 = 0;
     let root = HSTRING::from(format!("{letter}:\\"));

@@ -18,7 +18,7 @@ interface Props {
   upward?: boolean
 }
 
-/** The models the user can chat with, to pick one for an action. */
+/** The models the user can chat with, grouped by client, to pick one for an action. */
 export default function ModelMenu({ anchor, onClose, models, selectedId, onPick, heading, upward = false }: Props) {
   return (
     <Menu
@@ -29,20 +29,34 @@ export default function ModelMenu({ anchor, onClose, models, selectedId, onPick,
       transformOrigin={{ vertical: upward ? 'bottom' : 'top', horizontal: 'left' }}
     >
       {heading && <ListSubheader sx={{ lineHeight: 2.5 }}>{heading}</ListSubheader>}
-      {models.length === 0 && <MenuItem disabled>No models available, connect a client</MenuItem>}
-      {models.map((m) => (
-        <MenuItem
-          key={m.id}
-          selected={m.id === selectedId}
-          onClick={() => {
-            onPick(m)
-            onClose()
-          }}
-        >
-          <ListItemIcon>{m.id === selectedId && <CheckIcon fontSize="small" />}</ListItemIcon>
-          <ListItemText primary={m.label} secondary={m.detail} />
-        </MenuItem>
-      ))}
+      {models.length === 0 && (
+        <MenuItem disabled>No models available: connect a client, or install one from Clients</MenuItem>
+      )}
+      {models.flatMap((m, i) => {
+        // The list comes sorted by client, so a new client starts a new group.
+        const group = i === 0 || models[i - 1].target.client_id !== m.target.client_id
+        const item = (
+          <MenuItem
+            key={m.id}
+            selected={m.id === selectedId}
+            onClick={() => {
+              onPick(m)
+              onClose()
+            }}
+          >
+            <ListItemIcon>{m.id === selectedId && <CheckIcon fontSize="small" />}</ListItemIcon>
+            <ListItemText primary={m.label} />
+          </MenuItem>
+        )
+        return group
+          ? [
+              <ListSubheader key={`group-${m.target.client_id}`} sx={{ lineHeight: 2.5 }}>
+                {m.detail}
+              </ListSubheader>,
+              item,
+            ]
+          : [item]
+      })}
     </Menu>
   )
 }

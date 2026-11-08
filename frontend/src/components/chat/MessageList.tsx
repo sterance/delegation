@@ -150,12 +150,23 @@ function StatusNote({ message }: { message: ChatMessage }) {
   }
 }
 
+/** What a reply without text yet is doing. */
+function waitingText(message: ChatMessage): string {
+  if (message.status === 'queued') return 'Starting…'
+  if (message.stage === 'loading_model') return 'Loading model…'
+  return `Waiting for ${message.client_label ?? 'the client'}…`
+}
+
 function AssistantMessage({ step, actions }: { step: BranchStep; actions: MessageActions }) {
   const { message } = step
   const [menu, setMenu] = useState<{ anchor: HTMLElement; kind: 'retry' | 'regenerate' } | null>(null)
   const active = isActive(message.status)
   const retryable = message.status === 'failed' || message.status === 'orphaned'
-  const answeredBy = [message.model, message.client_label].filter(Boolean).join(' · ')
+  // The display name while that model is still offered; the stored id otherwise.
+  const modelName =
+    actions.models.find((o) => o.target.client_id === message.client_id && o.target.model === message.model)?.label ??
+    message.model
+  const answeredBy = [modelName, message.client_label].filter(Boolean).join(' · ')
   const openMenu = (anchor: HTMLElement, kind: 'retry' | 'regenerate') => {
     actions.onOpenModels()
     setMenu({ anchor, kind })
@@ -169,7 +180,7 @@ function AssistantMessage({ step, actions }: { step: BranchStep; actions: Messag
           <Stack direction="row" spacing={1} sx={{ alignItems: 'center' }}>
             <CircularProgress size={16} aria-label="Waiting for the reply" />
             <Typography variant="body2" color="text.secondary">
-              {message.status === 'queued' ? 'Starting…' : `Waiting for ${message.client_label ?? 'the client'}…`}
+              {waitingText(message)}
             </Typography>
           </Stack>
         )}

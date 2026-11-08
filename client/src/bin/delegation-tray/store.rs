@@ -4,6 +4,7 @@
 
 use anyhow::{bail, Context, Result};
 use delegation_client::identity::Identity;
+use delegation_client::settings::CachedTimeouts;
 use protocol::ClientSettings;
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
@@ -24,9 +25,11 @@ pub struct SavedServer {
     /// so it can be re-paired without losing its place in the list.
     pub client_id: Option<String>,
     pub signing_key_b64: Option<String>,
-    /// What this server last sent in `welcome`, so the reconnect backoff
-    /// follows its values before the tray has connected this run.
-    pub settings: Option<ClientSettings>,
+    /// The timeouts this server last sent in `welcome`, so the reconnect
+    /// backoff follows its values before the tray has connected this run.
+    /// (Earlier versions kept every setting here, as `settings`.)
+    #[serde(alias = "settings")]
+    pub timeouts: Option<CachedTimeouts>,
 }
 
 impl SavedServer {
@@ -96,11 +99,11 @@ impl Store {
             url: url.to_string(),
             client_id: Some(identity.client_id.clone()),
             signing_key_b64: Some(identity.signing_key_b64()),
-            settings: None,
+            timeouts: None,
         };
         let index = match self.find(url) {
             Some(i) => {
-                entry.settings = self.servers[i].settings;
+                entry.timeouts = self.servers[i].timeouts;
                 self.servers[i] = entry;
                 i
             }
@@ -114,19 +117,22 @@ impl Store {
         index
     }
 
-    /// The settings to connect to `url` with: its cached ones, or defaults.
+    /// The settings to connect to `url` with: its cached timeouts, and
+    /// defaults for everything else.
     pub fn settings_for(&self, url: &str) -> ClientSettings {
         self.find(url)
-            .and_then(|i| self.servers[i].settings)
+            .and_then(|i| self.servers[i].timeouts)
             .unwrap_or_default()
+            .settings()
     }
 
     /// Records the settings a server sent. Returns whether anything changed
     /// (and so needs saving).
     pub fn set_settings(&mut self, index: usize, settings: ClientSettings) -> bool {
+        let timeouts = CachedTimeouts::from(&settings);
         match self.servers.get_mut(index) {
-            Some(server) if server.settings != Some(settings) => {
-                server.settings = Some(settings);
+            Some(server) if server.timeouts != Some(timeouts) => {
+                server.timeouts = Some(timeouts);
                 true
             }
             _ => false,
@@ -227,6 +233,14 @@ mod tests {
         };
         assert!(store.set_settings(0, pushed));
         assert!(!store.set_settings(0, pushed), "unchanged settings don't need saving");
+        let other = ClientSettings {
+            tick_interval_ms: 9_000,
+            ..pushed
+        };
+        assert!(
+            !store.set_settings(0, other),
+            "only the pre-welcome timeouts are cached"
+        );
         assert_eq!(store.settings_for("A.EXAMPLE"), pushed);
 
         store.forget_identity(0);

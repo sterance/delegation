@@ -25,6 +25,20 @@ pub struct MachineInfo {
     pub specs: HardwareSpecs,
 }
 
+/// Free space for this user on the volume holding `path`, which must
+/// exist. None where it can't be read (or on other platforms).
+pub fn free_space(path: &std::path::Path) -> Option<u64> {
+    #[cfg(target_os = "linux")]
+    return linux::available_bytes(path);
+    #[cfg(windows)]
+    return windows::free_bytes_at(path);
+    #[allow(unreachable_code)]
+    {
+        let _ = path;
+        None
+    }
+}
+
 /// How long the scan may take before the client reports without it.
 const COLLECT_TIMEOUT: Duration = Duration::from_secs(30);
 

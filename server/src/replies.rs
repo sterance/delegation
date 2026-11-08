@@ -23,10 +23,11 @@
 use crate::config::ChatSettings;
 use crate::conversations::{self, active_sql, Busy, Message, MessageStatus};
 use crate::db::{now_ts, Db};
+use crate::live::usable;
 use crate::live::Live;
 use crate::{debug, log};
 use anyhow::Result;
-use protocol::{ChatTurn, ServerMessage};
+use protocol::{Backend, ChatTurn, InferenceSettings, ServerMessage, Stage};
 use rusqlite::{Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -49,6 +50,8 @@ pub enum Target {
 /// What a client sent about an attempt.
 #[derive(Debug, Clone, PartialEq)]
 pub enum ChatEvent {
+    /// Alive without text yet (e.g. loading its model). Resets the idle timeout.
+    Progress(Stage),
     Chunk(String),
     Done,
     Error(String),
@@ -58,6 +61,8 @@ pub enum ChatEvent {
 #[derive(Debug, Clone, PartialEq)]
 pub enum ReplyEvent {
     Status(Snapshot),
+    /// The client moved to a new stage (loading the model, generating).
+    Progress(Stage),
     Chunk(String),
     /// Last event: the final status, once it's in the database.
     End {
@@ -76,6 +81,9 @@ pub struct Snapshot {
     pub client_id: Option<String>,
     pub client_label: Option<String>,
     pub model: Option<String>,
+    /// The client's latest `chat_progress`, so a stream that attaches while
+    /// the model loads can say so.
+    pub stage: Option<Stage>,
 }
 
 #[derive(Debug)]
@@ -134,6 +142,7 @@ struct Hub {
     model: Option<String>,
     /// Always an active status: what listeners see until the ending commits.
     status: MessageStatus,
+    stage: Option<Stage>,
     /// Set once the reply has ended; it's written, then announced.
     ending: Option<(MessageStatus, Option<String>)>,
     text: String,
@@ -156,6 +165,7 @@ impl Hub {
             client_id: self.client_id.clone(),
             client_label: self.client_label.clone(),
             model: self.model.clone(),
+            stage: self.stage,
         }
     }
 
@@ -185,6 +195,8 @@ enum Write {
         client_id: String,
         client_label: String,
         model: String,
+        /// `meta_json` for this attempt (how much history was trimmed).
+        meta: Option<String>,
     },
     Running {
         message_id: String,
@@ -208,18 +220,21 @@ pub struct ReplyRunner {
     db: Db,
     live: Arc<Live>,
     chat: ChatSettings,
+    /// `max_tokens` and `default_context`, for trimming history.
+    inference: InferenceSettings,
     inner: Mutex<Inner>,
     writes: mpsc::UnboundedSender<Write>,
 }
 
 impl ReplyRunner {
     /// Starts the writer and the flush/idle-timeout task.
-    pub fn new(db: Db, live: Arc<Live>, chat: ChatSettings) -> Arc<Self> {
+    pub fn new(db: Db, live: Arc<Live>, chat: ChatSettings, inference: InferenceSettings) -> Arc<Self> {
         let (writes, rx) = mpsc::unbounded_channel();
         let runner = Arc::new(ReplyRunner {
             db,
             live,
             chat,
+            inference,
             inner: Mutex::new(Inner::default()),
             writes,
         });
@@ -320,6 +335,7 @@ impl ReplyRunner {
                     client_label: None,
                     model: None,
                     status: MessageStatus::Queued,
+                    stage: None,
                     ending: None,
                     text: String::new(),
                     chars: 0,
@@ -342,9 +358,22 @@ impl ReplyRunner {
         let Some(conn) = self.live.sender(&client_id) else {
             return fail(format!("{label} isn't connected."));
         };
-        if !conn.models.iter().any(|m| m.id == model) {
+        let Some(local) = conn.model(&model).filter(|m| usable(m.state)) else {
             return fail(format!("{label} doesn't offer the model {model:?}."));
-        }
+        };
+
+        // Fit the history in the model's context, leaving room for the reply.
+        let context = local
+            .context_length
+            .or((local.backend == Backend::LlamaCpp).then_some(self.inference.default_context));
+        let (history, dropped) = match context {
+            Some(context) => {
+                let budget = u64::from(context).saturating_sub(u64::from(self.inference.max_tokens));
+                conversations::trim_history(history, budget)
+            }
+            None => (history, 0),
+        };
+        let meta = (dropped > 0).then(|| serde_json::json!({ "history_turns_dropped": dropped }).to_string());
 
         let attempt_id = Uuid::new_v4().to_string();
         let turns = history.len();
@@ -374,11 +403,13 @@ impl ReplyRunner {
             client_id: client_id.clone(),
             client_label: label,
             model: model.clone(),
+            meta,
         });
         let request = ServerMessage::ChatRequest {
             request_id: attempt_id.clone(),
             model: model.clone(),
             messages: history,
+            temperature: None,
         };
         if conn.tx.try_send(request).is_err() {
             self.finish(
@@ -390,8 +421,13 @@ impl ReplyRunner {
             return Err(StartError::Failed("busy".into()));
         }
         drop(inner);
+        let trimmed = if dropped > 0 {
+            format!(", {dropped} older one(s) trimmed to fit the context")
+        } else {
+            String::new()
+        };
         log(format!(
-            "[reply] {message_id} attempt {attempt_id} sent to {client_id} ({model}, {turns} message(s))"
+            "[reply] {message_id} attempt {attempt_id} sent to {client_id} ({model}, {turns} message(s){trimmed})"
         ));
         debug(|| format!("[reply] {message_id} history: {preview}"));
         Ok(())
@@ -606,6 +642,14 @@ impl ReplyRunner {
             return;
         }
         let ending = match event {
+            ChatEvent::Progress(stage) => {
+                hub.last_activity = Instant::now();
+                if hub.stage != Some(stage) {
+                    hub.stage = Some(stage);
+                    let _ = hub.events.send(ReplyEvent::Progress(stage));
+                }
+                None
+            }
             ChatEvent::Chunk(delta) => {
                 if hub.status == MessageStatus::Assigned && transition(&message_id, hub.status, MessageStatus::Running)
                 {
@@ -820,14 +864,15 @@ fn apply(conn: &mut Connection, batch: Vec<Write>) -> Result<()> {
                 client_id,
                 client_label,
                 model,
+                meta,
             } => tx.execute(
                 // The client may have been deleted meanwhile; then there's
                 // no row to point at, and the label still says who it was.
                 "UPDATE messages SET status = 'assigned', attempt_id = ?2, attempts = attempts + 1,
                    client_id = (SELECT client_id FROM clients WHERE client_id = ?3),
-                   client_label = ?4, model = ?5, error = NULL
+                   client_label = ?4, model = ?5, error = NULL, meta_json = ?6
                  WHERE id = ?1 AND status = 'queued'",
-                (message_id, attempt_id, client_id, client_label, model),
+                (message_id, attempt_id, client_id, client_label, model, meta),
             ),
             Write::Running { message_id, attempt_id } => tx.execute(
                 "UPDATE messages SET status = 'running' WHERE id = ?1 AND attempt_id = ?2 AND status = 'assigned'",
@@ -882,6 +927,7 @@ fn apply(conn: &mut Connection, batch: Vec<Write>) -> Result<()> {
 
 fn kind(event: &ChatEvent) -> &'static str {
     match event {
+        ChatEvent::Progress(_) => "progress",
         ChatEvent::Chunk(_) => "chunk",
         ChatEvent::Done => "done",
         ChatEvent::Error(_) => "error",
@@ -908,7 +954,20 @@ mod tests {
     use crate::conversations::{create_turn, NewTurn, TurnOutcome};
     use crate::db::tests::{add_client, add_user, memory_db};
     use crate::live::ConnHandle;
-    use protocol::ModelInfo;
+    use protocol::{Inventory, LocalModel, ModelState};
+
+    pub fn local_model(id: &str, backend: Backend, context_length: Option<u32>) -> LocalModel {
+        LocalModel {
+            id: id.into(),
+            display_name: id.into(),
+            backend,
+            state: ModelState::Loaded,
+            size_bytes: 0,
+            context_length,
+            meta: Default::default(),
+            error: None,
+        }
+    }
 
     fn chat_settings() -> ChatSettings {
         ChatSettings {
@@ -918,6 +977,13 @@ mod tests {
             max_message_chars: 1000,
             max_reply_chars: 20,
             max_active_replies_per_user: 3,
+        }
+    }
+
+    fn inference_settings() -> InferenceSettings {
+        InferenceSettings {
+            max_tokens: 100,
+            ..InferenceSettings::default()
         }
     }
 
@@ -940,8 +1006,19 @@ mod tests {
         let owner = add_user(&db, "alice", "user");
         add_client(&db, "c1", &owner);
         let conn = live.register("c1");
-        live.set_models("c1", conn.id, vec![ModelInfo { id: "echo".into() }]);
-        let runner = ReplyRunner::new(db.clone(), live.clone(), chat_settings());
+        live.set_inventory(
+            "c1",
+            conn.id,
+            Inventory {
+                models: vec![
+                    local_model("echo", Backend::Echo, None),
+                    // 600 tokens, 100 of them kept for the reply.
+                    local_model("tiny", Backend::LlamaCpp, Some(600)),
+                ],
+                ..Inventory::default()
+            },
+        );
+        let runner = ReplyRunner::new(db.clone(), live.clone(), chat_settings(), inference_settings());
         Fixture {
             db,
             live,
@@ -1190,6 +1267,7 @@ mod tests {
                 idle_timeout: Duration::from_millis(100),
                 ..chat_settings()
             },
+            inference_settings(),
         );
         let id = queued_reply(&f, "conv");
         runner.start(&id, &target()).await.unwrap();
@@ -1202,5 +1280,122 @@ mod tests {
             f.conn.outbound.recv().await,
             Some(ServerMessage::ChatCancel { request_id }) if request_id == attempt
         ));
+    }
+
+    #[tokio::test]
+    async fn progress_keeps_a_slow_reply_alive_and_reaches_listeners() {
+        let mut f = fixture();
+        let runner = ReplyRunner::new(
+            f.db.clone(),
+            f.live.clone(),
+            ChatSettings {
+                idle_timeout: Duration::from_millis(300),
+                ..chat_settings()
+            },
+            inference_settings(),
+        );
+        let id = queued_reply(&f, "conv");
+        runner.start(&id, &target()).await.unwrap();
+        let attempt = sent_attempt(&mut f.conn).await;
+        let (_, mut rx) = runner.attach(&id).unwrap();
+        // Loading a model for 0.9 s, three times the idle timeout.
+        for _ in 0..9 {
+            runner.on_client_event(f.conn.id, &attempt, ChatEvent::Progress(Stage::LoadingModel));
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        assert!(runner.attach(&id).is_some(), "still running");
+        assert_eq!(rx.recv().await.unwrap(), ReplyEvent::Progress(Stage::LoadingModel));
+        assert_eq!(
+            runner.attach(&id).unwrap().0.stage,
+            Some(Stage::LoadingModel),
+            "a stream attaching now hears it's loading"
+        );
+        runner.on_client_event(f.conn.id, &attempt, ChatEvent::Progress(Stage::Generating));
+        runner.on_client_event(f.conn.id, &attempt, ChatEvent::Chunk("hi".into()));
+        // Then silence: it times out as before.
+        let (status, error) = wait_for_end(&mut rx).await;
+        assert_eq!(status, MessageStatus::Failed);
+        assert!(error.unwrap().contains("sent nothing"));
+    }
+
+    #[tokio::test]
+    async fn history_is_trimmed_to_the_models_context_and_recorded() {
+        let mut f = fixture();
+        let owner = f.owner.clone();
+        // Three long completed turns, then a new message: 2,000 chars each
+        // is about 500 tokens, and "tiny" has room for 500 in all.
+        let reply_id =
+            f.db.blocking(|c| {
+                let mut parent: Option<String> = None;
+                for i in 0..3 {
+                    let TurnOutcome::Created(turn) = create_turn(
+                        c,
+                        NewTurn {
+                            owner: &owner,
+                            conversation_id: "conv",
+                            content: Some(&format!("{i}{}", "x".repeat(2_000))),
+                            parent_id: parent.as_deref(),
+                            max_active_per_user: 10,
+                        },
+                    )?
+                    else {
+                        panic!("not created")
+                    };
+                    c.execute(
+                        "UPDATE messages SET status = 'completed', content = 'ok' WHERE id = ?1",
+                        [&turn.reply.id],
+                    )?;
+                    parent = Some(turn.reply.id);
+                }
+                let TurnOutcome::Created(turn) = create_turn(
+                    c,
+                    NewTurn {
+                        owner: &owner,
+                        conversation_id: "conv",
+                        content: Some("the newest question"),
+                        parent_id: parent.as_deref(),
+                        max_active_per_user: 10,
+                    },
+                )?
+                else {
+                    panic!("not created")
+                };
+                Ok(turn.reply.id)
+            })
+            .unwrap();
+        let tiny = Target::Client {
+            client_id: "c1".into(),
+            model: "tiny".into(),
+        };
+        f.runner.start(&reply_id, &tiny).await.unwrap();
+        let (_, messages) = match tokio::time::timeout(Duration::from_secs(2), f.conn.outbound.recv()).await {
+            Ok(Some(ServerMessage::ChatRequest {
+                request_id, messages, ..
+            })) => (request_id, messages),
+            other => panic!("expected a chat_request, got {other:?}"),
+        };
+        // Of 7 turns (3 x user+reply, then the question), only the last
+        // reply and the question fit; a reply can't open the history.
+        assert_eq!(messages.len(), 1, "{messages:?}");
+        assert_eq!(messages[0].content, "the newest question");
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let rid = reply_id.clone();
+        let meta: Option<String> =
+            f.db.call(move |c| Ok(c.query_row("SELECT meta_json FROM messages WHERE id = ?1", [&rid], |r| r.get(0))?))
+                .await
+                .unwrap();
+        assert_eq!(meta.as_deref(), Some(r#"{"history_turns_dropped":6}"#));
+
+        // Echo has no context limit: nothing is trimmed.
+        let other = queued_reply(&f, "conv2");
+        f.runner.start(&other, &target()).await.unwrap();
+        let _ = sent_attempt(&mut f.conn).await;
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let meta: Option<String> = f
+            .db
+            .call(move |c| Ok(c.query_row("SELECT meta_json FROM messages WHERE id = ?1", [&other], |r| r.get(0))?))
+            .await
+            .unwrap();
+        assert_eq!(meta, None);
     }
 }

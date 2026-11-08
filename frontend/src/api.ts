@@ -7,11 +7,13 @@
 // page; see setUnauthorizedHandler.
 
 import type {
+  Backend,
   ChatMessage,
   ChatModel,
   Conversation,
   ConversationPage,
   MessageStatus,
+  ModelState,
   ReplyEvent,
   SendRequest,
   Target,
@@ -44,6 +46,94 @@ export interface Client {
   info_updated_at: string | null
   /** Samples newer than the request's `since`, oldest first. Always empty when disconnected. */
   samples: Sample[]
+  /** What models it has; the card's expanded view fetches the details. */
+  models: ModelsSummary
+}
+
+// ---- models on clients: mirrors protocol/src/models.rs and server/src/models ----
+
+/** Counts by state (the built-in echo model left out), and pulls running. */
+export interface ModelsSummary {
+  available: number
+  loading: number
+  loaded: number
+  downloading: number
+  failed: number
+  active_pulls: { command_id: string; model_id: string; model_name: string; progress: Progress | null }[]
+}
+
+export interface Progress {
+  done_bytes: number
+  total_bytes: number
+  /** A pull downloads the llama.cpp runtime first if the client doesn't have it yet. */
+  phase: 'runtime' | 'model'
+}
+
+export interface ModelMeta {
+  family: string | null
+  parameters: string | null
+  quantization: string | null
+}
+
+export interface LocalModel {
+  id: string
+  display_name: string
+  backend: Backend
+  state: ModelState
+  size_bytes: number
+  context_length: number | null
+  meta: ModelMeta
+  /** Why it's `failed`. */
+  error: string | null
+}
+
+export interface RuntimeInfo {
+  backend: Backend
+  version: string
+  variant: string
+  state: 'absent' | 'downloading' | 'ready'
+}
+
+export type CommandState = 'sent' | 'accepted' | 'in_progress' | 'done' | 'failed' | 'cancelled' | 'unsupported'
+
+export interface ModelCommand {
+  command_id: string
+  client_id: string
+  kind: 'pull' | 'delete'
+  model_id: string
+  model_name: string
+  state: CommandState
+  progress: Progress | null
+  error: string | null
+  requested_by: string
+  started_at: string
+  finished_at: string | null
+}
+
+/** `GET /api/clients/:id/models`. */
+export interface ClientModels {
+  client_id: string
+  connected: boolean
+  can_manage: boolean
+  /** Empty until the client has reported, and while it's disconnected. */
+  models: LocalModel[]
+  storage: { models_bytes: number; free_bytes: number } | null
+  runtimes: RuntimeInfo[]
+  /** Recent and running commands, newest first; finished ones go after an hour. */
+  commands: ModelCommand[]
+}
+
+export interface CatalogEntry {
+  id: string
+  display_name: string
+  backend: Backend
+  size_bytes: number
+  context_length: number | null
+  meta: ModelMeta
+}
+
+export function isCommandActive(state: CommandState): boolean {
+  return state === 'sent' || state === 'accepted' || state === 'in_progress'
 }
 
 /** `GET /api/clients?since=<seq>`. */
@@ -360,6 +450,40 @@ export async function createPairingCode(): Promise<string> {
 /** Throws an ApiError with status 404 if the server doesn't know the code. */
 export function getPairingCodeStatus(code: string): Promise<PairingCodeStatus> {
   return request<PairingCodeStatus>('GET', `/api/pairing-codes/${encodeURIComponent(code)}/status`)
+}
+
+// ---- models on clients ----
+
+/** What can be installed. */
+export function listCatalog(): Promise<CatalogEntry[]> {
+  return request<CatalogEntry[]>('GET', '/api/models/catalog')
+}
+
+export function getClientModels(clientId: string): Promise<ClientModels> {
+  return request<ClientModels>('GET', `/api/clients/${encodeURIComponent(clientId)}/models`)
+}
+
+/** Sends a pull of a catalog entry. Rejects with a 409 if the client is offline. */
+export function installModel(clientId: string, catalogId: string): Promise<ModelCommand> {
+  return request<ModelCommand>('POST', `/api/clients/${encodeURIComponent(clientId)}/models`, {
+    catalog_id: catalogId,
+  })
+}
+
+export function deleteModel(clientId: string, modelId: string): Promise<ModelCommand> {
+  return request<ModelCommand>(
+    'DELETE',
+    `/api/clients/${encodeURIComponent(clientId)}/models/${encodeURIComponent(modelId)}`,
+  )
+}
+
+/** Stops a download; the client keeps what it has, so installing again resumes. */
+export function cancelModelCommand(clientId: string, commandId: string): Promise<ModelCommand> {
+  return request<ModelCommand>(
+    'POST',
+    `/api/clients/${encodeURIComponent(clientId)}/model-commands/${encodeURIComponent(commandId)}/cancel`,
+    {},
+  )
 }
 
 // ---- chat ----

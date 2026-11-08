@@ -11,8 +11,9 @@
 //! broken cross-variable rule, stops the server with a message naming the
 //! variable, rather than quietly running on something else.
 
+use protocol::models::{MIN_CONTEXT, MIN_MODEL_LOAD_TIMEOUT_MS, MIN_PROGRESS_INTERVAL_MS};
 use protocol::telemetry::MIN_SAMPLER_INTERVAL_MS;
-use protocol::ClientSettings;
+use protocol::{valid_model_id, Backend, ClientSettings, InferenceSettings, ModelMeta, ModelSource, ModelSpec};
 use serde::Serialize;
 use std::{collections::HashMap, path::PathBuf, time::Duration};
 
@@ -96,8 +97,10 @@ pub struct Settings {
     /// Pre-migration backups to keep next to the database.
     pub db_migration_backups_keep: usize,
     pub frontend_dir: String,
-    /// Pushed to every client in `welcome`.
+    /// Pushed to every client in `welcome`, `INFERENCE_*` included.
     pub client: ClientSettings,
+    /// `TEST_MODEL_*`: the catalog's one entry.
+    pub test_model: ModelSpec,
     pub liveness_timeout: Duration,
     pub ws_ping_interval: Duration,
     pub last_seen_flush_interval: Duration,
@@ -285,6 +288,61 @@ impl Settings {
         let chat_max_reply = p.int("CHAT_MAX_REPLY_CHARS", 400_000, 1);
         let chat_max_active = p.int("CHAT_MAX_ACTIVE_REPLIES_PER_USER", 3, 1);
 
+        // ---- inference (pushed to clients) ----
+        let inference_defaults = InferenceSettings::default();
+        let inf_progress = p.int(
+            "INFERENCE_PROGRESS_INTERVAL_MS",
+            inference_defaults.progress_interval_ms,
+            MIN_PROGRESS_INTERVAL_MS,
+        );
+        let inf_idle = p.int("INFERENCE_IDLE_UNLOAD_SECS", inference_defaults.idle_unload_secs, 0);
+        let inf_load = p.int(
+            "INFERENCE_MODEL_LOAD_TIMEOUT_MS",
+            inference_defaults.model_load_timeout_ms,
+            MIN_MODEL_LOAD_TIMEOUT_MS,
+        );
+        let inf_concurrent = p.int_in("INFERENCE_MAX_CONCURRENT", inference_defaults.max_concurrent, 1, 64);
+        let inf_max_tokens = p.int_in("INFERENCE_MAX_TOKENS", inference_defaults.max_tokens, 1, 1 << 20);
+        let inf_context = p.int_in(
+            "INFERENCE_DEFAULT_CONTEXT",
+            inference_defaults.default_context,
+            MIN_CONTEXT,
+            1 << 22,
+        );
+        let inf_threads = p.int_in("INFERENCE_THREADS", inference_defaults.threads, 0, 1_024);
+        let inf_reserve = p.int("INFERENCE_DISK_RESERVE_MB", inference_defaults.disk_reserve_mb, 0);
+        let inf_echo = p.bool("INFERENCE_ECHO_MODEL", inference_defaults.echo_model_enabled);
+
+        // ---- the test model (the catalog's one entry) ----
+        let test_id = p.string("TEST_MODEL_ID", DEFAULT_TEST_MODEL_ID);
+        if !valid_model_id(&test_id) {
+            p.errors.push(format!(
+                "TEST_MODEL_ID must be lowercase letters, digits, '.', '_' and '-', at most {} characters, got {test_id:?}",
+                protocol::models::MODEL_ID_MAX_LEN
+            ));
+        }
+        let test_name = p.string("TEST_MODEL_NAME", DEFAULT_TEST_MODEL_NAME);
+        if test_name.chars().count() > 200 {
+            p.errors.push("TEST_MODEL_NAME must be at most 200 characters".into());
+        }
+        let test_url = p.string("TEST_MODEL_URL", DEFAULT_TEST_MODEL_URL);
+        if !test_url.starts_with("https://")
+            || test_url.len() <= "https://".len()
+            || test_url.contains(char::is_whitespace)
+        {
+            p.errors
+                .push(format!("TEST_MODEL_URL must be an https:// URL, got {test_url:?}"));
+        }
+        let test_sha = p
+            .string("TEST_MODEL_SHA256", DEFAULT_TEST_MODEL_SHA256)
+            .to_ascii_lowercase();
+        if test_sha.len() != 64 || !test_sha.bytes().all(|b| b.is_ascii_hexdigit()) {
+            p.errors
+                .push(format!("TEST_MODEL_SHA256 must be 64 hex digits, got {test_sha:?}"));
+        }
+        let test_size = p.int("TEST_MODEL_SIZE_BYTES", DEFAULT_TEST_MODEL_SIZE_BYTES, 1);
+        let test_context = p.int_in("TEST_MODEL_CONTEXT", 4_096, MIN_CONTEXT, 1 << 22);
+
         // ---- http: origins, cookies, client IPs ----
         let public_origin = p.origin("PUBLIC_ORIGIN", "https://llm.smith-c.com");
         let extra_origins = p.origin_list("EXTRA_ALLOWED_ORIGINS");
@@ -337,6 +395,17 @@ impl Settings {
                  or every sample would be dropped"
             ));
         }
+        for (key, context) in [
+            ("INFERENCE_DEFAULT_CONTEXT", inf_context),
+            ("TEST_MODEL_CONTEXT", test_context),
+        ] {
+            if inf_max_tokens >= context {
+                p.errors.push(format!(
+                    "INFERENCE_MAX_TOKENS ({inf_max_tokens}) must be less than {key} ({context}), \
+                     or no prompt would fit next to the reply"
+                ));
+            }
+        }
         if password_max < password_min {
             p.errors.push(format!(
                 "AUTH_PASSWORD_MAX_LEN ({password_max}) must be at least AUTH_PASSWORD_MIN_LEN ({password_min})"
@@ -382,6 +451,29 @@ impl Settings {
                 server_silence_timeout_ms: silence,
                 reconnect_backoff_initial_ms: backoff_initial,
                 reconnect_backoff_max_ms: backoff_max,
+                inference: InferenceSettings {
+                    progress_interval_ms: inf_progress,
+                    idle_unload_secs: inf_idle,
+                    model_load_timeout_ms: inf_load,
+                    max_concurrent: inf_concurrent,
+                    max_tokens: inf_max_tokens,
+                    default_context: inf_context,
+                    threads: inf_threads,
+                    disk_reserve_mb: inf_reserve,
+                    echo_model_enabled: inf_echo,
+                },
+            },
+            test_model: ModelSpec {
+                id: test_id,
+                display_name: test_name,
+                backend: Backend::LlamaCpp,
+                source: ModelSource {
+                    url: test_url,
+                    sha256: test_sha,
+                    size_bytes: test_size,
+                },
+                context_length: Some(test_context),
+                meta: ModelMeta::default(),
             },
             liveness_timeout: Duration::from_millis(liveness),
             ws_ping_interval: Duration::from_millis(ping),
@@ -502,6 +594,30 @@ impl Settings {
                 self.chat.max_active_replies_per_user
             ),
             format!(
+                "inference (pushed to clients): {} at once, max {} tokens, default context {}, threads {}, \
+                 unload after {} s idle, load timeout {} ms, progress every {} ms, disk reserve {} MiB, echo model {}",
+                c.inference.max_concurrent,
+                c.inference.max_tokens,
+                c.inference.default_context,
+                match c.inference.threads {
+                    0 => "auto".to_string(),
+                    n => n.to_string(),
+                },
+                c.inference.idle_unload_secs,
+                c.inference.model_load_timeout_ms,
+                c.inference.progress_interval_ms,
+                c.inference.disk_reserve_mb,
+                if c.inference.echo_model_enabled { "on" } else { "off" }
+            ),
+            format!(
+                "catalog: {} ({}, {} bytes, context {}) from {}",
+                self.test_model.id,
+                self.test_model.display_name,
+                self.test_model.source.size_bytes,
+                self.test_model.context_length.unwrap_or(0),
+                self.test_model.source.url
+            ),
+            format!(
                 "http: public origin {}, extra origins [{}], secure cookie {}, trust CF-Connecting-IP {}",
                 self.http.public_origin,
                 self.http.extra_allowed_origins.join(", "),
@@ -566,6 +682,16 @@ impl Settings {
     }
 }
 
+/// The test model's defaults: Qwen2.5 0.5B Instruct, Q4_K_M, from Qwen's own
+/// Hugging Face repository. The size and SHA-256 (the file's LFS object id)
+/// were checked against Hugging Face.
+pub const DEFAULT_TEST_MODEL_ID: &str = "qwen2.5-0.5b-instruct-q4_k_m";
+pub const DEFAULT_TEST_MODEL_NAME: &str = "Qwen2.5 0.5B Instruct (Q4_K_M)";
+pub const DEFAULT_TEST_MODEL_URL: &str =
+    "https://huggingface.co/Qwen/Qwen2.5-0.5B-Instruct-GGUF/resolve/main/qwen2.5-0.5b-instruct-q4_k_m.gguf";
+pub const DEFAULT_TEST_MODEL_SHA256: &str = "74a4da8c9fdbcd15bd1f6d01d621410d31c6fc00986f5eb687824e7b93d7a9db";
+pub const DEFAULT_TEST_MODEL_SIZE_BYTES: u64 = 491_400_032;
+
 fn hours(n: u64) -> Duration {
     Duration::from_secs(n.saturating_mul(3600))
 }
@@ -627,6 +753,16 @@ impl Parser<'_> {
                 default
             }
         }
+    }
+
+    /// A whole number from `min` to `max`, for the u32 settings.
+    fn int_in(&mut self, key: &str, default: u32, min: u32, max: u32) -> u32 {
+        let n = self.int(key, u64::from(default), u64::from(min));
+        if n > u64::from(max) {
+            self.errors.push(format!("{key} must be at most {max}, got {n}"));
+            return default;
+        }
+        n as u32
     }
 
     fn bool(&mut self, key: &str, default: bool) -> bool {
@@ -726,6 +862,11 @@ mod tests {
         assert_eq!(s.port, 7070);
         assert!(!s.debug_logging);
         assert_eq!(s.client, ClientSettings::default());
+        assert_eq!(s.client.inference, InferenceSettings::default());
+        assert_eq!(s.test_model.id, "qwen2.5-0.5b-instruct-q4_k_m");
+        assert_eq!(s.test_model.source.size_bytes, 491_400_032);
+        assert_eq!(s.test_model.context_length, Some(4_096));
+        assert!(s.test_model.source.url.starts_with("https://huggingface.co/Qwen/"));
         assert_eq!(s.liveness_timeout, Duration::from_millis(4_000));
         assert_eq!(s.ws_ping_interval, Duration::from_millis(2_000));
         assert_eq!(s.last_seen_flush_interval, Duration::from_millis(30_000));
@@ -939,6 +1080,51 @@ mod tests {
         // Allowed but warned about.
         let s = parse(&[("PUBLIC_ORIGIN", "http://192.168.1.5:7070")]).unwrap();
         assert_eq!(s.warnings().len(), 1);
+    }
+
+    #[test]
+    fn the_example_config_parses_to_the_compiled_defaults() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../config.env.example");
+        let file = parse_dotenv(&std::fs::read_to_string(path).unwrap());
+        let s = Settings::parse(|key| file.get(key).cloned()).expect("config.env.example is valid");
+        let defaults = parse(&[]).unwrap();
+        assert_eq!(s.client, defaults.client, "the pushed values, inference included");
+        assert_eq!(s.test_model, defaults.test_model);
+        assert_eq!(s.chat, defaults.chat);
+    }
+
+    #[test]
+    fn inference_and_test_model_settings_are_validated() {
+        let s = parse(&[
+            ("INFERENCE_MAX_CONCURRENT", "2"),
+            ("INFERENCE_THREADS", "8"),
+            ("INFERENCE_IDLE_UNLOAD_SECS", "0"),
+            ("INFERENCE_ECHO_MODEL", "false"),
+            ("TEST_MODEL_SHA256", &"AB".repeat(32)),
+        ])
+        .unwrap();
+        assert_eq!(s.client.inference.max_concurrent, 2);
+        assert_eq!(s.client.inference.threads, 8);
+        assert_eq!(s.client.inference.idle_unload_secs, 0);
+        assert!(!s.client.inference.echo_model_enabled);
+        assert_eq!(s.test_model.source.sha256, "ab".repeat(32), "normalised to lowercase");
+
+        rejects(&[("INFERENCE_MAX_CONCURRENT", "0")], "INFERENCE_MAX_CONCURRENT");
+        rejects(&[("INFERENCE_MAX_CONCURRENT", "65")], "INFERENCE_MAX_CONCURRENT");
+        rejects(&[("INFERENCE_DEFAULT_CONTEXT", "100")], "INFERENCE_DEFAULT_CONTEXT");
+        rejects(
+            &[("INFERENCE_PROGRESS_INTERVAL_MS", "10")],
+            "INFERENCE_PROGRESS_INTERVAL_MS",
+        );
+        rejects(&[("INFERENCE_ECHO_MODEL", "maybe")], "INFERENCE_ECHO_MODEL");
+        rejects(&[("TEST_MODEL_ID", "../escape")], "TEST_MODEL_ID");
+        rejects(&[("TEST_MODEL_ID", "Qwen")], "TEST_MODEL_ID");
+        rejects(&[("TEST_MODEL_URL", "http://example.com/m.gguf")], "TEST_MODEL_URL");
+        rejects(&[("TEST_MODEL_SHA256", "abc")], "TEST_MODEL_SHA256");
+        rejects(&[("TEST_MODEL_SIZE_BYTES", "0")], "TEST_MODEL_SIZE_BYTES");
+        // The reply has to leave room for a prompt.
+        rejects(&[("TEST_MODEL_CONTEXT", "2048")], "INFERENCE_MAX_TOKENS");
+        assert_eq!(parse(&[("INFERENCE_MAX_TOKENS", "4096")]).unwrap_err().len(), 2);
     }
 
     #[test]

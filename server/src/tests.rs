@@ -5,6 +5,8 @@ use crate::auth::Auth;
 use crate::config::Settings;
 use crate::conversations::MessageStatus;
 use crate::live::{ConnHandle, Live};
+use crate::models::catalog::Catalog;
+use crate::models::commands::ModelCommands;
 use crate::replies::{ChatEvent, ReplyRunner};
 use crate::{db, routes, AppState};
 use axum::{
@@ -13,7 +15,10 @@ use axum::{
     response::Response,
     Router,
 };
-use protocol::{ChatRole, ChatTurn, ModelInfo, ServerMessage};
+use protocol::{
+    Backend, ChatRole, ChatTurn, CommandState, Inventory, LocalModel, ModelCommandKind, ModelState, Progress,
+    ProgressPhase, ServerMessage, Stage, Storage,
+};
 use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -66,13 +71,15 @@ async fn test_app(extra: &[(&str, &str)]) -> TestApp {
     let live = Arc::new(Live::new(settings.metrics));
     let auth = Arc::new(Auth::new(&settings).unwrap());
     let settings = Arc::new(settings);
-    let replies = ReplyRunner::new(db.clone(), live.clone(), settings.chat);
+    let replies = ReplyRunner::new(db.clone(), live.clone(), settings.chat, settings.client.inference);
     let state = AppState {
         db,
         live,
+        catalog: Arc::new(Catalog::from_settings(&settings)),
         settings,
         auth,
         replies,
+        model_commands: Arc::new(ModelCommands::default()),
     };
     let setup_token = state.auth.issue_setup_token();
     TestApp {
@@ -247,11 +254,38 @@ impl TestApp {
 
     /// Connects a fake client offering `echo`.
     fn connect(&self, client_id: &str) -> ConnHandle {
+        self.connect_with(client_id, vec![model("echo", Backend::Echo, ModelState::Loaded)])
+    }
+
+    /// Connects a fake client reporting these models.
+    fn connect_with(&self, client_id: &str, models: Vec<LocalModel>) -> ConnHandle {
         let conn = self.state.live.register(client_id);
-        self.state
-            .live
-            .set_models(client_id, conn.id, vec![ModelInfo { id: "echo".into() }]);
+        self.state.live.set_inventory(
+            client_id,
+            conn.id,
+            Inventory {
+                models,
+                storage: Storage {
+                    models_bytes: 1_000,
+                    free_bytes: 50_000,
+                },
+                runtimes: vec![],
+            },
+        );
         conn
+    }
+}
+
+fn model(id: &str, backend: Backend, state: ModelState) -> LocalModel {
+    LocalModel {
+        id: id.into(),
+        display_name: format!("{id} model"),
+        backend,
+        state,
+        size_bytes: 10,
+        context_length: None,
+        meta: Default::default(),
+        error: None,
     }
 }
 
@@ -1675,4 +1709,334 @@ async fn deleting_a_client_keeps_its_replies_readable() {
         .blocking(move |c| Ok(crate::conversations::message_state(c, &reply)?.unwrap().0))
         .unwrap();
     assert_eq!(status, MessageStatus::Completed);
+}
+
+// ---------------- models on clients ----------------
+
+/// The next model command a fake client was sent.
+async fn next_command(conn: &mut ConnHandle) -> (String, ModelCommandKind) {
+    match tokio::time::timeout(Duration::from_secs(2), conn.outbound.recv()).await {
+        Ok(Some(ServerMessage::ModelCommand { command_id, command })) => (command_id, command),
+        other => panic!("expected a model_command, got {other:?}"),
+    }
+}
+
+const TEST_MODEL: &str = crate::config::DEFAULT_TEST_MODEL_ID;
+
+#[tokio::test]
+async fn installing_needs_manage_and_takes_catalog_ids_only() {
+    let app = test_app(&[]).await;
+    let admin = app.setup_admin().await;
+    let alice = app.signup("alice").await;
+    let bob = app.signup("bob").await;
+    let a1 = app.enroll(&alice, "alice-pc").await;
+    let b1 = app.enroll(&bob, "bob-pc").await;
+    let mut a_conn = app.connect(&a1);
+    let mut b_conn = app.connect(&b1);
+
+    // Bob's client is invisible to Alice: 404 for every models endpoint.
+    let install = json!({ "catalog_id": TEST_MODEL });
+    assert_eq!(
+        app.get(&format!("/api/clients/{b1}/models"), &alice).await.status,
+        StatusCode::NOT_FOUND
+    );
+    let r = app
+        .post(&format!("/api/clients/{b1}/models"), Some(&alice), install.clone())
+        .await;
+    assert_eq!(r.status, StatusCode::NOT_FOUND);
+    let r = app
+        .delete(&format!("/api/clients/{b1}/models/{TEST_MODEL}"), &alice)
+        .await;
+    assert_eq!(r.status, StatusCode::NOT_FOUND);
+    let r = app
+        .post(
+            &format!("/api/clients/{b1}/model-commands/x/cancel"),
+            Some(&alice),
+            json!({}),
+        )
+        .await;
+    assert_eq!(r.status, StatusCode::NOT_FOUND);
+    assert!(b_conn.outbound.try_recv().is_err(), "nothing reached Bob's client");
+
+    // The browser can't name a URL or hash, only a catalog id.
+    let r = app
+        .post(
+            &format!("/api/clients/{a1}/models"),
+            Some(&alice),
+            json!({ "catalog_id": TEST_MODEL, "url": "https://evil.example/x.gguf" }),
+        )
+        .await;
+    assert_eq!(r.status, StatusCode::BAD_REQUEST, "{:?}", r.json);
+    let r = app
+        .post(
+            &format!("/api/clients/{a1}/models"),
+            Some(&alice),
+            json!({ "catalog_id": "nope" }),
+        )
+        .await;
+    assert_eq!(r.status, StatusCode::BAD_REQUEST);
+    assert!(a_conn.outbound.try_recv().is_err());
+
+    let catalog = app.get("/api/models/catalog", &alice).await.json;
+    assert_eq!(catalog[0]["id"], TEST_MODEL);
+    assert!(catalog[0].get("url").is_none() && catalog[0].get("source").is_none());
+
+    // Alice installs on her own client: the pull carries the catalog's source.
+    let r = app
+        .post(&format!("/api/clients/{a1}/models"), Some(&alice), install.clone())
+        .await;
+    assert_eq!(r.status, StatusCode::ACCEPTED, "{:?}", r.json);
+    assert_eq!(
+        (&r.json["state"], &r.json["requested_by"]),
+        (&json!("sent"), &json!("alice"))
+    );
+    let (command_id, command) = next_command(&mut a_conn).await;
+    assert_eq!(r.json["command_id"], command_id);
+    let ModelCommandKind::Pull { model: spec } = command else {
+        panic!("expected a pull")
+    };
+    assert_eq!(spec, app.state.settings.test_model);
+    // Asking again while it runs is the same command.
+    let again = app
+        .post(&format!("/api/clients/{a1}/models"), Some(&alice), install.clone())
+        .await;
+    assert_eq!(again.json["command_id"], command_id);
+    assert!(a_conn.outbound.try_recv().is_err());
+
+    // Progress shows in the detail and in the poll's summary.
+    let progress = Progress {
+        done_bytes: 25,
+        total_bytes: 100,
+        phase: ProgressPhase::Model,
+    };
+    app.state
+        .model_commands
+        .on_status(a_conn.id, &command_id, CommandState::InProgress, Some(progress), None);
+    let detail = app.get(&format!("/api/clients/{a1}/models"), &alice).await.json;
+    assert_eq!(detail["can_manage"], true);
+    assert_eq!(detail["storage"]["free_bytes"], 50_000);
+    assert_eq!(detail["commands"][0]["state"], "in_progress");
+    assert_eq!(detail["commands"][0]["progress"]["done_bytes"], 25);
+    let clients = app.get("/api/clients", &alice).await.json;
+    let pulls = &clients["clients"][0]["models"]["active_pulls"];
+    assert_eq!(pulls[0]["command_id"], command_id);
+    assert_eq!(pulls[0]["progress"]["total_bytes"], 100);
+
+    // Cancel sends a cancel naming the pull.
+    let r = app
+        .post(
+            &format!("/api/clients/{a1}/model-commands/{command_id}/cancel"),
+            Some(&alice),
+            json!({}),
+        )
+        .await;
+    assert_eq!(r.status, StatusCode::ACCEPTED);
+    let (_, cancel) = next_command(&mut a_conn).await;
+    assert_eq!(
+        cancel,
+        ModelCommandKind::Cancel {
+            target_command_id: command_id.clone()
+        }
+    );
+    app.state
+        .model_commands
+        .on_status(a_conn.id, &command_id, CommandState::Cancelled, None, None);
+    let r = app
+        .post(
+            &format!("/api/clients/{a1}/model-commands/{command_id}/cancel"),
+            Some(&alice),
+            json!({}),
+        )
+        .await;
+    assert_eq!(r.status, StatusCode::CONFLICT, "a finished pull can't be cancelled");
+
+    // Delete goes out as a delete; echo is built in.
+    let r = app
+        .delete(&format!("/api/clients/{a1}/models/{TEST_MODEL}"), &alice)
+        .await;
+    assert_eq!(r.status, StatusCode::ACCEPTED);
+    assert!(
+        matches!(next_command(&mut a_conn).await.1, ModelCommandKind::Delete { model_id } if model_id == TEST_MODEL)
+    );
+    assert_eq!(
+        app.delete(&format!("/api/clients/{a1}/models/echo"), &alice)
+            .await
+            .status,
+        StatusCode::BAD_REQUEST
+    );
+    assert_eq!(
+        app.delete(&format!("/api/clients/{a1}/models/..%2Fx"), &alice)
+            .await
+            .status,
+        StatusCode::BAD_REQUEST
+    );
+
+    // The admin manages everyone's clients.
+    let r = app
+        .post(&format!("/api/clients/{b1}/models"), Some(&admin), install)
+        .await;
+    assert_eq!(r.status, StatusCode::ACCEPTED);
+    assert!(matches!(
+        next_command(&mut b_conn).await.1,
+        ModelCommandKind::Pull { .. }
+    ));
+}
+
+#[tokio::test]
+async fn offline_clients_fail_commands_immediately() {
+    let app = test_app(&[]).await;
+    app.setup_admin().await;
+    let alice = app.signup("alice").await;
+    let a1 = app.enroll(&alice, "alice-pc").await;
+    let r = app
+        .post(
+            &format!("/api/clients/{a1}/models"),
+            Some(&alice),
+            json!({ "catalog_id": TEST_MODEL }),
+        )
+        .await;
+    assert_eq!(r.status, StatusCode::CONFLICT);
+    assert!(r.error().contains("offline"), "{}", r.error());
+    assert_eq!(r.json["command"]["state"], "failed");
+    let detail = app.get(&format!("/api/clients/{a1}/models"), &alice).await.json;
+    assert_eq!(detail["connected"], false);
+    assert_eq!(detail["models"], json!([]));
+    assert_eq!(detail["commands"][0]["state"], "failed");
+
+    // A client that drops mid-pull fails its commands too.
+    let conn = app.connect(&a1);
+    let r = app
+        .post(
+            &format!("/api/clients/{a1}/models"),
+            Some(&alice),
+            json!({ "catalog_id": TEST_MODEL }),
+        )
+        .await;
+    assert_eq!(r.status, StatusCode::ACCEPTED);
+    app.state.live.unregister(&a1, conn.id);
+    app.state.model_commands.on_connection_closed(conn.id);
+    let detail = app.get(&format!("/api/clients/{a1}/models"), &alice).await.json;
+    assert_eq!(detail["commands"][0]["state"], "failed");
+    assert!(detail["commands"][0]["error"].as_str().unwrap().contains("resume"));
+}
+
+#[tokio::test]
+async fn the_picker_lists_usable_models_on_clients_the_user_can_use() {
+    let app = test_app(&[]).await;
+    let admin = app.setup_admin().await;
+    let alice = app.signup("alice").await;
+    let bob = app.signup("bob").await;
+    let a1 = app.enroll(&alice, "alice-pc").await;
+    let b1 = app.enroll(&bob, "bob-pc").await;
+    let _a = app.connect_with(
+        &a1,
+        vec![
+            model("echo", Backend::Echo, ModelState::Loaded),
+            model("ready", Backend::LlamaCpp, ModelState::Available),
+            model("warm", Backend::LlamaCpp, ModelState::Loaded),
+            model("pulling", Backend::LlamaCpp, ModelState::Downloading),
+            model("broken", Backend::LlamaCpp, ModelState::Failed),
+        ],
+    );
+    let _b = app.connect_with(&b1, vec![model("bobs", Backend::LlamaCpp, ModelState::Available)]);
+
+    let list = app.get("/api/chat/models", &alice).await.json;
+    let ids: Vec<&str> = list
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|m| m["model"].as_str().unwrap())
+        .collect();
+    assert_eq!(ids, vec!["echo", "ready", "warm"], "{list}");
+    assert_eq!(list[1]["model_name"], "ready model");
+    assert_eq!(list[1]["client_name"], "alice-pc");
+    assert_eq!(list[1]["backend"], "llama_cpp");
+    let all = app.get("/api/chat/models", &admin).await.json;
+    assert_eq!(all.as_array().unwrap().len(), 4, "the admin can use Bob's too");
+
+    // Sending to a model that's still downloading is refused.
+    let r = app
+        .post(
+            &format!("/api/conversations/{}/messages", new_id()),
+            Some(&alice),
+            json!({ "content": "hi", "parent_id": null, "target": { "kind": "client", "client_id": a1, "model": "pulling" } }),
+        )
+        .await;
+    assert_eq!(r.status, StatusCode::CONFLICT);
+    assert!(r.error().contains("still downloading"), "{}", r.error());
+
+    // With INFERENCE_ECHO_MODEL off, echo isn't offered even if a client lists it.
+    let app = test_app(&[("INFERENCE_ECHO_MODEL", "false")]).await;
+    app.setup_admin().await;
+    let alice = app.signup("alice").await;
+    let a1 = app.enroll(&alice, "alice-pc").await;
+    let _a = app.connect(&a1);
+    assert_eq!(app.get("/api/chat/models", &alice).await.json, json!([]));
+}
+
+#[tokio::test]
+async fn inference_echo_model_controls_echo_on_cards_and_in_chat() {
+    for (on, ids) in [("true", vec!["echo", "ready"]), ("false", vec!["ready"])] {
+        let app = test_app(&[("INFERENCE_ECHO_MODEL", on)]).await;
+        app.setup_admin().await;
+        let alice = app.signup("alice").await;
+        let a1 = app.enroll(&alice, "alice-pc").await;
+        let _a = app.connect_with(
+            &a1,
+            vec![
+                model("echo", Backend::Echo, ModelState::Loaded),
+                model("ready", Backend::LlamaCpp, ModelState::Available),
+            ],
+        );
+        let ids_of = |list: &Value, key: &str| -> Vec<String> {
+            list.as_array()
+                .unwrap()
+                .iter()
+                .map(|m| m[key].as_str().unwrap().to_string())
+                .collect()
+        };
+        let detail = app.get(&format!("/api/clients/{a1}/models"), &alice).await.json;
+        assert_eq!(
+            ids_of(&detail["models"], "id"),
+            ids,
+            "card, INFERENCE_ECHO_MODEL={on}: {detail}"
+        );
+        let list = app.get("/api/chat/models", &alice).await.json;
+        assert_eq!(ids_of(&list, "model"), ids, "chat, INFERENCE_ECHO_MODEL={on}: {list}");
+    }
+}
+
+#[tokio::test]
+async fn loading_progress_reaches_the_reply_stream() {
+    let app = test_app(&[]).await;
+    app.setup_admin().await;
+    let alice = app.signup("alice").await;
+    let client = app.enroll(&alice, "alice-pc").await;
+    let mut conn = app.connect(&client);
+    let response = app
+        .raw(Call {
+            cookie: Some(&alice),
+            body: Some(json!({ "content": "hello", "parent_id": null, "target": target(&client) })),
+            ..app.call(Method::POST, &format!("/api/conversations/{}/messages", new_id()))
+        })
+        .await;
+    let reader = tokio::spawn(sse_events(response));
+    let (attempt, messages) = next_request(&mut conn).await;
+    // Give the stream a moment to attach, so the progress is live, not in a snapshot.
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    app.state
+        .replies
+        .on_client_event(conn.id, &attempt, ChatEvent::Progress(Stage::LoadingModel));
+    app.state
+        .replies
+        .on_client_event(conn.id, &attempt, ChatEvent::Progress(Stage::Generating));
+    echo(&app, &conn, &attempt, &messages);
+    let events = reader.await.unwrap();
+    let stages: Vec<&Value> = events
+        .iter()
+        .filter(|(name, _)| name == "progress")
+        .map(|(_, data)| &data["stage"])
+        .collect();
+    assert_eq!(stages, vec![&json!("loading_model"), &json!("generating")]);
+    assert_eq!(streamed_text(&events), "hello");
 }

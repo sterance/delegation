@@ -1,5 +1,6 @@
 //! Live, in-memory state: which clients are connected, each one's recent
-//! metric samples, and `last_seen_at` values not yet flushed to SQLite.
+//! metric samples and latest model inventory, and `last_seen_at` values not
+//! yet flushed to SQLite.
 //!
 //! None of the samples are ever persisted. Restarting the server starts
 //! with no connections and no history, and a new `epoch` tells the
@@ -7,7 +8,7 @@
 
 use crate::config::MetricsLimits;
 use crate::metrics;
-use protocol::{GpuMetrics, Metrics, ModelInfo, ServerMessage};
+use protocol::{GpuMetrics, Inventory, LocalModel, Metrics, ModelState, ServerMessage};
 use rand::Rng;
 use serde::Serialize;
 use std::collections::{HashMap, VecDeque};
@@ -45,11 +46,25 @@ pub struct ConnHandle {
 }
 
 /// Where to send a message for a connected client: its connection id (to
-/// match replies against) and its outbound queue.
+/// match replies against), its outbound queue, and what models it has.
 pub struct ConnSender {
     pub conn_id: u64,
-    pub models: Vec<ModelInfo>,
+    /// None until the client's first `model_inventory`.
+    pub inventory: Option<Arc<Inventory>>,
     pub tx: mpsc::Sender<ServerMessage>,
+}
+
+impl ConnSender {
+    /// The model, if the client has it.
+    pub fn model(&self, id: &str) -> Option<&LocalModel> {
+        self.inventory.as_ref()?.models.iter().find(|m| m.id == id)
+    }
+}
+
+/// A model can answer chat in these states (a `loading` one will once it's
+/// loaded, so a request for it waits rather than failing).
+pub fn usable(state: ModelState) -> bool {
+    matches!(state, ModelState::Available | ModelState::Loading | ModelState::Loaded)
 }
 
 #[derive(Debug, PartialEq)]
@@ -90,8 +105,8 @@ struct Conn {
     id: u64,
     kick: Arc<Notify>,
     outbound: mpsc::Sender<ServerMessage>,
-    /// From the client's latest `models` message; empty until it sends one.
-    models: Vec<ModelInfo>,
+    /// From the client's latest `model_inventory`; None until it sends one.
+    inventory: Option<Arc<Inventory>>,
     samples: VecDeque<Sample>,
     last_accepted: Option<Instant>,
 }
@@ -133,7 +148,7 @@ impl Live {
                 id,
                 kick: kick.clone(),
                 outbound: outbound_tx,
-                models: Vec::new(),
+                inventory: None,
                 samples: VecDeque::with_capacity(self.limits.history_samples),
                 last_accepted: None,
             },
@@ -160,17 +175,22 @@ impl Live {
         }
     }
 
-    /// Replaces the models `conn_id` advertises. Returns false if that
-    /// connection is no longer the client's current one.
-    pub fn set_models(&self, client_id: &str, conn_id: u64, models: Vec<ModelInfo>) -> bool {
+    /// Replaces `conn_id`'s inventory. Returns false if that connection is
+    /// no longer the client's current one.
+    pub fn set_inventory(&self, client_id: &str, conn_id: u64, inventory: Inventory) -> bool {
         let mut inner = self.lock();
         match inner.conns.get_mut(client_id).filter(|c| c.id == conn_id) {
             Some(conn) => {
-                conn.models = models;
+                conn.inventory = Some(Arc::new(inventory));
                 true
             }
             None => false,
         }
+    }
+
+    /// A connected client's latest inventory.
+    pub fn inventory(&self, client_id: &str) -> Option<Arc<Inventory>> {
+        self.lock().conns.get(client_id)?.inventory.clone()
     }
 
     /// The client's current connection, if it's connected.
@@ -178,18 +198,26 @@ impl Live {
         let inner = self.lock();
         inner.conns.get(client_id).map(|c| ConnSender {
             conn_id: c.id,
-            models: c.models.clone(),
+            inventory: c.inventory.clone(),
             tx: c.outbound.clone(),
         })
     }
 
-    /// Every model a connected client advertises, as (client_id, model).
-    pub fn models(&self) -> Vec<(String, ModelInfo)> {
+    /// Every model a connected client could chat with right now, as
+    /// (client_id, model).
+    pub fn models(&self) -> Vec<(String, LocalModel)> {
         let inner = self.lock();
         inner
             .conns
             .iter()
-            .flat_map(|(id, c)| c.models.iter().map(move |m| (id.clone(), m.clone())))
+            .filter_map(|(id, c)| Some((id, c.inventory.clone()?)))
+            .flat_map(|(id, inv)| {
+                inv.models
+                    .iter()
+                    .filter(|m| usable(m.state))
+                    .map(|m| (id.clone(), m.clone()))
+                    .collect::<Vec<_>>()
+            })
             .collect()
     }
 
@@ -436,22 +464,45 @@ mod tests {
         assert!(!live.snapshot(0).last_seen.contains_key("c"));
     }
 
+    fn model(id: &str, state: ModelState) -> LocalModel {
+        LocalModel {
+            id: id.into(),
+            display_name: id.to_uppercase(),
+            backend: protocol::Backend::LlamaCpp,
+            state,
+            size_bytes: 1,
+            context_length: None,
+            meta: Default::default(),
+            error: None,
+        }
+    }
+
     #[test]
-    fn models_follow_the_current_connection() {
+    fn inventories_follow_the_current_connection() {
         let live = live(60);
         let first = live.register("c");
-        let echo = vec![ModelInfo { id: "echo".into() }];
-        assert!(live.set_models("c", first.id, echo.clone()));
-        assert_eq!(live.models(), vec![("c".to_string(), echo[0].clone())]);
-        assert_eq!(
-            live.sender("c").map(|s| (s.conn_id, s.models)),
-            Some((first.id, echo.clone()))
-        );
+        let inventory = Inventory {
+            models: vec![
+                model("ready", ModelState::Available),
+                model("pulling", ModelState::Downloading),
+                model("broken", ModelState::Failed),
+            ],
+            ..Inventory::default()
+        };
+        assert!(live.set_inventory("c", first.id, inventory.clone()));
+        let usable: Vec<String> = live.models().into_iter().map(|(_, m)| m.id).collect();
+        assert_eq!(usable, vec!["ready"], "only models that can answer");
+        let sender = live.sender("c").unwrap();
+        assert_eq!(sender.conn_id, first.id);
+        assert_eq!(sender.model("pulling").map(|m| m.state), Some(ModelState::Downloading));
+        assert!(sender.model("nope").is_none());
+        assert_eq!(live.inventory("c").unwrap().models.len(), 3);
 
-        // A reconnect starts with no models, and the old connection can't set them.
+        // A reconnect starts with no inventory, and the old connection can't set it.
         let second = live.register("c");
         assert!(live.models().is_empty());
-        assert!(!live.set_models("c", first.id, echo.clone()));
+        assert!(live.inventory("c").is_none());
+        assert!(!live.set_inventory("c", first.id, inventory));
         assert_eq!(live.sender("c").map(|s| s.conn_id), Some(second.id));
 
         live.unregister("c", second.id);

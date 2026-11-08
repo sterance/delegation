@@ -1,11 +1,13 @@
 //! The delegation client as a library: enrollment, the session controller,
-//! the metrics sampler and hardware collection. Two front ends use it: the
+//! the metrics sampler, hardware collection, and inference (models and
+//! llama.cpp). Two front ends use it: the
 //! headless CLI (`bin/delegation-client.rs`, used natively on Linux and in
 //! Docker) and the Windows tray app (`bin/delegation-tray/`).
 
 pub mod chat;
 pub mod hardware;
 pub mod identity;
+pub mod inference;
 pub mod log;
 pub mod paths;
 pub mod sampler;

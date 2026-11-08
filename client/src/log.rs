@@ -4,6 +4,9 @@
 //!
 //! The CLI logs to stdout (warnings and errors to stderr, as before); the
 //! tray app has no console, so it logs to a file instead.
+//!
+//! `DELEGATION_LOG=debug` adds the debug lines, among them everything
+//! `llama-server` prints.
 
 use log::{Level, LevelFilter, Log, Metadata, Record};
 use std::fs::{File, OpenOptions};
@@ -16,11 +19,11 @@ enum Sink {
     File(Mutex<File>),
 }
 
-struct Logger(Sink);
+struct Logger(Sink, Level);
 
 impl Log for Logger {
     fn enabled(&self, metadata: &Metadata) -> bool {
-        metadata.level() <= Level::Info
+        metadata.level() <= self.1
     }
 
     fn log(&self, record: &Record) {
@@ -67,7 +70,13 @@ pub fn init_file(path: &Path) -> std::io::Result<()> {
 }
 
 fn install(sink: Sink) {
-    if log::set_boxed_logger(Box::new(Logger(sink))).is_ok() {
-        log::set_max_level(LevelFilter::Info);
+    let debug = std::env::var("DELEGATION_LOG").is_ok_and(|v| v.eq_ignore_ascii_case("debug"));
+    let (level, filter) = if debug {
+        (Level::Debug, LevelFilter::Debug)
+    } else {
+        (Level::Info, LevelFilter::Info)
+    };
+    if log::set_boxed_logger(Box::new(Logger(sink, level))).is_ok() {
+        log::set_max_level(filter);
     }
 }

@@ -11,10 +11,15 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 pub mod chat;
 pub mod hardware;
+pub mod models;
 pub mod telemetry;
 
-pub use chat::{ChatRole, ChatTurn, ModelInfo};
+pub use chat::{ChatRole, ChatTurn};
 pub use hardware::HardwareSpecs;
+pub use models::{
+    valid_model_id, Backend, CommandState, InferenceSettings, Inventory, LocalModel, ModelCommandKind, ModelMeta,
+    ModelSource, ModelSpec, ModelState, Progress, ProgressPhase, RuntimeInfo, RuntimeState, Stage, Storage,
+};
 pub use telemetry::{ClientSettings, GpuMetrics, Metrics, Tick};
 
 // ---- enrollment (HTTP) ----
@@ -60,11 +65,25 @@ pub enum ClientMessage {
     /// resource metrics. Also the liveness signal; never acked.
     #[serde(rename = "tick")]
     Tick(Tick),
-    /// The models this client can chat with. Sent after `info` on every
-    /// connection, and again whenever the set changes (a model loaded or
-    /// unloaded). Replaces the previous list. Not acked.
-    #[serde(rename = "models")]
-    Models { models: Vec<ModelInfo> },
+    /// The models this client has, its storage and its runtimes. Sent after
+    /// `welcome` on every connection, and again whenever any of it changes
+    /// (debounced, about 500 ms). Replaces the previous one. Not acked.
+    #[serde(rename = "model_inventory")]
+    ModelInventory(Inventory),
+    /// Progress and outcome of `model_command` `command_id`. A command gets
+    /// `accepted`, any number of `in_progress`, then exactly one final state.
+    #[serde(rename = "model_command_status")]
+    ModelCommandStatus {
+        command_id: String,
+        state: CommandState,
+        progress: Option<Progress>,
+        error: Option<String>,
+    },
+    /// The reply to `request_id` hasn't produced text yet but is alive, e.g.
+    /// while its model loads. Counts as activity for the server's idle
+    /// timeout.
+    #[serde(rename = "chat_progress")]
+    ChatProgress { request_id: String, stage: Stage },
     /// The next piece of the reply to `chat_request` `request_id`.
     #[serde(rename = "chat_chunk")]
     ChatChunk { request_id: String, delta: String },
@@ -90,19 +109,31 @@ pub enum ServerMessage {
     #[serde(rename = "auth_failed")]
     AuthFailed { reason: AuthFailedReason },
     /// Reply to `messages` (oldest first, ending with the user's new
-    /// message) using `model`, one of the ids from the client's `models`.
-    /// Answered with `chat_chunk`s, then `chat_done` or `chat_error`.
+    /// message) using `model`, one of the ids in the client's inventory.
+    /// Answered with `chat_progress`es and `chat_chunk`s, then `chat_done`
+    /// or `chat_error`. The reply's length limit is `max_tokens` from
+    /// `welcome`.
     #[serde(rename = "chat_request")]
     ChatRequest {
         request_id: String,
         model: String,
         messages: Vec<ChatTurn>,
+        /// Sampling temperature; left out, the model's own default.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        temperature: Option<f32>,
     },
     /// Nobody is waiting for `request_id` any more (the dashboard went
     /// away, or the server timed it out): stop generating. Nothing needs
     /// to be sent back.
     #[serde(rename = "chat_cancel")]
     ChatCancel { request_id: String },
+    /// Change which models the client has. Answered with
+    /// `model_command_status`es.
+    #[serde(rename = "model_command")]
+    ModelCommand {
+        command_id: String,
+        command: ModelCommandKind,
+    },
 }
 
 /// Why the server rejected a handshake. Serialized as the same strings
@@ -239,12 +270,20 @@ mod tests {
         .unwrap();
         assert_eq!(
             json,
-            r#"{"type":"welcome","settings":{"tick_interval_ms":1000,"sampler_interval_ms":500,"sample_max_age_ms":3000,"server_silence_timeout_ms":6000,"reconnect_backoff_initial_ms":1000,"reconnect_backoff_max_ms":30000}}"#
+            r#"{"type":"welcome","settings":{"tick_interval_ms":1000,"sampler_interval_ms":500,"sample_max_age_ms":3000,"server_silence_timeout_ms":6000,"reconnect_backoff_initial_ms":1000,"reconnect_backoff_max_ms":30000,"inference":{"progress_interval_ms":1000,"idle_unload_secs":600,"model_load_timeout_ms":120000,"max_concurrent":1,"max_tokens":2048,"default_context":4096,"threads":0,"disk_reserve_mb":2048,"echo_model_enabled":true}}}"#
         );
         let ServerMessage::Welcome { settings } = serde_json::from_str(&json).unwrap() else {
             panic!("not welcome")
         };
         assert_eq!(settings, ClientSettings::default());
+
+        // A settings cache from before inference settings existed.
+        let old: ClientSettings = serde_json::from_str(
+            r#"{"tick_interval_ms":2000,"sampler_interval_ms":500,"sample_max_age_ms":3000,"server_silence_timeout_ms":6000,"reconnect_backoff_initial_ms":1000,"reconnect_backoff_max_ms":30000}"#,
+        )
+        .unwrap();
+        assert_eq!(old.tick_interval_ms, 2000);
+        assert_eq!(old.inference, InferenceSettings::default());
     }
 
     #[test]
@@ -256,8 +295,13 @@ mod tests {
             server_silence_timeout_ms: 0,
             reconnect_backoff_initial_ms: 5_000,
             reconnect_backoff_max_ms: 1_000,
+            inference: InferenceSettings {
+                max_concurrent: 0,
+                ..InferenceSettings::default()
+            },
         }
         .sanitized();
+        assert_eq!(s.inference.max_concurrent, 1);
         assert_eq!(s.tick_interval_ms, 1);
         assert_eq!(s.sampler_interval_ms, telemetry::MIN_SAMPLER_INTERVAL_MS);
         assert_eq!(s.reconnect_backoff_max_ms, 5_000);
@@ -304,23 +348,35 @@ mod tests {
                 role: ChatRole::User,
                 content: "hi".into(),
             }],
+            temperature: None,
         };
         let json = serde_json::to_string(&request).unwrap();
         assert_eq!(
             json,
             r#"{"type":"chat_request","request_id":"r1","model":"echo","messages":[{"role":"user","content":"hi"}]}"#
         );
-        let ServerMessage::ChatRequest { messages, .. } = serde_json::from_str(&json).unwrap() else {
+        let ServerMessage::ChatRequest {
+            messages, temperature, ..
+        } = serde_json::from_str(&json).unwrap()
+        else {
             panic!("not a chat_request")
         };
         assert_eq!(messages[0].role, ChatRole::User);
+        assert_eq!(temperature, None);
+        let with_temperature =
+            r#"{"type":"chat_request","request_id":"r1","model":"m","messages":[],"temperature":0.5}"#;
+        let ServerMessage::ChatRequest { temperature, .. } = serde_json::from_str(with_temperature).unwrap() else {
+            panic!("not a chat_request")
+        };
+        assert_eq!(temperature, Some(0.5));
 
         let cases = [
             (
-                ClientMessage::Models {
-                    models: vec![ModelInfo { id: "echo".into() }],
+                ClientMessage::ChatProgress {
+                    request_id: "r1".into(),
+                    stage: Stage::LoadingModel,
                 },
-                r#"{"type":"models","models":[{"id":"echo"}]}"#,
+                r#"{"type":"chat_progress","request_id":"r1","stage":"loading_model"}"#,
             ),
             (
                 ClientMessage::ChatChunk {
@@ -354,6 +410,145 @@ mod tests {
         })
         .unwrap();
         assert_eq!(cancel, r#"{"type":"chat_cancel","request_id":"r1"}"#);
+    }
+
+    fn sample_spec() -> ModelSpec {
+        ModelSpec {
+            id: "qwen".into(),
+            display_name: "Qwen".into(),
+            backend: Backend::LlamaCpp,
+            source: ModelSource {
+                url: "https://example.com/q.gguf".into(),
+                sha256: "ab".repeat(32),
+                size_bytes: 10,
+            },
+            context_length: Some(4096),
+            meta: ModelMeta {
+                family: Some("qwen2.5".into()),
+                parameters: None,
+                quantization: Some("Q4_K_M".into()),
+            },
+        }
+    }
+
+    #[test]
+    fn model_commands_have_their_wire_forms() {
+        let cases = [
+            (
+                ModelCommandKind::Pull { model: sample_spec() },
+                format!(
+                    r#"{{"type":"model_command","command_id":"c1","command":{{"kind":"pull","model":{{"id":"qwen","display_name":"Qwen","backend":"llama_cpp","source":{{"url":"https://example.com/q.gguf","sha256":"{}","size_bytes":10}},"context_length":4096,"meta":{{"family":"qwen2.5","parameters":null,"quantization":"Q4_K_M"}}}}}}}}"#,
+                    "ab".repeat(32)
+                ),
+            ),
+            (
+                ModelCommandKind::Delete {
+                    model_id: "qwen".into(),
+                },
+                r#"{"type":"model_command","command_id":"c1","command":{"kind":"delete","model_id":"qwen"}}"#.into(),
+            ),
+            (
+                ModelCommandKind::Cancel {
+                    target_command_id: "c0".into(),
+                },
+                r#"{"type":"model_command","command_id":"c1","command":{"kind":"cancel","target_command_id":"c0"}}"#
+                    .into(),
+            ),
+        ];
+        for (command, wire) in cases {
+            let msg = ServerMessage::ModelCommand {
+                command_id: "c1".into(),
+                command: command.clone(),
+            };
+            assert_eq!(serde_json::to_string(&msg).unwrap(), wire);
+            let ServerMessage::ModelCommand {
+                command_id,
+                command: back,
+            } = serde_json::from_str(&wire).unwrap()
+            else {
+                panic!("not a model_command")
+            };
+            assert_eq!((command_id.as_str(), back), ("c1", command));
+        }
+    }
+
+    #[test]
+    fn unknown_command_kinds_parse_as_unknown() {
+        // What a newer server's `load` command looks like to this build.
+        let msg: ServerMessage = serde_json::from_str(
+            r#"{"type":"model_command","command_id":"c9","command":{"kind":"load","model_id":"qwen","gpu_layers":20}}"#,
+        )
+        .unwrap();
+        let ServerMessage::ModelCommand { command_id, command } = msg else {
+            panic!("not a model_command")
+        };
+        assert_eq!(command_id, "c9");
+        assert_eq!(command, ModelCommandKind::Unknown);
+    }
+
+    #[test]
+    fn inventory_and_command_status_round_trip() {
+        let inventory = ClientMessage::ModelInventory(Inventory {
+            models: vec![LocalModel {
+                id: "qwen".into(),
+                display_name: "Qwen".into(),
+                backend: Backend::LlamaCpp,
+                state: ModelState::Loaded,
+                size_bytes: 10,
+                context_length: None,
+                meta: ModelMeta::default(),
+                error: None,
+            }],
+            storage: Storage {
+                models_bytes: 10,
+                free_bytes: 20,
+            },
+            runtimes: vec![RuntimeInfo {
+                backend: Backend::LlamaCpp,
+                version: "b1".into(),
+                variant: "cpu".into(),
+                state: RuntimeState::Ready,
+            }],
+        });
+        let wire = r#"{"type":"model_inventory","models":[{"id":"qwen","display_name":"Qwen","backend":"llama_cpp","state":"loaded","size_bytes":10,"context_length":null,"meta":{"family":null,"parameters":null,"quantization":null},"error":null}],"storage":{"models_bytes":10,"free_bytes":20},"runtimes":[{"backend":"llama_cpp","version":"b1","variant":"cpu","state":"ready"}]}"#;
+        assert_eq!(serde_json::to_string(&inventory).unwrap(), wire);
+        let back: ClientMessage = serde_json::from_str(wire).unwrap();
+        assert_eq!(serde_json::to_string(&back).unwrap(), wire);
+        // Optional model fields may be left out.
+        let minimal: ClientMessage = serde_json::from_str(
+            r#"{"type":"model_inventory","models":[{"id":"echo","display_name":"Echo","backend":"echo","state":"loaded","size_bytes":0}],"storage":{"models_bytes":0,"free_bytes":0},"runtimes":[]}"#,
+        )
+        .unwrap();
+        let ClientMessage::ModelInventory(minimal) = minimal else {
+            panic!("not an inventory")
+        };
+        assert_eq!(minimal.models[0].meta, ModelMeta::default());
+
+        let status = ClientMessage::ModelCommandStatus {
+            command_id: "c1".into(),
+            state: CommandState::InProgress,
+            progress: Some(Progress {
+                done_bytes: 5,
+                total_bytes: 10,
+                phase: ProgressPhase::Runtime,
+            }),
+            error: None,
+        };
+        let wire = r#"{"type":"model_command_status","command_id":"c1","state":"in_progress","progress":{"done_bytes":5,"total_bytes":10,"phase":"runtime"},"error":null}"#;
+        assert_eq!(serde_json::to_string(&status).unwrap(), wire);
+        let back: ClientMessage = serde_json::from_str(wire).unwrap();
+        assert_eq!(serde_json::to_string(&back).unwrap(), wire);
+        for state in [
+            CommandState::Accepted,
+            CommandState::Done,
+            CommandState::Failed,
+            CommandState::Cancelled,
+            CommandState::Unsupported,
+        ] {
+            let json = serde_json::to_string(&state).unwrap();
+            assert_eq!(serde_json::from_str::<CommandState>(&json).unwrap(), state);
+        }
+        assert!(CommandState::Unsupported.is_final() && !CommandState::InProgress.is_final());
     }
 
     #[test]

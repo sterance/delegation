@@ -4,10 +4,15 @@
 
 use base64::{engine::general_purpose::STANDARD, Engine as _};
 use delegation_client::identity::Identity;
+use delegation_client::inference::echo::ECHO_MODEL;
+use delegation_client::inference::Inference;
 use delegation_client::sampler::{Reading, Sampler, Source};
 use delegation_client::session::{self, ClientInfo, ServerIdentity, SessionCmd, SessionStatus};
 use futures_util::{SinkExt, StreamExt};
-use protocol::{ChatRole, ChatTurn, ClientMessage, ClientSettings, ServerMessage, Tick};
+use protocol::{
+    ChatRole, ChatTurn, ClientMessage, ClientSettings, CommandState, InferenceSettings, ModelCommandKind,
+    ServerMessage, Stage, Tick,
+};
 use std::time::Duration;
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{mpsc, watch};
@@ -23,6 +28,30 @@ fn fast_settings() -> ClientSettings {
         server_silence_timeout_ms: 400,
         reconnect_backoff_initial_ms: 50,
         reconnect_backoff_max_ms: 100,
+        inference: InferenceSettings::default(),
+    }
+}
+
+/// A data directory for the test's `Inference`, removed on drop.
+struct DataDir(std::path::PathBuf);
+
+impl DataDir {
+    fn new() -> DataDir {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        static N: AtomicUsize = AtomicUsize::new(0);
+        let dir = std::env::temp_dir().join(format!(
+            "delegation-session-test-{}-{}",
+            std::process::id(),
+            N.fetch_add(1, Ordering::Relaxed)
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        DataDir(dir)
+    }
+}
+
+impl Drop for DataDir {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
     }
 }
 
@@ -50,6 +79,7 @@ struct Harness {
     statuses: mpsc::UnboundedReceiver<SessionStatus>,
     _cmds: mpsc::Sender<SessionCmd>,
     _machine: watch::Sender<Option<std::sync::Arc<delegation_client::hardware::MachineInfo>>>,
+    _data: DataDir,
 }
 
 /// Starts a controller connected to a fresh local listener.
@@ -59,6 +89,7 @@ async fn start(sampler: Sampler) -> Harness {
     let (machine_tx, machine_rx) = watch::channel(None);
     let (cmd_tx, cmd_rx) = mpsc::channel(4);
     let (status_tx, status_rx) = mpsc::unbounded_channel();
+    let data = DataDir::new();
     tokio::spawn(session::controller(
         cmd_rx,
         move |_url: &str, status| {
@@ -67,6 +98,7 @@ async fn start(sampler: Sampler) -> Harness {
         ClientInfo {
             machine: machine_rx,
             sampler,
+            inference: Inference::new(&data.0),
         },
     ));
     let identity = Identity::from_b64("test-client".into(), &STANDARD.encode([7u8; 32])).unwrap();
@@ -84,6 +116,7 @@ async fn start(sampler: Sampler) -> Harness {
         statuses: status_rx,
         _cmds: cmd_tx,
         _machine: machine_tx,
+        _data: data,
     }
 }
 
@@ -160,14 +193,14 @@ async fn ticks_keep_coming_without_metrics_when_the_sampler_stalls() {
     });
 
     let mut ticks: Vec<Tick> = Vec::new();
-    let mut models = Vec::new();
+    let mut inventories = Vec::new();
     let mut pongs = 0;
     let deadline = tokio::time::Instant::now() + Duration::from_millis(1_500);
     while let Ok(Some(frame)) = tokio::time::timeout_at(deadline, stream.next()).await {
         match frame.unwrap() {
             Message::Text(text) => match serde_json::from_str(&text).unwrap() {
                 ClientMessage::Tick(tick) => ticks.push(tick),
-                ClientMessage::Models { models: m } => models.push(m),
+                ClientMessage::ModelInventory(inventory) => inventories.push(inventory),
                 other => panic!("unexpected {other:?}"),
             },
             Message::Pong(_) => pongs += 1,
@@ -194,8 +227,13 @@ async fn ticks_keep_coming_without_metrics_when_the_sampler_stalls() {
         "once the reading is older than sample_max_age_ms, ticks carry no metrics"
     );
     assert!(pongs >= 5, "pings were answered with pongs ({pongs})");
-    assert_eq!(models.len(), 1, "models advertised once per connection");
-    assert_eq!(models[0], delegation_client::chat::models());
+    assert_eq!(
+        inventories.len(),
+        1,
+        "the inventory is sent once per connection when nothing changes"
+    );
+    let ids: Vec<&str> = inventories[0].models.iter().map(|m| m.id.as_str()).collect();
+    assert_eq!(ids, vec![ECHO_MODEL]);
     assert!(
         h.statuses.try_recv().is_err(),
         "the client never dropped the connection"
@@ -233,14 +271,18 @@ async fn a_silent_server_is_dropped_and_reconnected() {
     silent.abort();
 }
 
-/// The chat messages the client sends, skipping ticks and models.
+/// The chat and command messages the client sends, skipping ticks,
+/// inventories and progress.
 async fn next_chat_message(ws: &mut Ws) -> ClientMessage {
     loop {
         match tokio::time::timeout(Duration::from_secs(5), next_client_message(ws))
             .await
             .expect("no chat message")
         {
-            ClientMessage::Tick(_) | ClientMessage::Models { .. } | ClientMessage::Info { .. } => {}
+            ClientMessage::Tick(_)
+            | ClientMessage::ModelInventory(_)
+            | ClientMessage::Info { .. }
+            | ClientMessage::ChatProgress { .. } => {}
             other => return other,
         }
     }
@@ -249,11 +291,12 @@ async fn next_chat_message(ws: &mut Ws) -> ClientMessage {
 fn echo_request(request_id: &str, text: &str) -> ServerMessage {
     ServerMessage::ChatRequest {
         request_id: request_id.into(),
-        model: delegation_client::chat::ECHO_MODEL.into(),
+        model: ECHO_MODEL.into(),
         messages: vec![ChatTurn {
             role: ChatRole::User,
             content: text.into(),
         }],
+        temperature: None,
     }
 }
 
@@ -311,4 +354,62 @@ async fn chat_requests_are_echoed_back_and_can_be_cancelled() {
         }
     }
     assert!(after_cancel <= 1, "{after_cancel} chunks arrived after the cancel");
+}
+
+#[tokio::test]
+async fn replies_report_progress_first_and_model_commands_are_answered() {
+    let sampler = Sampler::spawn_with(Duration::from_millis(200), || StallsAfterFirst(false));
+    let h = start(sampler).await;
+    let settings = ClientSettings {
+        tick_interval_ms: 1_000,
+        server_silence_timeout_ms: 10_000,
+        ..fast_settings()
+    };
+    let mut ws = accept_and_welcome(&h.listener, settings).await;
+
+    // chat_progress comes before any text.
+    send(&mut ws, &echo_request("r1", "hi")).await;
+    let first = loop {
+        match tokio::time::timeout(Duration::from_secs(5), next_client_message(&mut ws))
+            .await
+            .unwrap()
+        {
+            ClientMessage::ChatProgress { request_id, stage } => break (request_id, stage),
+            ClientMessage::ChatChunk { .. } => panic!("text before chat_progress"),
+            _ => {}
+        }
+    };
+    assert_eq!(first, ("r1".to_string(), Stage::Generating));
+    while !matches!(next_chat_message(&mut ws).await, ClientMessage::ChatDone { .. }) {}
+
+    // A command kind from a newer server.
+    send(
+        &mut ws,
+        &ServerMessage::ModelCommand {
+            command_id: "c1".into(),
+            command: ModelCommandKind::Unknown,
+        },
+    )
+    .await;
+    match next_chat_message(&mut ws).await {
+        ClientMessage::ModelCommandStatus { command_id, state, .. } => {
+            assert_eq!((command_id.as_str(), state), ("c1", CommandState::Unsupported))
+        }
+        other => panic!("unexpected {other:?}"),
+    }
+    // An invalid pull fails without touching anything.
+    let raw = r#"{"type":"model_command","command_id":"c2","command":{"kind":"pull","model":{"id":"../x","display_name":"x","backend":"llama_cpp","source":{"url":"https://example.com/x","sha256":"00","size_bytes":1}}}}"#;
+    ws.send(Message::Text(raw.into())).await.unwrap();
+    match next_chat_message(&mut ws).await {
+        ClientMessage::ModelCommandStatus {
+            command_id,
+            state,
+            error,
+            ..
+        } => {
+            assert_eq!((command_id.as_str(), state), ("c2", CommandState::Failed));
+            assert!(error.unwrap().contains("valid model id"));
+        }
+        other => panic!("unexpected {other:?}"),
+    }
 }

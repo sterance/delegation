@@ -99,8 +99,10 @@ case "${1:-up}" in
     CODE="$(mint_code)"
     cd ..
     OLDHOME="$HOME"
-    # Separate HOME so the dev identity never clobbers ~/.config/delegation-client
+    # Separate HOME so the dev identity never clobbers ~/.config/delegation-client,
+    # and models land in dev/.native-home/.local/share rather than your own.
     export HOME="$PWD/dev/.native-home"; mkdir -p "$HOME"
+    unset XDG_DATA_HOME
     export CARGO_HOME="${CARGO_HOME:-$OLDHOME/.cargo}" RUSTUP_HOME="${RUSTUP_HOME:-$OLDHOME/.rustup}"
     exec cargo run -p delegation-client -- --server "$URL" --pairing-code "$CODE"
     ;;

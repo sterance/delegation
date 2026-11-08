@@ -14,6 +14,7 @@ import Typography from "@mui/material/Typography";
 import { MAX_FRIENDLY_NAME_LENGTH, type Client, type DashboardConfig, type HardwareSpecs } from "../../api";
 import { MISSING, formatCpu, formatDisk, formatGib, formatGpu, formatMemory } from "../../utils/format";
 import { latestSample, metricsGpuCount, type History } from "../../hooks/useClients";
+import ClientModels from "./ClientModels";
 import ClientUsage from "./ClientUsage";
 import InlineTextEdit from "../common/InlineTextEdit";
 
@@ -325,6 +326,12 @@ export default function ClientCard({ client, history, config, meId, onRename, on
               value={formatSwap(history)}
             />
           </Stack>
+          <Divider sx={{ my: 1.5 }} />
+          <ClientModels
+            clientId={client.client_id}
+            clientName={client.friendly_name}
+            config={config}
+          />
           <Divider sx={{ my: 1.5 }} />
           <Stack spacing={0.5}>
             <DetailRow

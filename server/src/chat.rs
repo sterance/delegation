@@ -9,6 +9,7 @@
 //!   `{ conversation?, user_message?, reply }`
 //! - `snapshot`: the full text so far and the current status
 //! - `status`: a status change, with who's answering
+//! - `progress`: `{ stage }`, before text: `loading_model`, then `generating`
 //! - `chunk`: `{ delta }`
 //! - `end`: the final status and error, last
 //!
@@ -18,6 +19,7 @@ use crate::access::{self, Check, ClientAction};
 use crate::auth::{CurrentUser, User};
 use crate::conversations::{self, Busy, Message, MessageRole, SetLeaf, TurnOutcome, RENAME_MAX_CHARS};
 use crate::http::{ApiError, ApiJson, ApiResult};
+use crate::live::usable;
 use crate::replies::{ReplyEvent, RetryError, StartError, Target};
 use crate::{log, AppState};
 use axum::{
@@ -44,12 +46,24 @@ struct ChatModel {
     client_id: String,
     /// The client's friendly name (or hostname), for the picker.
     client_name: String,
+    /// The id to send in a target.
     model: String,
+    model_name: String,
+    backend: protocol::Backend,
+    state: protocol::ModelState,
 }
 
-/// `GET /api/chat/models`: the models on connected clients this user can Use.
+/// `GET /api/chat/models`: the models on connected clients this user can
+/// Use that can answer now (`available`, `loading` or `loaded`), `echo`
+/// included while it's enabled.
 pub async fn list_models(State(state): State<AppState>, CurrentUser(user): CurrentUser) -> ApiResult<Response> {
-    let live = state.live.models();
+    let echo_on = state.settings.client.inference.echo_model_enabled;
+    let live: Vec<_> = state
+        .live
+        .models()
+        .into_iter()
+        .filter(|(_, m)| echo_on || m.backend != protocol::Backend::Echo)
+        .collect();
     if live.is_empty() {
         return Ok(Json(Vec::<ChatModel>::new()).into_response());
     }
@@ -67,10 +81,20 @@ pub async fn list_models(State(state): State<AppState>, CurrentUser(user): Curre
                 client_name: usable.get(&client_id)?.clone(),
                 client_id,
                 model: model.id,
+                model_name: model.display_name,
+                backend: model.backend,
+                state: model.state,
             })
         })
         .collect();
-    list.sort_by(|a, b| (&a.client_name, &a.model).cmp(&(&b.client_name, &b.model)));
+    list.sort_by(|a, b| {
+        (&a.client_name, &a.client_id, &a.model_name, &a.model).cmp(&(
+            &b.client_name,
+            &b.client_id,
+            &b.model_name,
+            &b.model,
+        ))
+    });
     Ok(Json(list).into_response())
 }
 
@@ -90,13 +114,22 @@ async fn check_target(state: &AppState, user: &User, target: &Target) -> ApiResu
     let Some(conn) = state.live.sender(client_id) else {
         return Err(ApiError::conflict(format!("{} isn't connected.", row.friendly_name)));
     };
-    if !conn.models.iter().any(|m| &m.id == model) {
-        return Err(ApiError::bad_request(format!(
-            "{} doesn't offer the model {model:?}.",
-            row.friendly_name
-        )));
+    let echo_off = !state.settings.client.inference.echo_model_enabled;
+    match conn.model(model) {
+        Some(m) if echo_off && m.backend == protocol::Backend::Echo => {}
+        Some(m) if usable(m.state) => return Ok(()),
+        Some(m) if m.state == protocol::ModelState::Downloading => {
+            return Err(ApiError::conflict(format!(
+                "{} is still downloading {}.",
+                row.friendly_name, m.display_name
+            )))
+        }
+        _ => {}
     }
-    Ok(())
+    Err(ApiError::bad_request(format!(
+        "{} doesn't offer the model {model:?}.",
+        row.friendly_name
+    )))
 }
 
 fn busy_error(busy: Busy) -> ApiError {
@@ -465,6 +498,7 @@ async fn pump(state: AppState, owner: String, message_id: String, first: Option<
             };
             let out = match next {
                 Ok(ReplyEvent::Chunk(delta)) => event("chunk", json!({ "delta": delta })),
+                Ok(ReplyEvent::Progress(stage)) => event("progress", json!({ "stage": stage })),
                 Ok(ReplyEvent::Status(s)) => event(
                     "status",
                     json!({
@@ -498,5 +532,6 @@ fn snapshot_json(m: &Message) -> serde_json::Value {
         "client_id": m.client_id,
         "client_label": m.client_label,
         "model": m.model,
+        "stage": null,
     })
 }

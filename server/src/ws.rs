@@ -15,7 +15,7 @@ use axum::{
 };
 use base64::{engine::general_purpose::STANDARD, Engine as _};
 use ed25519_dalek::{Signature, Verifier, VerifyingKey};
-use protocol::{AuthFailedReason, ClientMessage, ServerMessage, Tick};
+use protocol::{valid_model_id, AuthFailedReason, ClientMessage, Inventory, ServerMessage, Tick};
 use rand::Rng;
 use std::time::{Duration, Instant};
 use tokio::time::MissedTickBehavior;
@@ -127,11 +127,13 @@ async fn handle_socket(mut socket: WebSocket, state: AppState) {
         hostname: record.hostname,
         conn: &mut conn,
         next_seq: 0,
+        last_inventory: None,
     };
     let reason = session.run(&mut socket).await;
 
     state.live.unregister(&client_id, conn_id);
     state.replies.on_connection_closed(conn_id);
+    state.model_commands.on_connection_closed(conn_id);
     flush_last_seen(&state, Some(&client_id)).await;
     log(format!("[ws] client {client_id} disconnected: {reason}"));
 }
@@ -145,6 +147,8 @@ struct Session<'a> {
     conn: &'a mut ConnHandle,
     /// The tick seq we expect next, to log drops at debug level.
     next_seq: u64,
+    /// The last inventory logged, so an unchanged one isn't logged again.
+    last_inventory: Option<String>,
 }
 
 impl Session<'_> {
@@ -243,10 +247,37 @@ impl Session<'_> {
                     }
                 });
             }
-            Ok(ClientMessage::Models { models }) => {
-                let ids: Vec<&str> = models.iter().map(|m| m.id.as_str()).collect();
-                log(format!("[models] {client_id} ({}): {}", self.hostname, ids.join(", ")));
-                self.state.live.set_models(client_id, self.conn.id, models);
+            Ok(ClientMessage::ModelInventory(inventory)) => match check_inventory(&inventory) {
+                Ok(()) => {
+                    let summary: Vec<String> = inventory
+                        .models
+                        .iter()
+                        .map(|m| format!("{} ({:?})", m.id, m.state).to_lowercase())
+                        .collect();
+                    let summary = summary.join(", ");
+                    if self.last_inventory.as_deref() != Some(summary.as_str()) {
+                        log(format!("[models] {client_id} ({}): {summary}", self.hostname));
+                        self.last_inventory = Some(summary);
+                    }
+                    self.state.live.set_inventory(client_id, self.conn.id, inventory);
+                }
+                Err(why) => log(format!("[models] ignored an inventory from {client_id}: {why}")),
+            },
+            Ok(ClientMessage::ModelCommandStatus {
+                command_id,
+                state,
+                progress,
+                error,
+            }) => {
+                self.state
+                    .model_commands
+                    .on_status(self.conn.id, &command_id, state, progress, error);
+            }
+            Ok(ClientMessage::ChatProgress { request_id, stage }) => {
+                debug(|| format!("[chat] {request_id}: {stage:?}"));
+                self.state
+                    .replies
+                    .on_client_event(self.conn.id, &request_id, ChatEvent::Progress(stage));
             }
             Ok(ClientMessage::ChatChunk { request_id, delta }) => {
                 self.state
@@ -302,4 +333,37 @@ impl Session<'_> {
             SampleOutcome::NotConnected => {}
         }
     }
+}
+
+/// Limits on what a client may report, so one can't make the server hold
+/// (and every dashboard poll copy) something huge.
+const MAX_INVENTORY_MODELS: usize = 256;
+const MAX_INVENTORY_STRING: usize = 512;
+
+fn check_inventory(inventory: &Inventory) -> Result<(), String> {
+    if inventory.models.len() > MAX_INVENTORY_MODELS || inventory.runtimes.len() > 32 {
+        return Err("too many entries".into());
+    }
+    let long = |s: &Option<String>| s.as_ref().is_some_and(|s| s.len() > MAX_INVENTORY_STRING);
+    for m in &inventory.models {
+        if !valid_model_id(&m.id) {
+            return Err(format!("invalid model id {:?}", m.id));
+        }
+        if m.display_name.len() > MAX_INVENTORY_STRING
+            || long(&m.meta.family)
+            || long(&m.meta.parameters)
+            || long(&m.meta.quantization)
+            || m.error.as_ref().is_some_and(|e| e.len() > 8 * MAX_INVENTORY_STRING)
+        {
+            return Err(format!("a string about {} is too long", m.id));
+        }
+    }
+    if inventory
+        .runtimes
+        .iter()
+        .any(|r| r.version.len() > 64 || r.variant.len() > 64)
+    {
+        return Err("a runtime string is too long".into());
+    }
+    Ok(())
 }

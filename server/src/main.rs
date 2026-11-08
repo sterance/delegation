@@ -8,6 +8,7 @@ mod db;
 mod http;
 mod live;
 mod metrics;
+mod models;
 mod ratelimit;
 mod replies;
 mod routes;
@@ -19,6 +20,8 @@ use auth::Auth;
 use config::{ConfigFile, Settings};
 use db::Db;
 use live::Live;
+use models::catalog::Catalog;
+use models::commands::ModelCommands;
 use replies::ReplyRunner;
 use std::io::{BufRead, IsTerminal};
 use std::net::SocketAddr;
@@ -40,6 +43,10 @@ pub struct AppState {
     pub auth: Arc<Auth>,
     /// Every chat reply being generated.
     pub replies: Arc<ReplyRunner>,
+    /// The models clients may be told to install.
+    pub catalog: Arc<Catalog>,
+    /// Model commands sent to clients, recent ones included.
+    pub model_commands: Arc<ModelCommands>,
 }
 
 static DEBUG_LOGGING: AtomicBool = AtomicBool::new(false);
@@ -175,13 +182,15 @@ async fn serve(settings: Settings) -> ExitCode {
         }
     };
     let settings = Arc::new(settings);
-    let replies = ReplyRunner::new(db.clone(), live.clone(), settings.chat);
+    let replies = ReplyRunner::new(db.clone(), live.clone(), settings.chat, settings.client.inference);
     let state = AppState {
         db,
         live,
+        catalog: Arc::new(Catalog::from_settings(&settings)),
         settings,
         auth,
         replies,
+        model_commands: Arc::new(ModelCommands::default()),
     };
 
     match state.db.call(|c| auth::store::admin_exists(c)).await {

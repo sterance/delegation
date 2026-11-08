@@ -7,6 +7,7 @@ use crate::form::FormResult;
 use crate::menu::{self, MenuAction, TrayMenu};
 use crate::store::Store;
 use delegation_client::identity::Identity;
+use delegation_client::inference::Inference;
 use delegation_client::sampler::Sampler;
 use delegation_client::session::{self, ClientInfo, ServerIdentity, SessionCmd, SessionStatus};
 use delegation_client::{hardware, paths};
@@ -46,6 +47,8 @@ pub fn run() {
     let info = ClientInfo {
         machine: hardware::spawn_collect(),
         sampler: Sampler::spawn(ClientSettings::default().sampler_interval()),
+        // %LOCALAPPDATA%\delegation-client: models stay out of the roaming profile.
+        inference: Inference::new(&paths::data_dir()),
     };
 
     let event_loop = match EventLoop::<UserEvent>::with_user_event().build() {

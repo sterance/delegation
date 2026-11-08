@@ -21,8 +21,12 @@ FROM debian:bookworm-slim
 # AMD/Intel GPU PCI IDs into model names for the hardware report.
 # rustls-tls-webpki-roots (enabled in Cargo.toml) bundles its own CA
 # roots, so no ca-certificates package is needed purely for TLS to work.
+# libssl3 and libgomp1 are for llama-server, which the client downloads
+# (pinned release, checked by hash) the first time a model is installed.
+# The release is built on Ubuntu; it needs glibc 2.34 and GCC 12's
+# libstdc++, both of which bookworm has.
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends pciutils \
+    && apt-get install -y --no-install-recommends pciutils libssl3 libgomp1 \
     && rm -rf /var/lib/apt/lists/*
 
 COPY --from=builder /build/target/release/delegation-client /usr/local/bin/delegation-client
@@ -33,5 +37,8 @@ RUN chmod +x /usr/local/bin/docker-entrypoint.sh
 # volume at this path — without it, every `docker compose up` after a
 # container recreation looks like a brand new, unenrolled machine.
 VOLUME /root/.config/delegation-client
+# Models and the llama.cpp runtime, kept apart from the identity because
+# they're large. docker-compose.yml mounts the `client-models` volume here.
+VOLUME /root/.local/share/delegation-client
 
 ENTRYPOINT ["/usr/local/bin/docker-entrypoint.sh"]

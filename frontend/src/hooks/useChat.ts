@@ -120,7 +120,10 @@ function applyEvent(m: ChatMessage, event: ReplyEvent): ChatMessage {
         client_id: event.client_id ?? m.client_id,
         client_label: event.client_label ?? m.client_label,
         model: event.model ?? m.model,
+        stage: event.stage ?? null,
       }
+    case 'progress':
+      return { ...m, stage: event.stage }
     case 'status':
       return {
         ...m,
@@ -132,7 +135,7 @@ function applyEvent(m: ChatMessage, event: ReplyEvent): ChatMessage {
     case 'chunk':
       return { ...m, content: m.content + event.delta }
     case 'end':
-      return { ...m, status: event.status, error: event.error, completed_at: new Date().toISOString() }
+      return { ...m, status: event.status, error: event.error, stage: null, completed_at: new Date().toISOString() }
     case 'created':
       return m
   }
@@ -252,7 +255,7 @@ function reducer(state: State, action: Action): State {
   }
 }
 
-/** Models on connected clients the user can chat with, refetched on demand. */
+/** Models on connected clients the user can chat with, grouped by client, refetched on demand. */
 function useModels(): [ModelOption[], () => void] {
   const [models, setModels] = useState<ModelOption[]>([])
   const refresh = useCallback(() => {
@@ -262,7 +265,7 @@ function useModels(): [ModelOption[], () => void] {
           list.map((m) => ({
             id: `${m.client_id}/${m.model}`,
             target: { kind: 'client', client_id: m.client_id, model: m.model },
-            label: m.model,
+            label: m.model_name,
             detail: m.client_name,
           })),
         ),

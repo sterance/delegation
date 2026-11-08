@@ -22,11 +22,3 @@ pub struct ChatTurn {
     pub role: ChatRole,
     pub content: String,
 }
-
-/// A model a client can answer with. A struct rather than a bare string
-/// so details (display name, context length, ...) can be added later as
-/// `Option` fields without breaking older peers.
-#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
-pub struct ModelInfo {
-    pub id: String,
-}

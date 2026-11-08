@@ -1,87 +1,137 @@
-//! Answers chat requests relayed by the server.
+//! Chat requests relayed by the server, translated to and from
+//! [`Inference::chat`]: `chat_request` in; `chat_progress`, `chat_chunk`,
+//! then `chat_done` or `chat_error` out. Nothing about models lives here.
 //!
-//! **This is the LLM plug-in point.** The session calls `models()` once per
-//! connection to advertise what this client offers, and `respond()` once
-//! per request, as its own task. A real backend only needs to replace
-//! these two functions: stream its output as `ChatChunk`s and finish with
-//! `ChatDone` or `ChatError`. Cancellation is handled by the session, which
-//! aborts the task, so `respond` needs no cancellation logic of its own.
-//!
-//! For now the only model is `echo`, which streams the user's last message
-//! back word by word, so the whole round trip can be tested without one.
+//! Cancellation is the session's job: it aborts the task running
+//! `respond`, which drops the `Inference::chat` future, which stops
+//! generation.
 
+use crate::inference::{ChatCompletion, Inference, InferenceEvent};
 use log::debug;
-use protocol::{ChatRole, ChatTurn, ClientMessage, ModelInfo};
+use protocol::{ChatTurn, ClientMessage, Stage};
 use std::time::Duration;
 use tokio::sync::mpsc;
 
-pub const ECHO_MODEL: &str = "echo";
+/// Until text flows, the current stage is repeated this often. A model can
+/// take longer to load than the server's `CHAT_IDLE_TIMEOUT_MS`, and every
+/// `chat_progress` counts as activity there.
+const HEARTBEAT: Duration = Duration::from_secs(10);
 
-/// Pause between words, so the reply visibly streams like a model's would.
-const ECHO_WORD_DELAY: Duration = Duration::from_millis(50);
+/// Turns inference events into messages: every delta, and each stage once
+/// (plus heartbeats until the first delta).
+struct Progress {
+    request_id: String,
+    stage: Option<Stage>,
+    texting: bool,
+}
 
-/// The models this client offers, advertised after every `welcome`.
-pub fn models() -> Vec<ModelInfo> {
-    vec![ModelInfo { id: ECHO_MODEL.into() }]
+impl Progress {
+    fn new(request_id: String) -> Self {
+        Progress {
+            request_id,
+            stage: None,
+            texting: false,
+        }
+    }
+
+    fn message(&mut self, event: InferenceEvent) -> Option<ClientMessage> {
+        match event {
+            InferenceEvent::Delta(delta) => {
+                self.texting = true;
+                Some(ClientMessage::ChatChunk {
+                    request_id: self.request_id.clone(),
+                    delta,
+                })
+            }
+            InferenceEvent::Status(stage) if self.stage == Some(stage) => None,
+            InferenceEvent::Status(stage) => {
+                self.stage = Some(stage);
+                Some(self.progress(stage))
+            }
+        }
+    }
+
+    fn heartbeat(&self) -> Option<ClientMessage> {
+        (!self.texting).then_some(self.stage?).map(|stage| self.progress(stage))
+    }
+
+    fn progress(&self, stage: Stage) -> ClientMessage {
+        ClientMessage::ChatProgress {
+            request_id: self.request_id.clone(),
+            stage,
+        }
+    }
 }
 
 /// Generates the reply to one request and sends it on `out`, ending with
 /// exactly one `ChatDone` or `ChatError`. Returns early if the session has
 /// closed `out`.
-pub async fn respond(request_id: String, model: String, messages: Vec<ChatTurn>, out: mpsc::Sender<ClientMessage>) {
-    let result = match model.as_str() {
-        ECHO_MODEL => echo(&request_id, &messages, &out).await,
-        other => Err(format!("this client doesn't offer the model {other:?}")),
+pub async fn respond(
+    request_id: String,
+    model: String,
+    messages: Vec<ChatTurn>,
+    temperature: Option<f32>,
+    inference: Inference,
+    out: mpsc::Sender<ClientMessage>,
+) {
+    let (events_tx, mut events) = mpsc::channel(64);
+    let request = ChatCompletion {
+        model_id: model,
+        messages,
+        // INFERENCE_MAX_TOKENS: the server doesn't set one per request (yet).
+        max_tokens: None,
+        temperature,
     };
+    let chat = inference.chat(request, events_tx);
+    tokio::pin!(chat);
+    let mut progress = Progress::new(request_id.clone());
+    let mut heartbeat = tokio::time::interval_at(tokio::time::Instant::now() + HEARTBEAT, HEARTBEAT);
+    let result = loop {
+        tokio::select! {
+            biased;
+            Some(event) = events.recv() => {
+                if let Some(msg) = progress.message(event) {
+                    if out.send(msg).await.is_err() {
+                        return;
+                    }
+                }
+            }
+            result = &mut chat => break result,
+            _ = heartbeat.tick() => {
+                if let Some(msg) = progress.heartbeat() {
+                    if out.send(msg).await.is_err() {
+                        return;
+                    }
+                }
+            }
+        }
+    };
+    // What was queued as it finished (all of it, if it finished at once).
+    while let Ok(event) = events.try_recv() {
+        if let Some(msg) = progress.message(event) {
+            if out.send(msg).await.is_err() {
+                return;
+            }
+        }
+    }
     let last = match result {
         Ok(()) => ClientMessage::ChatDone { request_id },
-        Err(error) => ClientMessage::ChatError { request_id, error },
+        Err(error) => {
+            debug!(target: "chat", "{request_id} failed: {error}");
+            ClientMessage::ChatError {
+                request_id,
+                error: error.to_string(),
+            }
+        }
     };
     let _ = out.send(last).await;
-}
-
-async fn echo(request_id: &str, messages: &[ChatTurn], out: &mpsc::Sender<ClientMessage>) -> Result<(), String> {
-    let text = messages
-        .iter()
-        .rev()
-        .find(|t| t.role == ChatRole::User)
-        .map(|t| t.content.as_str())
-        .ok_or("there's no user message to echo")?;
-    debug!(target: "chat", "{request_id}: echoing {} chars", text.len());
-    for (i, piece) in words(text).enumerate() {
-        if i > 0 {
-            tokio::time::sleep(ECHO_WORD_DELAY).await;
-        }
-        let chunk = ClientMessage::ChatChunk {
-            request_id: request_id.to_string(),
-            delta: piece.to_string(),
-        };
-        out.send(chunk).await.map_err(|_| "the session closed".to_string())?;
-    }
-    Ok(())
-}
-
-/// Splits after each run of whitespace, so the pieces join back into the
-/// exact input (newlines and repeated spaces included).
-fn words(text: &str) -> impl Iterator<Item = &str> {
-    let mut rest = text;
-    std::iter::from_fn(move || {
-        if rest.is_empty() {
-            return None;
-        }
-        let word_end = rest.find(char::is_whitespace).unwrap_or(rest.len());
-        let after_space = rest[word_end..]
-            .find(|c: char| !c.is_whitespace())
-            .map_or(rest.len(), |i| word_end + i);
-        let (piece, tail) = rest.split_at(after_space);
-        rest = tail;
-        Some(piece)
-    })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::inference::store::tests::TempDir;
+    use protocol::{ChatRole, Stage};
 
     fn turn(role: ChatRole, content: &str) -> ChatTurn {
         ChatTurn {
@@ -91,8 +141,10 @@ mod tests {
     }
 
     async fn run(model: &str, messages: Vec<ChatTurn>) -> Vec<ClientMessage> {
+        let dir = TempDir::new("chat");
+        let inference = Inference::new(&dir.0);
         let (tx, mut rx) = mpsc::channel(64);
-        respond("r".into(), model.into(), messages, tx).await;
+        respond("r".into(), model.into(), messages, None, inference, tx).await;
         let mut got = Vec::new();
         while let Some(msg) = rx.recv().await {
             got.push(msg);
@@ -100,21 +152,10 @@ mod tests {
         got
     }
 
-    #[test]
-    fn words_rejoin_into_the_input() {
-        for text in ["one", "two words", "  leading", "trailing  ", "a\n\nb \t c", ""] {
-            assert_eq!(words(text).collect::<String>(), text);
-        }
-        assert_eq!(
-            words("hi there\nyou").collect::<Vec<_>>(),
-            vec!["hi ", "there\n", "you"]
-        );
-    }
-
     #[tokio::test]
     async fn echo_streams_the_last_user_message_then_finishes() {
         let got = run(
-            ECHO_MODEL,
+            "echo",
             vec![
                 turn(ChatRole::User, "first"),
                 turn(ChatRole::Assistant, "first"),
@@ -122,7 +163,11 @@ mod tests {
             ],
         )
         .await;
-        let (last, chunks) = got.split_last().unwrap();
+        assert!(matches!(
+            &got[0],
+            ClientMessage::ChatProgress { request_id, stage: Stage::Generating } if request_id == "r"
+        ));
+        let (last, chunks) = got[1..].split_last().unwrap();
         assert!(matches!(last, ClientMessage::ChatDone { request_id } if request_id == "r"));
         let text: String = chunks
             .iter()
@@ -135,11 +180,35 @@ mod tests {
         assert_eq!(chunks.len(), 3);
     }
 
+    #[test]
+    fn stages_are_sent_once_and_repeated_only_until_text_arrives() {
+        let mut p = Progress::new("r".into());
+        assert!(p.heartbeat().is_none(), "nothing to repeat yet");
+        assert!(p.message(InferenceEvent::Status(Stage::LoadingModel)).is_some());
+        assert!(p.message(InferenceEvent::Status(Stage::LoadingModel)).is_none());
+        assert!(matches!(
+            p.heartbeat(),
+            Some(ClientMessage::ChatProgress {
+                stage: Stage::LoadingModel,
+                ..
+            })
+        ));
+        assert!(p.message(InferenceEvent::Status(Stage::Generating)).is_some());
+        assert!(p.message(InferenceEvent::Delta("x".into())).is_some());
+        assert!(p.heartbeat().is_none(), "chunks are the activity now");
+    }
+
     #[tokio::test]
-    async fn unknown_model_or_no_user_message_is_an_error() {
+    async fn inference_errors_become_readable_chat_errors() {
         let got = run("nope", vec![turn(ChatRole::User, "hi")]).await;
-        assert!(matches!(got.as_slice(), [ClientMessage::ChatError { error, .. }] if error.contains("nope")));
-        let got = run(ECHO_MODEL, vec![turn(ChatRole::Assistant, "hi")]).await;
-        assert!(matches!(got.as_slice(), [ClientMessage::ChatError { .. }]));
+        assert!(
+            matches!(got.as_slice(), [ClientMessage::ChatError { error, .. }] if error.contains("doesn't have the model \"nope\"")),
+            "{got:?}"
+        );
+        let got = run("echo", vec![turn(ChatRole::Assistant, "hi")]).await;
+        assert!(
+            matches!(got.as_slice(), [ClientMessage::ChatError { error, .. }] if error.contains("no user message")),
+            "{got:?}"
+        );
     }
 }

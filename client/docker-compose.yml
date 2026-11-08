@@ -16,6 +16,9 @@ services:
       DELEGATION_DMI_PATH: /hostdmi/DMI
     volumes:
       - client-identity:/root/.config/delegation-client
+      # Installed models and the llama.cpp runtime, so they survive
+      # `docker compose down` / `up`.
+      - client-models:/root/.local/share/delegation-client
       # The host's filesystem, read-only, so the hardware report shows the
       # host's disks and free space. NOTE: this exposes everything on the
       # host (SSH keys included) to code running in this container. It is
@@ -28,3 +31,4 @@ services:
 
 volumes:
   client-identity:
+  client-models:

@@ -7,6 +7,7 @@
 //! as `Option` fields: serde treats a missing `Option` as `None`, so a
 //! sender that doesn't fill them in still parses.
 
+use crate::models::InferenceSettings;
 use serde::{Deserialize, Serialize};
 use std::time::Duration;
 
@@ -58,6 +59,10 @@ pub struct ClientSettings {
     pub server_silence_timeout_ms: u64,
     pub reconnect_backoff_initial_ms: u64,
     pub reconnect_backoff_max_ms: u64,
+    /// Defaulted when missing, so a settings cache written before these
+    /// existed still loads.
+    #[serde(default)]
+    pub inference: InferenceSettings,
 }
 
 /// The sampler can't go faster than this: CPU % is the difference between
@@ -73,6 +78,7 @@ impl Default for ClientSettings {
             server_silence_timeout_ms: 6_000,
             reconnect_backoff_initial_ms: 1_000,
             reconnect_backoff_max_ms: 30_000,
+            inference: InferenceSettings::default(),
         }
     }
 }
@@ -89,6 +95,7 @@ impl ClientSettings {
             server_silence_timeout_ms: self.server_silence_timeout_ms.max(1),
             reconnect_backoff_initial_ms: initial,
             reconnect_backoff_max_ms: self.reconnect_backoff_max_ms.max(initial),
+            inference: self.inference.sanitized(),
         }
     }
 

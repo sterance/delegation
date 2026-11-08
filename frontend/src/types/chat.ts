@@ -11,6 +11,9 @@ export type MessageStatus = 'queued' | 'assigned' | 'running' | 'completed' | 'f
 
 export type Role = 'system' | 'user' | 'assistant'
 
+/** Where a reply is before its text: the client is loading the model, or the model is working. */
+export type Stage = 'loading_model' | 'generating'
+
 export interface ChatMessage {
   id: string
   conversation_id: string
@@ -28,6 +31,8 @@ export interface ChatMessage {
   model: string | null
   created_at: string
   completed_at: string | null
+  /** Live only, from the reply stream: never stored. */
+  stage?: Stage | null
 }
 
 export interface ConversationSummary {
@@ -83,17 +88,34 @@ export type ReplyEvent =
       user_message?: ChatMessage | null
       reply: ChatMessage
     }
-  | ({ type: 'snapshot'; message_id: string; status: MessageStatus; content: string; error: string | null } & Answerer)
+  | ({
+      type: 'snapshot'
+      message_id: string
+      status: MessageStatus
+      content: string
+      error: string | null
+      stage: Stage | null
+    } & Answerer)
   | ({ type: 'status'; status: MessageStatus } & Answerer)
+  | { type: 'progress'; stage: Stage }
   | { type: 'chunk'; delta: string }
   | { type: 'end'; status: MessageStatus; error: string | null }
 
-/** One entry of `GET /api/chat/models`. */
+export type Backend = 'llama_cpp' | 'echo'
+
+/** A model's state on its client; mirrors `ModelState` in protocol/src/models.rs. */
+export type ModelState = 'downloading' | 'available' | 'loading' | 'loaded' | 'failed'
+
+/** One entry of `GET /api/chat/models`: only models that can answer now. */
 export interface ChatModel {
   client_id: string
   /** The client's friendly name (or hostname). */
   client_name: string
+  /** The model's id, as a target names it. */
   model: string
+  model_name: string
+  backend: Backend
+  state: ModelState
 }
 
 /** One entry in a model picker. */
@@ -101,8 +123,8 @@ export interface ModelOption {
   /** `${clientId}/${model}`: unique across clients offering the same model. */
   id: string
   target: Target
-  /** The model name. */
+  /** The model's display name. */
   label: string
-  /** Secondary line: which client hosts it. */
+  /** Which client hosts it; the picker groups by it. */
   detail: string
 }

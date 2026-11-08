@@ -375,7 +375,7 @@ fn unescape_octal(s: &str) -> String {
     String::from_utf8_lossy(&out).into_owned()
 }
 
-fn available_bytes(path: &Path) -> Option<u64> {
+pub(super) fn available_bytes(path: &Path) -> Option<u64> {
     use std::os::unix::ffi::OsStrExt;
     let c_path = std::ffi::CString::new(path.as_os_str().as_bytes()).ok()?;
     // SAFETY: c_path is a valid NUL-terminated string and st is a properly

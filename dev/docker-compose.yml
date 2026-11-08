@@ -65,10 +65,12 @@ services:
       DELEGATION_DMI_PATH: /hostdmi/DMI
     volumes:
       - dev-client-identity:/root/.config/delegation-client
+      - dev-client-models:/root/.local/share/delegation-client
       - /:/hostfs:ro
       - /sys/firmware/dmi/tables:/hostdmi:ro
 
 volumes:
   dev-server-data:
   dev-client-identity:
+  dev-client-models:
   dev-frontend-modules:

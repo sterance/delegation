@@ -574,9 +574,41 @@ pub fn history_for(conn: &Connection, reply_id: &str) -> Result<Vec<ChatTurn>> {
             })
         })?
         .collect::<rusqlite::Result<_>>()?;
-    // HOOK: trim `turns` to fit the model's context window here, once
-    // models advertise one (ModelInfo gains a context length).
+    // Trimmed to the model's context by the reply runner (`trim_history`),
+    // which knows which model will answer.
     Ok(turns)
+}
+
+/// A rough token count: characters / 4, plus a few for each turn's role
+/// markers in the chat template. Good enough to stay clear of the limit.
+pub fn estimate_tokens(turn: &ChatTurn) -> u64 {
+    const PER_TURN: u64 = 4;
+    (turn.content.chars().count() as u64).div_ceil(4) + PER_TURN
+}
+
+/// Drops the oldest turns until the estimated prompt fits in
+/// `budget_tokens` (the model's context minus the room kept for the
+/// reply). The newest turn, the user's message, always stays, even alone
+/// over budget, and the history never starts with an assistant turn.
+/// Returns the turns kept and how many were dropped.
+pub fn trim_history(turns: Vec<ChatTurn>, budget_tokens: u64) -> (Vec<ChatTurn>, usize) {
+    let total = turns.len();
+    let mut used = 0;
+    let mut keep = 0;
+    for (i, turn) in turns.iter().enumerate().rev() {
+        let cost = estimate_tokens(turn);
+        if i + 1 < total && used + cost > budget_tokens {
+            break;
+        }
+        used += cost;
+        keep += 1;
+    }
+    let mut kept: Vec<ChatTurn> = turns.into_iter().skip(total - keep).collect();
+    while kept.len() > 1 && kept[0].role == ChatRole::Assistant {
+        kept.remove(0);
+    }
+    let dropped = total - kept.len();
+    (kept, dropped)
 }
 
 /// `CHAT_RETENTION_DAYS`: deletes conversations not updated since `cutoff`.
@@ -769,6 +801,43 @@ mod tests {
             Ok(())
         })
         .unwrap();
+    }
+
+    #[test]
+    fn trimming_drops_the_oldest_turns_and_keeps_the_newest_user_message() {
+        let t = |role, n: usize| ChatTurn {
+            role,
+            content: "x".repeat(n),
+        };
+        // Each 40-char turn costs 10 + 4 = 14 tokens.
+        let history = vec![
+            t(ChatRole::User, 40),
+            t(ChatRole::Assistant, 40),
+            t(ChatRole::User, 40),
+            t(ChatRole::Assistant, 40),
+            t(ChatRole::User, 40),
+        ];
+        let (kept, dropped) = trim_history(history.clone(), 1_000);
+        assert_eq!((kept.len(), dropped), (5, 0), "it all fits");
+
+        // Room for two turns, but the older would be an assistant turn
+        // opening the history, so it goes too.
+        let (kept, dropped) = trim_history(history.clone(), 28);
+        assert_eq!((kept.len(), dropped), (1, 4));
+        // Room for three: user, assistant, user.
+        let (kept, dropped) = trim_history(history.clone(), 42);
+        assert_eq!((kept.len(), dropped), (3, 2));
+        // Room for four: the leading assistant turn is dropped again.
+        let (kept, dropped) = trim_history(history.clone(), 56);
+        assert_eq!((kept.len(), dropped), (3, 2));
+        assert_eq!(kept[0].role, ChatRole::User);
+        assert_eq!(kept.last(), history.last());
+
+        // The newest message alone over budget still goes.
+        let (kept, dropped) = trim_history(vec![t(ChatRole::User, 10), t(ChatRole::User, 4_000)], 10);
+        assert_eq!((kept.len(), dropped), (1, 1));
+        assert_eq!(kept[0].content.len(), 4_000);
+        assert_eq!(trim_history(Vec::new(), 0), (Vec::new(), 0));
     }
 
     #[test]

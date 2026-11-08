@@ -12,7 +12,7 @@
 
 use crate::auth::{self, handlers as auth_api};
 use crate::http::{self, ApiError, ApiResult};
-use crate::{chat, clients, db, ws, AppState};
+use crate::{chat, clients, db, models, ws, AppState};
 use axum::{
     extract::{MatchedPath, Request, State},
     handler::Handler,
@@ -100,6 +100,15 @@ pub fn api_routes() -> ApiRoutes {
         .post("/pairing-codes", clients::create_pairing_code)
         .get("/pairing-codes/:code/status", clients::pairing_code_status)
         .get("/dashboard-config", clients::dashboard_config)
+        // models on clients
+        .get("/models/catalog", models::list_catalog)
+        .get("/clients/:client_id/models", models::client_models)
+        .post("/clients/:client_id/models", models::install)
+        .delete("/clients/:client_id/models/:model_id", models::delete_model)
+        .post(
+            "/clients/:client_id/model-commands/:command_id/cancel",
+            models::cancel_command,
+        )
         // chat
         .get("/chat/models", chat::list_models)
         .get("/conversations", chat::list_conversations)

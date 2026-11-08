@@ -22,7 +22,7 @@ path = "src/bin/delegation-tray/main.rs"
 
 [dependencies]
 protocol = { path = "../protocol" }
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "time", "io-util", "sync"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "time", "io-util", "sync", "process", "signal"] }
 tokio-tungstenite = "0.30"
 futures-util = "0.3"
 ed25519-dalek = { version = "2", features = ["rand_core"] }
@@ -37,6 +37,13 @@ gethostname = "1"
 sysinfo = { version = "0.38", default-features = false, features = ["system"] }
 # Loads libnvidia-ml.so.1 / nvml.dll at runtime; does nothing without NVIDIA.
 nvml-wrapper = "0.13"
+# Model and runtime downloads: verified with SHA-256, then the llama.cpp
+# release archive (a .tar.gz on Linux, a .zip on Windows) is unpacked.
+sha2 = "0.10"
+hex = "0.4"
+tar = { version = "0.4", default-features = false }
+flate2 = "1"
+zip = { version = "9.4.2", default-features = false, features = ["deflate-flate2"] }
 
 [target.'cfg(not(windows))'.dependencies]
 # rustls with bundled roots: no system CA store needed in the slim image.
@@ -62,6 +69,7 @@ windows = { version = "0.62", features = [
     "Win32_Security",
     "Win32_Storage_FileSystem",
     "Win32_System_Console",
+    "Win32_System_JobObjects",
     "Win32_System_Registry",
     "Win32_System_SystemInformation",
     "Win32_System_Threading",
