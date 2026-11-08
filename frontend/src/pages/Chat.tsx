@@ -1,5 +1,6 @@
 import EditNoteIcon from '@mui/icons-material/EditNote'
 import MenuIcon from '@mui/icons-material/Menu'
+import Alert from '@mui/material/Alert'
 import Box from '@mui/material/Box'
 import Divider from '@mui/material/Divider'
 import Drawer from '@mui/material/Drawer'
@@ -33,7 +34,9 @@ export default function Chat() {
   const sidebar = (
     <ChatSidebar
       conversations={chat.conversations}
-      activeId={chat.active?.id ?? null}
+      activeId={chat.activeId}
+      hasMore={chat.hasMore}
+      listError={chat.listError}
       onSelect={(id) => {
         chat.selectChat(id)
         closeOverlay()
@@ -43,6 +46,9 @@ export default function Chat() {
         closeOverlay()
       }}
       onCollapse={() => setSidebarOpen(false)}
+      onLoadMore={chat.loadMore}
+      onRename={chat.renameChat}
+      onDelete={chat.deleteChat}
     />
   )
 
@@ -89,21 +95,42 @@ export default function Chat() {
             </>
           )}
           <Typography noWrap sx={{ px: 1, fontWeight: 500 }}>
-            {chat.active?.title ?? 'New chat'}
+            {chat.title}
           </Typography>
         </Stack>
         <Divider />
 
-        <MessageList key={chat.active?.id ?? 'new'} messages={chat.active?.messages ?? []} />
+        <MessageList
+          key={chat.activeId ?? 'new'}
+          steps={chat.steps}
+          loading={chat.loading}
+          loadError={chat.loadError}
+          models={chat.models}
+          model={chat.model}
+          busy={chat.generating}
+          onRetry={chat.retry}
+          onRegenerate={chat.regenerate}
+          onEdit={chat.edit}
+          onSwitch={chat.switchTo}
+          onOpenModels={chat.refreshModels}
+        />
 
         <Box sx={{ px: 2, pb: 2, pt: 1 }}>
           <Box sx={{ maxWidth: CHAT_COLUMN_MAX_WIDTH, mx: 'auto' }}>
+            {chat.error && (
+              <Alert severity="error" onClose={chat.dismissError} sx={{ mb: 1 }}>
+                {chat.error}
+              </Alert>
+            )}
             <Composer
               onSend={chat.send}
               // No model: nowhere to send it.
-              disabled={chat.busy || chat.modelId === null}
+              disabled={chat.model === null || chat.loading}
+              generating={chat.generating}
+              canStop={chat.canStop}
+              onStop={chat.stop}
               models={chat.models}
-              modelId={chat.modelId}
+              modelId={chat.model?.id ?? null}
               onSelectModel={chat.selectModel}
               onOpenModels={chat.refreshModels}
             />

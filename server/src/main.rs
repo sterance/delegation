@@ -1,145 +1,217 @@
+mod access;
+mod auth;
 mod chat;
+mod clients;
 mod config;
+mod conversations;
 mod db;
+mod http;
 mod live;
 mod metrics;
+mod ratelimit;
+mod replies;
+mod routes;
+#[cfg(test)]
+mod tests;
+mod ws;
 
-use axum::{
-    extract::{
-        ws::{Message, WebSocket, WebSocketUpgrade},
-        Path, Query, State,
-    },
-    http::StatusCode,
-    response::IntoResponse,
-    routing::{get, patch, post},
-    Json, Router,
-};
-use base64::{engine::general_purpose::STANDARD, Engine as _};
-use chat::{ChatEvent, Chats};
+use auth::Auth;
 use config::{ConfigFile, Settings};
 use db::Db;
-use ed25519_dalek::{Signature, Verifier, VerifyingKey};
-use live::{ConnHandle, Live, Sample, SampleOutcome};
-use protocol::{
-    AuthFailedReason, ClientMessage, EnrollError, EnrollRequest, EnrollResponse, HardwareSpecs, ServerMessage, Tick,
+use live::Live;
+use replies::ReplyRunner;
+use std::io::{BufRead, IsTerminal};
+use std::net::SocketAddr;
+use std::process::ExitCode;
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    Arc,
 };
-use rand::Rng;
-use serde::{Deserialize, Serialize};
-use std::{
-    sync::{
-        atomic::{AtomicBool, Ordering},
-        Arc,
-    },
-    time::{Duration, Instant},
-};
+use std::time::{Duration, SystemTime};
 use tokio::time::MissedTickBehavior;
-use tower_http::services::{ServeDir, ServeFile};
-use uuid::Uuid;
 
 #[derive(Clone)]
-struct AppState {
-    db: Db,
+pub struct AppState {
+    pub db: Db,
     /// Connections, metric history and unflushed `last_seen_at` values.
-    live: Arc<Live>,
-    settings: Arc<Settings>,
-    /// Chat requests sent to clients and still waiting on their replies.
-    chats: Arc<Chats>,
+    pub live: Arc<Live>,
+    pub settings: Arc<Settings>,
+    /// Sessions cache, rate limits, password hashing, the setup token.
+    pub auth: Arc<Auth>,
+    /// Every chat reply being generated.
+    pub replies: Arc<ReplyRunner>,
 }
 
 static DEBUG_LOGGING: AtomicBool = AtomicBool::new(false);
 
-fn log(msg: impl AsRef<str>) {
+pub fn log(msg: impl AsRef<str>) {
     println!("[{}] {}", protocol::ts(), msg.as_ref());
 }
 
-/// Per-tick and per-sample detail, shown with `SERVER_LOG_LEVEL=debug`.
-/// Takes a closure so nothing is formatted when it's off.
-fn debug(msg: impl FnOnce() -> String) {
+/// Per-tick, per-sample and per-flush detail, shown with
+/// `SERVER_LOG_LEVEL=debug`. Takes a closure so nothing is formatted when
+/// it's off.
+pub fn debug(msg: impl FnOnce() -> String) {
     if DEBUG_LOGGING.load(Ordering::Relaxed) {
         println!("[{}] {}", protocol::ts(), msg());
     }
 }
 
-#[tokio::main]
-async fn main() {
+const USAGE: &str = "usage:
+  delegation-server                         run the server
+  delegation-server reset-admin-password    set a new password for the admin account
+                                            (prompts, or reads one line from stdin)
+  delegation-server backup [FILE]           write a consistent copy of the database
+                                            (VACUUM INTO), default next to it";
+
+fn main() -> ExitCode {
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    match args.first().map(String::as_str) {
+        None | Some("serve") => {
+            let Some(settings) = load_settings(true) else {
+                return ExitCode::FAILURE;
+            };
+            let runtime = match tokio::runtime::Builder::new_multi_thread().enable_all().build() {
+                Ok(runtime) => runtime,
+                Err(e) => {
+                    eprintln!("failed to start the async runtime: {e}");
+                    return ExitCode::FAILURE;
+                }
+            };
+            runtime.block_on(serve(settings))
+        }
+        Some("reset-admin-password") if args.len() == 1 => match load_settings(false) {
+            Some(settings) => reset_admin_password(&settings),
+            None => ExitCode::FAILURE,
+        },
+        Some("backup") if args.len() <= 2 => match load_settings(false) {
+            Some(settings) => backup(&settings, args.get(1).map(String::as_str)),
+            None => ExitCode::FAILURE,
+        },
+        Some("help" | "--help" | "-h") => {
+            println!("{USAGE}");
+            ExitCode::SUCCESS
+        }
+        Some(_) => {
+            eprintln!("{USAGE}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+/// `config.env` plus the environment, validated. None (after printing
+/// every problem) if anything is invalid.
+fn load_settings(verbose: bool) -> Option<Settings> {
     let file = ConfigFile::load(&["config.env".into()]);
-    match file.source() {
-        Some(path) => log(format!("[config] loaded {}", path.display())),
-        None => log("[config] no config file, using environment and defaults"),
+    if verbose {
+        match file.source() {
+            Some(path) => log(format!("[config] loaded {}", path.display())),
+            None => log("[config] no config file, using environment and defaults"),
+        }
     }
     for warning in config::replaced_keys_in_use(|key| file.get(key)) {
         log(format!("[config] warning: {warning}"));
     }
-    let settings = match Settings::parse(|key| file.get(key)) {
-        Ok(settings) => settings,
+    match Settings::parse(|key| file.get(key)) {
+        Ok(settings) => Some(settings),
         Err(errors) => {
             for error in &errors {
                 eprintln!("[{}] [config] invalid: {error}", protocol::ts());
             }
             eprintln!("[{}] [config] refusing to start; fix config.env", protocol::ts());
-            std::process::exit(1);
+            None
         }
-    };
+    }
+}
+
+fn open_db(settings: &Settings) -> Option<Db> {
+    if let Some(parent) = std::path::Path::new(&settings.db_path).parent() {
+        std::fs::create_dir_all(parent).ok();
+    }
+    match db::open(&settings.db_path) {
+        Ok(db) => Some(db),
+        Err(e) => {
+            let ts = protocol::ts();
+            eprintln!("[{ts}] [db] ************************************************************");
+            eprintln!("[{ts}] [db] REFUSING TO START: {e:#}");
+            eprintln!("[{ts}] [db] ************************************************************");
+            None
+        }
+    }
+}
+
+async fn serve(settings: Settings) -> ExitCode {
     DEBUG_LOGGING.store(settings.debug_logging, Ordering::Relaxed);
     for line in settings.summary() {
         log(format!("[config] {line}"));
     }
-
-    if let Some(parent) = std::path::Path::new(&settings.db_path).parent() {
-        std::fs::create_dir_all(parent).ok();
+    for warning in settings.warnings() {
+        log(format!("[config] warning: {warning}"));
     }
-    let db = db::open(&settings.db_path).expect("failed to open database");
+
+    let Some(db) = open_db(&settings) else {
+        return ExitCode::FAILURE;
+    };
+    match db.blocking(ReplyRunner::orphan_interrupted) {
+        Ok(0) => {}
+        Ok(n) => log(format!(
+            "[reply] {n} reply(s) interrupted by the last shutdown marked orphaned"
+        )),
+        Err(e) => log(format!("[reply] error orphaning interrupted replies: {e:#}")),
+    }
 
     let live = Arc::new(Live::new(settings.metrics));
     log(format!("[live] epoch {}", live.epoch));
+    let auth = match Auth::new(&settings) {
+        Ok(auth) => Arc::new(auth),
+        Err(e) => {
+            eprintln!("[{}] [auth] {e:#}", protocol::ts());
+            return ExitCode::FAILURE;
+        }
+    };
     let settings = Arc::new(settings);
+    let replies = ReplyRunner::new(db.clone(), live.clone(), settings.chat);
     let state = AppState {
         db,
         live,
         settings,
-        chats: Arc::new(Chats::default()),
+        auth,
+        replies,
     };
 
+    match state.db.call(|c| auth::store::admin_exists(c)).await {
+        Ok(true) => {}
+        Ok(false) => {
+            let token = state.auth.issue_setup_token();
+            let origin = &state.settings.http.public_origin;
+            log("[setup] ================================================================");
+            log("[setup] No admin account exists yet.");
+            log(format!(
+                "[setup] Open {origin}/setup and enter this setup token: {token}"
+            ));
+            log("[setup] It's valid until the admin is created or the server restarts.");
+            log("[setup] ================================================================");
+        }
+        Err(e) => {
+            eprintln!("[{}] [db] {e:#}", protocol::ts());
+            return ExitCode::FAILURE;
+        }
+    }
+
     tokio::spawn(flush_loop(state.clone()));
+    tokio::spawn(cleanup_loop(state.clone()));
 
     // The built React dashboard (`npm run build` in frontend/). Default is
     // relative so it resolves both from the repo root natively and from
     // /app in the Docker image.
-    let frontend_dir = state.settings.frontend_dir.clone();
-    if !std::path::Path::new(&frontend_dir).join("index.html").is_file() {
+    let frontend_dir = &state.settings.frontend_dir;
+    if !std::path::Path::new(frontend_dir).join("index.html").is_file() {
         log(format!(
             "[dashboard] no index.html in {frontend_dir}, dashboard will 404 (build frontend/ first)"
         ));
     }
 
-    // Dashboard-facing endpoints live under /api so they never collide with
-    // the dashboard's own client-side routes (/clients, /chat, ...). Unknown
-    // /api paths 404 here instead of falling through to index.html.
-    let api = Router::new()
-        .route("/admin/pairing-code", post(create_pairing_code))
-        .route("/admin/pairing-code/:code/status", get(pairing_code_status))
-        .route("/admin/dashboard-config", get(dashboard_config))
-        .route("/clients", get(list_clients))
-        .route("/clients/:client_id", patch(update_client).delete(delete_client))
-        .route("/chat", post(chat::post_chat))
-        .route("/chat/models", get(chat::list_models))
-        .fallback(|| async { StatusCode::NOT_FOUND });
-
-    // Any path that isn't a real file gets index.html, so deep links and
-    // reloads of client-side routes load the app, which then routes itself.
-    let spa =
-        ServeDir::new(&frontend_dir).fallback(ServeFile::new(std::path::Path::new(&frontend_dir).join("index.html")));
-
-    let app = Router::new()
-        // Used by the client binary, so these stay at the root.
-        .route("/enroll", post(enroll))
-        .route("/ws", get(ws_upgrade))
-        .nest("/api", api)
-        // Fallback, not a route: only requests no route above matched ever
-        // reach the static files, so the dashboard can't shadow the API.
-        .fallback_service(spa)
-        .with_state(state.clone());
-
+    let app = routes::app(state.clone());
     let port = state.settings.port;
     let addr = format!("0.0.0.0:{port}");
     log(format!("delegation-server listening on :{port}"));
@@ -147,16 +219,25 @@ async fn main() {
     log(format!("  ws:        ws://localhost:{port}/ws"));
     log(format!("  dashboard: http://localhost:{port}/ (from {frontend_dir})"));
 
-    let listener = tokio::net::TcpListener::bind(&addr).await.unwrap();
-    // Upgraded WebSockets run on their own tasks, so this returns once
-    // in-flight HTTP requests finish without waiting for clients.
-    axum::serve(listener, app)
+    let listener = match tokio::net::TcpListener::bind(&addr).await {
+        Ok(listener) => listener,
+        Err(e) => {
+            eprintln!("[{}] couldn't listen on {addr}: {e}", protocol::ts());
+            return ExitCode::FAILURE;
+        }
+    };
+    // Upgraded WebSockets and reply streams run on their own tasks, so this
+    // returns once in-flight HTTP requests finish without waiting for them.
+    let served = axum::serve(listener, app.into_make_service_with_connect_info::<SocketAddr>())
         .with_graceful_shutdown(shutdown_signal())
-        .await
-        .unwrap();
+        .await;
+    if let Err(e) = served {
+        log(format!("[shutdown] server error: {e}"));
+    }
 
-    flush_last_seen(&state, None);
+    flush_last_seen(&state, None).await;
     log("[shutdown] last_seen_at flushed, exiting");
+    ExitCode::SUCCESS
 }
 
 /// `docker stop` sends SIGTERM; Ctrl-C covers native runs.
@@ -182,7 +263,7 @@ async fn shutdown_signal() {
     log("[shutdown] signal received, stopping");
 }
 
-// ---------------- last_seen_at ----------------
+// ---------------- background tasks ----------------
 
 /// Writes changed `last_seen_at` values every `LAST_SEEN_FLUSH_INTERVAL_MS`.
 async fn flush_loop(state: AppState) {
@@ -191,19 +272,20 @@ async fn flush_loop(state: AppState) {
     interval.tick().await; // the first tick is immediate
     loop {
         interval.tick().await;
-        flush_last_seen(&state, None);
+        flush_last_seen(&state, None).await;
     }
 }
 
 /// Writes changed `last_seen_at` values (all, or just `only`'s) to SQLite
 /// in one transaction. A client whose row has gone was deleted while
 /// connected, so its connection is closed.
-fn flush_last_seen(state: &AppState, only: Option<&str>) {
+pub async fn flush_last_seen(state: &AppState, only: Option<&str>) {
     let rows = state.live.take_dirty(only);
     if rows.is_empty() {
         return;
     }
-    match db::write_last_seen(&state.db, &rows) {
+    let to_write = rows.clone();
+    match state.db.call(move |c| db::write_last_seen(c, &to_write)).await {
         Ok(missing) => {
             debug(|| format!("[last_seen] flushed {} row(s)", rows.len()));
             for client_id in missing {
@@ -218,498 +300,151 @@ fn flush_last_seen(state: &AppState, only: Option<&str>) {
     }
 }
 
-// ---------------- enrollment ----------------
+const CLEANUP_INTERVAL: Duration = Duration::from_secs(600);
+const RETENTION_INTERVAL: Duration = Duration::from_secs(86_400);
 
-async fn enroll(State(state): State<AppState>, Json(req): Json<EnrollRequest>) -> impl IntoResponse {
-    let client_id = Uuid::new_v4().to_string();
-    match db::try_enroll(&state.db, &req.pairing_code, &client_id, &req.public_key, &req.hostname) {
-        Ok(db::EnrollOutcome::Enrolled) => {
-            log(format!("[enroll] new client {client_id} ({})", req.hostname));
-            (StatusCode::OK, Json(EnrollResponse { client_id })).into_response()
-        }
-        Ok(db::EnrollOutcome::InvalidCode) => (
-            StatusCode::FORBIDDEN,
-            Json(EnrollError {
-                error: "invalid or expired pairing code".into(),
-            }),
-        )
-            .into_response(),
-        Err(e) => {
-            log(format!("[enroll] error: {e:#}"));
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(EnrollError {
-                    error: "internal error".into(),
-                }),
-            )
-                .into_response()
-        }
-    }
-}
-
-// ---------------- admin / dashboard-facing endpoints ----------------
-// No auth at this layer yet, deliberately — Cloudflare Access sits in
-// front of the whole origin per the agreed plan. Revisit if this server
-// is ever reachable any other way.
-
-#[derive(Serialize)]
-struct PairingCodeResponse {
-    code: String,
-}
-
-async fn create_pairing_code(State(state): State<AppState>) -> impl IntoResponse {
-    let code = random_code();
-    let ttl_secs = i64::try_from(state.settings.pairing_code_ttl_secs).unwrap_or(i64::MAX);
-    match db::create_pairing_code(&state.db, ttl_secs, &code) {
-        Ok(()) => {
-            log(format!("[admin] pairing code generated: {code}"));
-            Json(PairingCodeResponse { code }).into_response()
-        }
-        Err(e) => {
-            log(format!("[admin] error generating pairing code: {e:#}"));
-            StatusCode::INTERNAL_SERVER_ERROR.into_response()
+/// Expired sessions and reset links, old pairing codes and rate-limit
+/// entries every few minutes; old conversations daily when
+/// `CHAT_RETENTION_DAYS` is set.
+async fn cleanup_loop(state: AppState) {
+    let mut cleanup = tokio::time::interval(CLEANUP_INTERVAL);
+    cleanup.set_missed_tick_behavior(MissedTickBehavior::Delay);
+    let mut retention = tokio::time::interval(RETENTION_INTERVAL);
+    retention.set_missed_tick_behavior(MissedTickBehavior::Delay);
+    loop {
+        tokio::select! {
+            _ = cleanup.tick() => {
+                let idle = state.settings.auth.session_idle_timeout;
+                let result = state
+                    .db
+                    .call(move |c| {
+                        let now = SystemTime::now();
+                        let (sessions, resets) = auth::store::delete_expired(c, now, now - idle)?;
+                        let codes = db::delete_old_pairing_codes(c)?;
+                        Ok((sessions, resets, codes))
+                    })
+                    .await;
+                match result {
+                    Ok((s, r, p)) => debug(|| format!("[cleanup] removed {s} session(s), {r} reset link(s), {p} pairing code(s)")),
+                    Err(e) => log(format!("[cleanup] error: {e:#}")),
+                }
+                state.auth.prune();
+            }
+            _ = retention.tick() => {
+                let days = state.settings.chat.retention_days;
+                if days == 0 {
+                    continue;
+                }
+                let cutoff = db::ts(SystemTime::now() - Duration::from_secs(days.saturating_mul(86_400)));
+                match state.db.call(move |c| conversations::delete_older_than(c, &cutoff)).await {
+                    Ok(0) => {}
+                    Ok(n) => log(format!("[retention] deleted {n} conversation(s) not updated in {days} day(s)")),
+                    Err(e) => log(format!("[retention] error: {e:#}")),
+                }
+            }
         }
     }
 }
 
-#[derive(Serialize)]
-struct PairingStatusResponse {
-    used: bool,
-    claimed_by: Option<ClaimedClient>,
-}
+// ---------------- CLI subcommands ----------------
 
-#[derive(Serialize)]
-struct ClaimedClient {
-    client_id: String,
-    hostname: String,
-}
-
-/// Polled by the "Add client" modal: once `claimed_by` is populated, the
-/// modal swaps from showing the code to showing the new client's info.
-async fn pairing_code_status(State(state): State<AppState>, Path(code): Path<String>) -> impl IntoResponse {
-    match db::pairing_code_status(&state.db, &code) {
-        Ok(Some((used, Some(client_id)))) => {
-            let claimed_by = db::get_client(&state.db, &client_id)
-                .ok()
-                .flatten()
-                .map(|c| ClaimedClient {
-                    client_id: c.client_id,
-                    hostname: c.hostname,
-                });
-            Json(PairingStatusResponse { used, claimed_by }).into_response()
-        }
-        Ok(Some((used, None))) => Json(PairingStatusResponse { used, claimed_by: None }).into_response(),
-        Ok(None) => StatusCode::NOT_FOUND.into_response(),
-        Err(e) => {
-            log(format!("[admin] error checking pairing code status: {e:#}"));
-            StatusCode::INTERNAL_SERVER_ERROR.into_response()
-        }
-    }
-}
-
-/// The dashboard's runtime settings (graph look, poll intervals), so
-/// changing them needs a server restart rather than a frontend rebuild.
-async fn dashboard_config(State(state): State<AppState>) -> impl IntoResponse {
-    Json(state.settings.dashboard.clone())
-}
-
-#[derive(Serialize)]
-struct ClientsResponse {
-    /// Random per server start; a change means `seq` numbering restarted.
-    epoch: String,
-    /// The newest sample seq across all clients; the next poll's `since`.
-    latest_seq: u64,
-    clients: Vec<ClientListEntry>,
-}
-
-#[derive(Serialize)]
-struct ClientListEntry {
-    client_id: String,
-    hostname: String,
-    /// What the dashboard displays: set by the user, or the hostname.
-    friendly_name: String,
-    enrolled_at: String,
-    last_seen_at: Option<String>,
-    connected: bool,
-    /// The rest come from the client's `info` message, so they're null
-    /// until the client has connected at least once.
-    os: Option<String>,
-    client_version: Option<String>,
-    specs: Option<HardwareSpecs>,
-    info_updated_at: Option<String>,
-    /// Samples newer than `since`, oldest first. Empty when disconnected.
-    samples: Vec<Sample>,
-}
-
-#[derive(Deserialize)]
-struct ClientsQuery {
-    since: Option<u64>,
-}
-
-async fn list_clients(State(state): State<AppState>, Query(query): Query<ClientsQuery>) -> impl IntoResponse {
-    match db::list_clients(&state.db) {
-        Ok(rows) => {
-            let mut snapshot = state.live.snapshot(query.since.unwrap_or(0));
-            let clients = rows
-                .into_iter()
-                .map(|r| {
-                    let samples = snapshot.connected.remove(&r.client_id);
-                    ClientListEntry {
-                        connected: samples.is_some(),
-                        samples: samples.unwrap_or_default(),
-                        last_seen_at: snapshot.last_seen.remove(&r.client_id).or(r.last_seen_at),
-                        client_id: r.client_id,
-                        hostname: r.hostname,
-                        friendly_name: r.friendly_name,
-                        enrolled_at: r.enrolled_at,
-                        os: r.os,
-                        client_version: r.client_version,
-                        specs: r.specs_json.and_then(|json| serde_json::from_str(&json).ok()),
-                        info_updated_at: r.info_updated_at,
-                    }
-                })
-                .collect();
-            Json(ClientsResponse {
-                epoch: state.live.epoch.clone(),
-                latest_seq: snapshot.latest_seq,
-                clients,
-            })
-            .into_response()
-        }
-        Err(e) => {
-            log(format!("[clients] error: {e:#}"));
-            StatusCode::INTERNAL_SERVER_ERROR.into_response()
-        }
-    }
-}
-
-const MAX_FRIENDLY_NAME_CHARS: usize = 64;
-
-#[derive(Deserialize)]
-struct UpdateClientRequest {
-    /// Blank or null resets to the hostname.
-    friendly_name: Option<String>,
-}
-
-async fn update_client(
-    State(state): State<AppState>,
-    Path(client_id): Path<String>,
-    Json(req): Json<UpdateClientRequest>,
-) -> impl IntoResponse {
-    let name = req.friendly_name.as_deref().map(str::trim).filter(|n| !n.is_empty());
-    if name.is_some_and(|n| n.chars().count() > MAX_FRIENDLY_NAME_CHARS) {
-        return (
-            StatusCode::BAD_REQUEST,
-            format!("friendly_name is longer than {MAX_FRIENDLY_NAME_CHARS} characters"),
-        )
-            .into_response();
-    }
-    match db::set_friendly_name(&state.db, &client_id, name) {
-        Ok(true) => {
-            log(format!("[admin] {client_id} friendly name set to {name:?}"));
-            StatusCode::NO_CONTENT.into_response()
-        }
-        Ok(false) => StatusCode::NOT_FOUND.into_response(),
-        Err(e) => {
-            log(format!("[admin] error renaming {client_id}: {e:#}"));
-            StatusCode::INTERNAL_SERVER_ERROR.into_response()
-        }
-    }
-}
-
-/// Removes the client from the database and closes its socket if it's
-/// connected. It then reconnects, gets `unknown_client`, and clears its
-/// own identity.
-async fn delete_client(State(state): State<AppState>, Path(client_id): Path<String>) -> impl IntoResponse {
-    match db::delete_client(&state.db, &client_id) {
-        Ok(true) => {
-            state.live.forget(&client_id);
-            log(format!("[admin] client {client_id} deleted"));
-            StatusCode::NO_CONTENT.into_response()
-        }
-        Ok(false) => StatusCode::NOT_FOUND.into_response(),
-        Err(e) => {
-            log(format!("[admin] error deleting {client_id}: {e:#}"));
-            StatusCode::INTERNAL_SERVER_ERROR.into_response()
-        }
-    }
-}
-
-// ---------------- WebSocket: challenge-response, then ticks ----------------
-
-async fn ws_upgrade(ws: WebSocketUpgrade, State(state): State<AppState>) -> impl IntoResponse {
-    ws.on_upgrade(move |socket| handle_socket(socket, state))
-}
-
-async fn send(socket: &mut WebSocket, msg: &ServerMessage) -> bool {
-    let Ok(text) = serde_json::to_string(msg) else {
-        return false;
+/// `delegation-server reset-admin-password`, e.g. through
+/// `docker compose exec delegation-server delegation-server reset-admin-password`.
+fn reset_admin_password(settings: &Settings) -> ExitCode {
+    let Some(db) = open_db(settings) else {
+        return ExitCode::FAILURE;
     };
-    socket.send(Message::Text(text)).await.is_ok()
-}
-
-/// Waits for the next text message and parses it, with a timeout — used
-/// only during the handshake, before we're tracking the connection as
-/// authenticated at all.
-async fn recv_within(socket: &mut WebSocket, timeout: Duration) -> Option<ClientMessage> {
-    let msg = tokio::time::timeout(timeout, socket.recv()).await.ok()??;
-    let Message::Text(text) = msg.ok()? else { return None };
-    serde_json::from_str(&text).ok()
-}
-
-async fn handle_socket(mut socket: WebSocket, state: AppState) {
-    let auth_timeout = state.settings.auth_timeout;
-    let Some(ClientMessage::Hello { client_id }) = recv_within(&mut socket, auth_timeout).await else {
-        log("[ws] handshake timed out or malformed hello, closing");
-        return;
-    };
-
-    let Ok(Some(record)) = db::get_client(&state.db, &client_id) else {
-        log(format!("[ws] unknown client_id {client_id}"));
-        send(
-            &mut socket,
-            &ServerMessage::AuthFailed {
-                reason: AuthFailedReason::UnknownClient,
-            },
-        )
-        .await;
-        return;
-    };
-
-    let mut nonce = [0u8; 16];
-    rand::thread_rng().fill(&mut nonce);
-    if !send(
-        &mut socket,
-        &ServerMessage::Challenge {
-            nonce: STANDARD.encode(nonce),
-        },
-    )
-    .await
-    {
-        return;
-    }
-
-    let Some(ClientMessage::ChallengeResponse { signature }) = recv_within(&mut socket, auth_timeout).await else {
-        log(format!("[ws] {client_id} didn't respond to challenge in time"));
-        return;
-    };
-
-    let valid = (|| -> Option<bool> {
-        let pubkey_bytes: [u8; 32] = STANDARD.decode(&record.public_key).ok()?.try_into().ok()?;
-        let verifying_key = VerifyingKey::from_bytes(&pubkey_bytes).ok()?;
-        let sig_bytes: [u8; 64] = STANDARD.decode(&signature).ok()?.try_into().ok()?;
-        let sig = Signature::from_bytes(&sig_bytes);
-        Some(verifying_key.verify(&nonce, &sig).is_ok())
-    })()
-    .unwrap_or(false);
-
-    if !valid {
-        log(format!("[ws] bad signature from {client_id}"));
-        send(
-            &mut socket,
-            &ServerMessage::AuthFailed {
-                reason: AuthFailedReason::BadSignature,
-            },
-        )
-        .await;
-        return;
-    }
-
-    if !send(
-        &mut socket,
-        &ServerMessage::Welcome {
-            settings: state.settings.client,
-        },
-    )
-    .await
-    {
-        return;
-    }
-    log(format!("[ws] client {client_id} authenticated"));
-    let mut conn = state.live.register(&client_id);
-    let conn_id = conn.id;
-    let mut session = Session {
-        state: &state,
-        client_id: &client_id,
-        hostname: record.hostname,
-        conn: &mut conn,
-        next_seq: 0,
-    };
-    let reason = session.run(&mut socket).await;
-
-    state.live.unregister(&client_id, conn_id);
-    state.chats.fail_conn(conn_id, "the client disconnected");
-    flush_last_seen(&state, Some(&client_id));
-    log(format!("[ws] client {client_id} disconnected: {reason}"));
-}
-
-/// One authenticated connection.
-struct Session<'a> {
-    state: &'a AppState,
-    client_id: &'a str,
-    /// For log lines only; updated when the client reports a new name.
-    hostname: String,
-    conn: &'a mut ConnHandle,
-    /// The tick seq we expect next, to log drops at debug level.
-    next_seq: u64,
-}
-
-impl Session<'_> {
-    /// Runs until the connection should end; returns why, for the log.
-    async fn run(&mut self, socket: &mut WebSocket) -> String {
-        let settings = &self.state.settings;
-        let liveness_timeout = settings.liveness_timeout;
-        let mut last_inbound = Instant::now();
-
-        // Checks liveness at least once per tick interval.
-        let mut watchdog = tokio::time::interval(settings.client.tick_interval());
-        watchdog.set_missed_tick_behavior(MissedTickBehavior::Delay);
-        // Pings let the client tell a dead server from a quiet one; its
-        // WebSocket library answers them with pongs automatically.
-        let mut ping = tokio::time::interval(settings.ws_ping_interval);
-        ping.set_missed_tick_behavior(MissedTickBehavior::Delay);
-        ping.tick().await; // the first tick is immediate
-
-        loop {
-            tokio::select! {
-                _ = self.conn.kick.notified() => {
-                    let _ = tokio::time::timeout(Duration::from_secs(1), socket.send(Message::Close(None))).await;
-                    return "closed by the server (deleted, or replaced by a newer connection)".into();
-                }
-                _ = watchdog.tick() => {
-                    let silent = last_inbound.elapsed();
-                    if silent >= liveness_timeout {
-                        return format!("no frame for {} ms, timed out", silent.as_millis());
-                    }
-                }
-                _ = ping.tick() => {
-                    // Bounded, so a peer that stopped reading can't wedge
-                    // this loop (and with it the watchdog).
-                    match tokio::time::timeout(liveness_timeout, socket.send(Message::Ping(Vec::new()))).await {
-                        Ok(Ok(())) => {}
-                        Ok(Err(e)) => return format!("ping failed: {e}"),
-                        Err(_) => return "ping send timed out".into(),
-                    }
-                }
-                // Chat requests and cancels queued by HTTP handlers.
-                Some(out) = self.conn.outbound.recv() => {
-                    let Ok(text) = serde_json::to_string(&out) else { continue };
-                    match tokio::time::timeout(liveness_timeout, socket.send(Message::Text(text))).await {
-                        Ok(Ok(())) => {}
-                        Ok(Err(e)) => return format!("send failed: {e}"),
-                        Err(_) => return "send timed out".into(),
-                    }
-                }
-                msg = socket.recv() => {
-                    let msg = match msg {
-                        Some(Ok(msg)) => msg,
-                        Some(Err(e)) => return format!("websocket error: {e}"),
-                        None => return "connection closed".into(),
-                    };
-                    // Any frame at all is proof of life: ticks, pongs, even
-                    // ones that fail to parse.
-                    last_inbound = Instant::now();
-                    self.state.live.touch(self.client_id);
-                    match msg {
-                        Message::Text(text) => self.on_text(&text),
-                        Message::Close(_) => return "client closed the connection".into(),
-                        // Pongs only matter for liveness; pings are answered
-                        // by axum.
-                        Message::Ping(_) | Message::Pong(_) | Message::Binary(_) => {}
-                    }
-                }
-            }
-        }
-    }
-
-    fn on_text(&mut self, text: &str) {
-        let client_id = self.client_id;
-        match serde_json::from_str::<ClientMessage>(text) {
-            Ok(ClientMessage::Tick(tick)) => self.on_tick(tick),
-            Ok(ClientMessage::Info {
-                hostname,
-                os,
-                client_version,
-                specs,
-            }) => {
-                let specs_json = serde_json::to_string(&specs).unwrap_or_else(|_| "{}".into());
-                match db::update_client_info(&self.state.db, client_id, &hostname, &os, &client_version, &specs_json) {
-                    Ok(()) => log(format!(
-                        "[info] {client_id} ({hostname}): {os}, client {client_version}"
-                    )),
-                    Err(e) => log(format!("[info] error saving info for {client_id}: {e:#}")),
-                }
-                self.hostname = hostname;
-            }
-            Ok(ClientMessage::Models { models }) => {
-                let ids: Vec<&str> = models.iter().map(|m| m.id.as_str()).collect();
-                log(format!("[models] {client_id} ({}): {}", self.hostname, ids.join(", ")));
-                self.state.live.set_models(client_id, self.conn.id, models);
-            }
-            Ok(ClientMessage::ChatChunk { request_id, delta }) => {
-                self.deliver_chat(&request_id, ChatEvent::Chunk(delta))
-            }
-            Ok(ClientMessage::ChatDone { request_id }) => {
-                debug(|| format!("[chat] {request_id} done"));
-                self.deliver_chat(&request_id, ChatEvent::Done)
-            }
-            Ok(ClientMessage::ChatError { request_id, error }) => {
-                log(format!("[chat] {request_id} failed on {client_id}: {error}"));
-                self.deliver_chat(&request_id, ChatEvent::Error(error))
-            }
-            Ok(ClientMessage::Hello { .. } | ClientMessage::ChallengeResponse { .. }) => {
-                log(format!("[ws] unexpected handshake message from {client_id}"))
-            }
-            Err(e) => debug(|| format!("[ws] unparseable message from {client_id}: {e}")),
-        }
-    }
-
-    fn deliver_chat(&self, request_id: &str, event: ChatEvent) {
-        if !self.state.chats.deliver(self.conn.id, request_id, event) {
-            // Normal after a cancel: chunks already in flight still arrive.
-            debug(|| {
-                format!(
-                    "[chat] {} sent a reply for unknown request {request_id}",
-                    self.client_id
-                )
-            });
-        }
-    }
-
-    fn on_tick(&mut self, Tick { seq, metrics }: Tick) {
-        let (client_id, hostname) = (self.client_id, &self.hostname);
-        if seq != self.next_seq {
-            debug(|| {
-                format!(
-                    "[tick] {client_id} ({hostname}): expected seq {}, got {seq}",
-                    self.next_seq
-                )
-            });
-        }
-        self.next_seq = seq.wrapping_add(1);
-        let Some(metrics) = metrics else {
-            debug(|| format!("[tick] {client_id} ({hostname}) seq {seq}: no metrics"));
-            return;
+    let admin = match db.blocking(|c| {
+        let Some(id) = auth::store::admin_id(c)? else {
+            return Ok(None);
         };
-        let age = metrics.sample_age_ms;
-        match self
-            .state
-            .live
-            .record_sample(client_id, self.conn.id, metrics, Instant::now())
-        {
-            SampleOutcome::Accepted { seq: sample_seq } => {
-                debug(|| format!("[tick] {client_id} ({hostname}) seq {seq}: sample {sample_seq}, {age} ms old"))
-            }
-            SampleOutcome::Rejected(reason) => {
-                debug(|| format!("[tick] {client_id} ({hostname}) seq {seq}: sample dropped: {reason}"))
-            }
-            SampleOutcome::NotConnected => {}
+        auth::store::find_by_id(c, &id)
+    }) {
+        Ok(Some(admin)) => admin.user,
+        Ok(None) => {
+            eprintln!(
+                "No admin account exists yet. Start the server and create one at /setup with the token from its log."
+            );
+            return ExitCode::FAILURE;
         }
+        Err(e) => {
+            eprintln!("error: {e:#}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let password = match read_new_password(&admin.username) {
+        Ok(password) => password,
+        Err(e) => {
+            eprintln!("error: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    if let Err(e) = auth::validate_password(settings, &password) {
+        eprintln!("error: {}", e.message);
+        return ExitCode::FAILURE;
+    }
+    let hash = match auth::password::Hasher::new(settings.auth.argon2).and_then(|h| h.hash_blocking(&password)) {
+        Ok(hash) => hash,
+        Err(e) => {
+            eprintln!("error: {e:#}");
+            return ExitCode::FAILURE;
+        }
+    };
+    if let Err(e) = db.blocking(|c| auth::store::set_password(c, &admin.id, &hash, None)) {
+        eprintln!("error: {e:#}");
+        return ExitCode::FAILURE;
+    }
+    println!(
+        "Password updated for {}. Every one of their sessions was signed out \
+         (a running server stops accepting them within a few seconds).",
+        admin.username
+    );
+    ExitCode::SUCCESS
+}
+
+/// Prompts twice on a terminal; otherwise reads one line from stdin.
+fn read_new_password(username: &str) -> Result<String, String> {
+    if std::io::stdin().is_terminal() {
+        let first = rpassword::prompt_password(format!("New password for {username}: ")).map_err(|e| e.to_string())?;
+        let second = rpassword::prompt_password("Again: ").map_err(|e| e.to_string())?;
+        if first != second {
+            return Err("the passwords don't match".into());
+        }
+        Ok(first)
+    } else {
+        let mut line = String::new();
+        std::io::stdin()
+            .lock()
+            .read_line(&mut line)
+            .map_err(|e| e.to_string())?;
+        Ok(line.trim_end_matches(['\n', '\r']).to_string())
     }
 }
 
-fn random_code() -> String {
-    const CHARS: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
-    let mut rng = rand::thread_rng();
-    (0..8).map(|_| CHARS[rng.gen_range(0..CHARS.len())] as char).collect()
+/// `delegation-server backup [FILE]`: `VACUUM INTO`, safe while the server
+/// is running.
+fn backup(settings: &Settings, dest: Option<&str>) -> ExitCode {
+    let Some(db) = open_db(settings) else {
+        return ExitCode::FAILURE;
+    };
+    let dest = dest.map(str::to_string).unwrap_or_else(|| {
+        let dir = std::path::Path::new(&settings.db_path)
+            .parent()
+            .unwrap_or(std::path::Path::new("."));
+        let stamp = protocol::ts().replace(':', "");
+        dir.join(format!("delegation-backup-{stamp}.db"))
+            .to_string_lossy()
+            .into_owned()
+    });
+    match db.blocking(|c| db::backup(c, &dest)) {
+        Ok(()) => {
+            let size = std::fs::metadata(&dest).map(|m| m.len()).unwrap_or(0);
+            println!("Backup written to {dest} ({size} bytes)");
+            ExitCode::SUCCESS
+        }
+        Err(e) => {
+            eprintln!("error: {e:#}");
+            ExitCode::FAILURE
+        }
+    }
 }

@@ -15,8 +15,17 @@ services:
     env_file:
       - path: ../config.env
         required: false
-    # Localhost-only so the admin endpoints (unauthenticated) aren't
-    # exposed to the LAN. Lets you curl it and point a native client at it.
+    # Plain http on localhost: no Secure cookie, no Cloudflare in front, and
+    # state-changing requests from the built dashboard (:7070) and the Vite
+    # dev server (:5173) both pass the Origin check. These override
+    # config.env.
+    environment:
+      PUBLIC_ORIGIN: http://127.0.0.1:7070
+      EXTRA_ALLOWED_ORIGINS: http://localhost:7070,http://localhost:5173,http://127.0.0.1:5173
+      COOKIE_SECURE: "false"
+      TRUST_CF_CONNECTING_IP: "false"
+    # Localhost-only, so the dev stack isn't exposed to the LAN. Lets you
+    # curl it and point a native client at it.
     ports:
       - "127.0.0.1:7070:7070"
     volumes:

@@ -1,58 +1,92 @@
-// Chat data model, kept independent of any transport so the UI doesn't care
-// whether a reply comes from a client echo, a real LLM, or a stream.
-
-export type Role = 'user' | 'assistant'
+// Chat data, mirroring server/src/conversations.rs, replies.rs and chat.rs.
 
 /**
- * `pending`: sent, waiting on (or still streaming) a reply.
- * `error`: the send or the reply failed; `error` says why.
+ * A message's state; the same as `MessageStatus` on the server. User
+ * messages are always `completed`. A reply goes `queued` (created) ->
+ * `assigned` (sent to a client) -> `running` (first piece arrived) -> one of
+ * `completed`, `failed`, `cancelled` (Stop) or `orphaned` (its client went
+ * away mid-reply; the partial text is kept).
  */
-export type MessageStatus = 'done' | 'pending' | 'error'
+export type MessageStatus = 'queued' | 'assigned' | 'running' | 'completed' | 'failed' | 'cancelled' | 'orphaned'
+
+export type Role = 'system' | 'user' | 'assistant'
 
 export interface ChatMessage {
   id: string
+  conversation_id: string
+  /** Null for a first message. Siblings (same parent) are alternative branches. */
+  parent_id: string | null
   role: Role
   content: string
-  /** ISO timestamp. */
-  createdAt: string
   status: MessageStatus
-  error?: string
+  error: string | null
+  attempts: number
+  /** Null once the client that answered has been deleted. */
+  client_id: string | null
+  /** The client's name when it answered, kept after it's deleted. */
+  client_label: string | null
+  model: string | null
+  created_at: string
+  completed_at: string | null
 }
 
-export interface Conversation {
+export interface ConversationSummary {
   id: string
   title: string
-  /** ISO timestamp of the latest message; the sidebar sorts on it. */
-  updatedAt: string
+  /** The message whose branch is shown. */
+  active_leaf_id: string | null
+  created_at: string
+  /** The sidebar sorts on it. */
+  updated_at: string
+}
+
+export interface Conversation extends ConversationSummary {
+  /** Every message, oldest first; the dashboard works out branches itself. */
   messages: ChatMessage[]
 }
 
-/** One entry in the model picker: a model offered by a connected client. */
-export interface ModelOption {
-  /** `${clientId}/${model}`: unique across clients offering the same model. */
-  id: string
-  clientId: string
-  model: string
-  /** The model name. */
-  label: string
-  /** Secondary line: which client hosts it. */
-  detail?: string
+/** `GET /api/conversations`. */
+export interface ConversationPage {
+  conversations: ConversationSummary[]
+  /** Pass as `before` for the next page; null on the last one. */
+  next_before: string | null
 }
 
-// ---- wire types: mirror server/src/chat.rs and protocol/src/chat.rs ----
-
-/** One message of the history sent with a request. */
-export interface ChatTurn {
-  role: Role
-  content: string
-}
-
-/** `POST /api/chat` body. `messages` is the whole conversation, ending with the new message. */
-export interface ChatRequest {
+/** Who should answer. Only `client` exists for now. */
+export interface Target {
+  kind: 'client'
   client_id: string
   model: string
-  messages: ChatTurn[]
 }
+
+/** `POST /api/conversations/:id/messages`. Leave out `content` to regenerate the reply to `parent_id`. */
+export interface SendRequest {
+  content?: string
+  parent_id: string | null
+  target: Target
+}
+
+/** Who is answering a reply, as `snapshot` and `status` events carry it. */
+interface Answerer {
+  client_id: string | null
+  client_label: string | null
+  model: string | null
+}
+
+/** The server-sent events of a reply stream. */
+export type ReplyEvent =
+  | {
+      type: 'created'
+      /** Set when the send created the conversation. */
+      conversation?: ConversationSummary | null
+      /** Null when regenerating or retrying. */
+      user_message?: ChatMessage | null
+      reply: ChatMessage
+    }
+  | ({ type: 'snapshot'; message_id: string; status: MessageStatus; content: string; error: string | null } & Answerer)
+  | ({ type: 'status'; status: MessageStatus } & Answerer)
+  | { type: 'chunk'; delta: string }
+  | { type: 'end'; status: MessageStatus; error: string | null }
 
 /** One entry of `GET /api/chat/models`. */
 export interface ChatModel {
@@ -60,4 +94,15 @@ export interface ChatModel {
   /** The client's friendly name (or hostname). */
   client_name: string
   model: string
+}
+
+/** One entry in a model picker. */
+export interface ModelOption {
+  /** `${clientId}/${model}`: unique across clients offering the same model. */
+  id: string
+  target: Target
+  /** The model name. */
+  label: string
+  /** Secondary line: which client hosts it. */
+  detail: string
 }
