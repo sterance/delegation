@@ -1,6 +1,6 @@
 # Builds the Windows tray client and its installer. ci.yml calls this after
 # its checks pass, for PRs and pushes to main; it can also be run by hand, which
-# skips CI. Pushes to main also sign both through SignPath (once it's set up:
+# skips CI. Pushes to main also sign both (see "Signing" below and
 # installer/SIGNING.md) and publish them as a GitHub Release (tag
 # v<APP_VERSION>), marked latest; for PRs and manual runs, download the
 # unsigned builds from the run's "Artifacts" section instead.
@@ -10,6 +10,10 @@ on:
   workflow_call:
     secrets:
       SIGNPATH_API_TOKEN:
+        required: false
+      SELF_SIGN_PFX_BASE64:
+        required: false
+      SELF_SIGN_PFX_PASSWORD:
         required: false
   workflow_dispatch:
 
@@ -25,13 +29,17 @@ jobs:
       contents: read
       actions: read
     outputs:
-      signed: ${{ steps.signing.outputs.signed }}
+      signing: ${{ steps.signing.outputs.mode }}
+      thumbprint: ${{ steps.self-sign-tray.outputs.thumbprint }}
     env:
       APP_VERSION: 0.1.0.${{ github.run_number }}
-      # Only pushes to main are signed (never PR code), and only once the
-      # SignPath variables exist. Signing policies with manual approval
-      # wait here until someone approves in SignPath.
-      SIGN: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' && vars.SIGNPATH_ORGANIZATION_ID != '' }}
+      # How releases are signed: the repository variable WINDOWS_SIGNING,
+      #   signpath     through SignPath (SIGNPATH_* variables and token)
+      #   self-signed  with the certificate in SELF_SIGN_PFX_* (made by
+      #                installer/make-self-signed-cert.sh)
+      # and unsigned when it's unset. Only pushes to main are ever signed
+      # (never PR code); everything else is "none".
+      SIGNING: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' && vars.WINDOWS_SIGNING || 'none' }}
     steps:
       - uses: actions/checkout@v7
       # Same version as rust-toolchain.toml.
@@ -60,13 +68,17 @@ jobs:
         id: signing
         shell: pwsh
         run: |
-          "signed=$env:SIGN" >> $env:GITHUB_OUTPUT
-          if ($env:SIGN -ne 'true') { Write-Output "Not signing: only pushes to main are signed, once SIGNPATH_ORGANIZATION_ID is set." }
+          $modes = 'none', 'signpath', 'self-signed'
+          if ($env:SIGNING -notin $modes) { throw "WINDOWS_SIGNING is '$env:SIGNING'; use signpath or self-signed, or delete it." }
+          "mode=$env:SIGNING" >> $env:GITHUB_OUTPUT
+          Write-Output "Signing: $env:SIGNING"
 
       # ---- Sign the tray exe first, so the installer packages the signed one ----
+
+      # SignPath
       - name: Upload unsigned tray exe
         id: unsigned-tray
-        if: env.SIGN == 'true'
+        if: env.SIGNING == 'signpath'
         uses: actions/upload-artifact@v7
         with:
           name: unsigned-tray
@@ -74,8 +86,8 @@ jobs:
           if-no-files-found: error
           retention-days: 1
 
-      - name: Sign tray exe
-        if: env.SIGN == 'true'
+      - name: Sign tray exe (SignPath)
+        if: env.SIGNING == 'signpath'
         uses: signpath/github-action-submit-signing-request@v3
         with:
           api-token: ${{ secrets.SIGNPATH_API_TOKEN }}
@@ -88,11 +100,27 @@ jobs:
           wait-for-completion-timeout-in-seconds: 3600
           output-artifact-directory: signed/tray
 
-      - name: Use the signed tray exe
-        if: env.SIGN == 'true'
+      - name: Use the SignPath-signed tray exe
+        if: env.SIGNING == 'signpath'
+        shell: pwsh
+        run: Copy-Item signed\tray\delegation-tray.exe target\release\delegation-tray.exe -Force
+
+      # Self-signed
+      - name: Sign tray exe (self-signed)
+        id: self-sign-tray
+        if: env.SIGNING == 'self-signed'
+        shell: pwsh
+        env:
+          SELF_SIGN_PFX_BASE64: ${{ secrets.SELF_SIGN_PFX_BASE64 }}
+          SELF_SIGN_PFX_PASSWORD: ${{ secrets.SELF_SIGN_PFX_PASSWORD }}
+        run: |
+          New-Item -ItemType Directory -Force installer\Output | Out-Null
+          ./installer/self-sign.ps1 -Path target\release\delegation-tray.exe -ExportCer installer\Output\DelegationTray-signing-certificate.cer
+
+      - name: Check tray exe signature
+        if: env.SIGNING != 'none'
         shell: pwsh
         run: |
-          Copy-Item signed\tray\delegation-tray.exe target\release\delegation-tray.exe -Force
           $sig = Get-AuthenticodeSignature target\release\delegation-tray.exe
           Write-Output "$($sig.Status): $($sig.SignerCertificate.Subject)"
           if ($sig.Status -ne 'Valid') { exit 1 }
@@ -111,9 +139,11 @@ jobs:
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
       # ---- Then the installer itself ----
+
+      # SignPath
       - name: Upload unsigned installer
         id: unsigned-installer
-        if: env.SIGN == 'true'
+        if: env.SIGNING == 'signpath'
         uses: actions/upload-artifact@v7
         with:
           name: unsigned-installer
@@ -121,8 +151,8 @@ jobs:
           if-no-files-found: error
           retention-days: 1
 
-      - name: Sign installer
-        if: env.SIGN == 'true'
+      - name: Sign installer (SignPath)
+        if: env.SIGNING == 'signpath'
         uses: signpath/github-action-submit-signing-request@v3
         with:
           api-token: ${{ secrets.SIGNPATH_API_TOKEN }}
@@ -134,13 +164,27 @@ jobs:
           wait-for-completion-timeout-in-seconds: 3600
           output-artifact-directory: signed/installer
 
-      - name: Use the signed installer
-        if: env.SIGN == 'true'
+      - name: Use the SignPath-signed installer
+        if: env.SIGNING == 'signpath'
         shell: pwsh
         run: |
           $name = "DelegationTray-Setup-$env:APP_VERSION.exe"
           Copy-Item "signed\installer\$name" "installer\Output\$name" -Force
-          $sig = Get-AuthenticodeSignature "installer\Output\$name"
+
+      # Self-signed
+      - name: Sign installer (self-signed)
+        if: env.SIGNING == 'self-signed'
+        shell: pwsh
+        env:
+          SELF_SIGN_PFX_BASE64: ${{ secrets.SELF_SIGN_PFX_BASE64 }}
+          SELF_SIGN_PFX_PASSWORD: ${{ secrets.SELF_SIGN_PFX_PASSWORD }}
+        run: ./installer/self-sign.ps1 -Path "installer\Output\DelegationTray-Setup-$env:APP_VERSION.exe"
+
+      - name: Check installer signature
+        if: env.SIGNING != 'none'
+        shell: pwsh
+        run: |
+          $sig = Get-AuthenticodeSignature "installer\Output\DelegationTray-Setup-$env:APP_VERSION.exe"
           Write-Output "$($sig.Status): $($sig.SignerCertificate.Subject)"
           if ($sig.Status -ne 'Valid') { exit 1 }
 
@@ -161,6 +205,15 @@ jobs:
           path: installer/Output/DelegationTray-${{ env.APP_VERSION }}-portable.exe
           if-no-files-found: error
 
+      # Self-signed releases include the public certificate, for anyone who
+      # wants to check signatures against it or trust it.
+      - uses: actions/upload-artifact@v7
+        if: env.SIGNING == 'self-signed'
+        with:
+          name: DelegationTray-signing-certificate
+          path: installer/Output/DelegationTray-signing-certificate.cer
+          if-no-files-found: error
+
   # Only pushes to main publish a release: PR builds and manual runs stay as
   # artifacts. Kept as a separate job so the build job (which runs PR code)
   # never gets write access.
@@ -173,7 +226,8 @@ jobs:
     env:
       # Same run, so the same number as the build job's APP_VERSION.
       VERSION: 0.1.0.${{ github.run_number }}
-      SIGNED: ${{ needs.tray.outputs.signed }}
+      SIGNING: ${{ needs.tray.outputs.signing }}
+      THUMBPRINT: ${{ needs.tray.outputs.thumbprint }}
     steps:
       - uses: actions/download-artifact@v8
         with:
@@ -187,16 +241,23 @@ jobs:
         # A re-run keeps the same run_number, so the release may already
         # exist: then replace its files instead of failing on the tag.
         run: |
-          if [ "$SIGNED" = "true" ]; then
-            signing="Free code signing provided by SignPath.io, certificate by SignPath Foundation. Code signing policy: https://github.com/$GITHUB_REPOSITORY#code-signing-policy"
-          else
-            signing="Not code signed: SmartScreen will warn (More info, then Run anyway)."
-          fi
+          policy="Code signing policy: https://github.com/$GITHUB_REPOSITORY#code-signing-policy"
+          case "$SIGNING" in
+            signpath)
+              signing="Free code signing provided by SignPath.io, certificate by SignPath Foundation. $policy" ;;
+            self-signed)
+              signing="Signed with the project's self-signed certificate (SHA-1 thumbprint $THUMBPRINT, included as DelegationTray-signing-certificate.cer). Windows doesn't trust it by default, so SmartScreen still warns (More info, then Run anyway). $policy" ;;
+            *)
+              signing="Not code signed: SmartScreen will warn (More info, then Run anyway)." ;;
+          esac
+          # The certificate is only there for self-signed releases.
+          shopt -s nullglob
+          files=(dist/*.exe dist/*.cer)
           if gh release view "v$VERSION" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
-            gh release upload "v$VERSION" dist/*.exe --repo "$GITHUB_REPOSITORY" --clobber
+            gh release upload "v$VERSION" "${files[@]}" --repo "$GITHUB_REPOSITORY" --clobber
             gh release edit "v$VERSION" --repo "$GITHUB_REPOSITORY" --latest
           else
-            gh release create "v$VERSION" dist/*.exe \
+            gh release create "v$VERSION" "${files[@]}" \
               --repo "$GITHUB_REPOSITORY" \
               --target "$GITHUB_SHA" \
               --title "Delegation tray $VERSION" \

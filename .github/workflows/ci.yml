@@ -53,10 +53,10 @@ jobs:
         run: docker build -f server/Dockerfile -t delegation-server .
 
   # Builds the tray app and installer for PRs and pushes to main (not other
-  # branch pushes); on pushes to main it also signs them (once SignPath is
-  # set up, see installer/SIGNING.md) and publishes a GitHub Release, which
-  # needs contents: write. actions: read lets SignPath fetch the unsigned
-  # files from the run.
+  # branch pushes); on pushes to main it also signs them (as the
+  # WINDOWS_SIGNING variable says, see installer/SIGNING.md) and publishes a
+  # GitHub Release, which needs contents: write. actions: read lets SignPath
+  # fetch the unsigned files from the run.
   windows:
     needs: [rust, frontend, docker]
     if: github.event_name == 'pull_request' || github.ref == 'refs/heads/main'
@@ -64,9 +64,11 @@ jobs:
     permissions:
       contents: write
       actions: read
-    # Only the signing token; the build never sees other secrets.
+    # Only the signing secrets; the build never sees other secrets.
     secrets:
       SIGNPATH_API_TOKEN: ${{ secrets.SIGNPATH_API_TOKEN }}
+      SELF_SIGN_PFX_BASE64: ${{ secrets.SELF_SIGN_PFX_BASE64 }}
+      SELF_SIGN_PFX_PASSWORD: ${{ secrets.SELF_SIGN_PFX_PASSWORD }}
 
   # A called workflow can't have more permissions than its caller grants,
   # so these match deploy.yml's.

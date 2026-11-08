@@ -176,12 +176,16 @@ Signed: the Windows tray app (`delegation-tray.exe`) and its installer
 (`DelegationTray-Setup-<version>.exe`), as published on this repository's
 [Releases](https://github.com/sterance/delegation/releases) page.
 
-Signing starts once the SignPath Foundation accepts the project. Until then,
-releases are unsigned, and their notes say so.
+SignPath signing starts once the SignPath Foundation accepts the project.
+Until then, releases are signed with the project's own self-signed
+certificate. That proves a file is what CI built, but Windows doesn't trust
+the certificate, so it still shows "Unknown publisher". Each release's notes
+say how it was signed, and self-signed releases include the public
+certificate and its thumbprint.
 
-They're built by GitHub Actions from this repository's `main` branch, and
-every signing request is approved by hand. Pull-request builds are never
-signed. The CI and signing setup are in `.github/workflows/windows.yml` and
+Releases are built by GitHub Actions from this repository's `main` branch.
+With SignPath, every signing request is approved by hand. Pull-request
+builds are never signed. The CI and signing setup are in `.github/workflows/windows.yml` and
 `installer/SIGNING.md`.
 
 Team roles. This is a one-person project:
