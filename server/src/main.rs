@@ -128,7 +128,7 @@ fn open_db(settings: &Settings) -> Option<Db> {
     if let Some(parent) = std::path::Path::new(&settings.db_path).parent() {
         std::fs::create_dir_all(parent).ok();
     }
-    match db::open(&settings.db_path) {
+    match db::open(&settings.db_path, settings.db_migration_backups_keep) {
         Ok(db) => Some(db),
         Err(e) => {
             let ts = protocol::ts();
@@ -152,6 +152,11 @@ async fn serve(settings: Settings) -> ExitCode {
     let Some(db) = open_db(&settings) else {
         return ExitCode::FAILURE;
     };
+    log(format!(
+        "[db] {} is ready (this build's schema version is {})",
+        settings.db_path,
+        db::SCHEMA_VERSION
+    ));
     match db.blocking(ReplyRunner::orphan_interrupted) {
         Ok(0) => {}
         Ok(n) => log(format!(

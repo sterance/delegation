@@ -62,7 +62,7 @@ struct TestApp {
 
 async fn test_app(extra: &[(&str, &str)]) -> TestApp {
     let settings = settings(extra);
-    let db = db::open(":memory:").unwrap();
+    let db = db::open(":memory:", 3).unwrap();
     let live = Arc::new(Live::new(settings.metrics));
     let auth = Arc::new(Auth::new(&settings).unwrap());
     let settings = Arc::new(settings);

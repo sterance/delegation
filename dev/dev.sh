@@ -33,7 +33,8 @@ wait_server() {
       $DC logs --no-log-prefix --tail 3 server >&2
       if $DC logs --tail 3 server 2>/dev/null | grep -q 'REFUSING TO START'; then
         echo >&2
-        echo "The dev database is from an older build (there are no migrations). Run:" >&2
+        echo "The dev database can't be used by this build (see above: a pre-auth database," >&2
+        echo "a failed migration, or one from a newer build). To start over, run:" >&2
         echo "  dev/dev.sh reset   # wipes the dev DB and the dev client's identity" >&2
         echo "  dev/dev.sh up" >&2
       fi

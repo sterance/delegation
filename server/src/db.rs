@@ -5,19 +5,17 @@
 //! [`Db::call`], which moves it onto tokio's blocking pool, so a slow write
 //! never stalls the async worker threads serving the WebSockets and API.
 //!
-//! The schema is versioned with `PRAGMA user_version` and created in one go
-//! on an empty database. There are no migrations: a database from an older
-//! build is refused at startup with instructions to reset it (the project
-//! is greenfield, so nothing in it needs to survive).
+//! The schema is versioned with `PRAGMA user_version` and upgraded in place
+//! on startup by the migrations in [`migrations`], after a backup.
 
-use crate::conversations::{MessageRole, MessageStatus};
+mod migrations;
+
 use anyhow::{bail, Context, Result};
 use rusqlite::{Connection, OptionalExtension};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-/// Bump whenever the schema below changes. Older databases are refused.
-pub const SCHEMA_VERSION: i64 = 1;
+pub use migrations::SCHEMA_VERSION;
 
 /// How long a query waits on a lock held by another connection (the admin
 /// CLI, a backup) before giving up.
@@ -55,11 +53,13 @@ impl Db {
 }
 
 /// Opens (creating if needed) the database at `path`, sets the pragmas and
-/// checks the schema version. `:memory:` gives a private in-memory database.
-pub fn open(path: &str) -> Result<Db> {
-    let conn = Connection::open(path).with_context(|| format!("opening sqlite database {path}"))?;
+/// brings the schema up to date, backing it up first and keeping the newest
+/// `backups_keep` pre-migration backups. `:memory:` gives a private
+/// in-memory database.
+pub fn open(path: &str, backups_keep: usize) -> Result<Db> {
+    let mut conn = Connection::open(path).with_context(|| format!("opening sqlite database {path}"))?;
     configure(&conn)?;
-    ensure_schema(&conn, path)?;
+    migrations::ensure_schema(&mut conn, path, migrations::MIGRATIONS, backups_keep)?;
     Ok(Db {
         conn: Arc::new(Mutex::new(conn)),
     })
@@ -82,152 +82,6 @@ fn configure(conn: &Connection) -> Result<()> {
         bail!("this SQLite build doesn't support foreign keys");
     }
     Ok(())
-}
-
-fn ensure_schema(conn: &Connection, path: &str) -> Result<()> {
-    let version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
-    let tables: i64 = conn.query_row(
-        "SELECT COUNT(*) FROM sqlite_schema WHERE type = 'table' AND name NOT LIKE 'sqlite_%'",
-        [],
-        |r| r.get(0),
-    )?;
-    if version == SCHEMA_VERSION {
-        return Ok(());
-    }
-    if version == 0 && tables == 0 {
-        conn.execute_batch(&format!(
-            "BEGIN;\n{}\nPRAGMA user_version = {SCHEMA_VERSION};\nCOMMIT;",
-            schema()
-        ))
-        .context("creating the schema")?;
-        return Ok(());
-    }
-    let found = if version == 0 {
-        "an unversioned schema from before auth and chat persistence".to_string()
-    } else {
-        format!("schema version {version}")
-    };
-    if version > SCHEMA_VERSION {
-        bail!(
-            "the database at {path} has {found}, newer than this build understands (version {SCHEMA_VERSION}). \
-             Run a newer server, or restore a backup made by this one."
-        );
-    }
-    bail!(
-        "the database at {path} has {found}, but this build needs schema version {SCHEMA_VERSION}. \
-         There are no migrations (the project is greenfield): stop the server, delete {path} \
-         (and {path}-wal and {path}-shm if present), and start it again. Every client will then need \
-         to re-enrol with a new pairing code."
-    );
-}
-
-/// The whole schema. Statuses and roles come from their Rust enums, so the
-/// CHECK constraints can't drift from the code.
-fn schema() -> String {
-    let statuses = sql_list(MessageStatus::ALL.iter().map(|s| s.as_str()));
-    let roles = sql_list(MessageRole::ALL.iter().map(|r| r.as_str()));
-    let active = sql_list(MessageStatus::ACTIVE.iter().map(|s| s.as_str()));
-    format!(
-        "
-        CREATE TABLE users (
-          id                   TEXT PRIMARY KEY,
-          username             TEXT NOT NULL UNIQUE COLLATE NOCASE,
-          password_hash        TEXT NOT NULL,
-          role                 TEXT NOT NULL CHECK (role IN ('admin','user')),
-          created_at           TEXT NOT NULL,
-          password_changed_at  TEXT NOT NULL,
-          disabled_at          TEXT
-        );
-        -- Exactly one admin per deployment, enforced by the database.
-        CREATE UNIQUE INDEX one_admin ON users(role) WHERE role = 'admin';
-
-        CREATE TABLE sessions (
-          token_hash    TEXT PRIMARY KEY,
-          user_id       TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-          created_at    TEXT NOT NULL,
-          last_seen_at  TEXT NOT NULL,
-          expires_at    TEXT NOT NULL,
-          persistent    INTEGER NOT NULL,
-          user_agent    TEXT,
-          ip            TEXT
-        );
-        CREATE INDEX sessions_by_user ON sessions(user_id);
-
-        CREATE TABLE password_resets (
-          id          TEXT PRIMARY KEY,
-          token_hash  TEXT NOT NULL UNIQUE,
-          user_id     TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-          created_by  TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-          created_at  TEXT NOT NULL,
-          expires_at  TEXT NOT NULL,
-          used_at     TEXT
-        );
-        CREATE INDEX password_resets_by_user ON password_resets(user_id);
-
-        CREATE TABLE clients (
-          client_id        TEXT PRIMARY KEY,
-          owner_user_id    TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-          public_key       TEXT NOT NULL,
-          hostname         TEXT NOT NULL,
-          -- Set from the dashboard. NULL means use the hostname, so an
-          -- unrenamed client keeps following hostname changes.
-          friendly_name    TEXT,
-          enrolled_at      TEXT NOT NULL,
-          last_seen_at     TEXT,
-          os               TEXT,
-          client_version   TEXT,
-          specs_json       TEXT,
-          info_updated_at  TEXT
-        );
-        CREATE INDEX clients_by_owner ON clients(owner_user_id);
-
-        CREATE TABLE pairing_codes (
-          code               TEXT PRIMARY KEY,
-          created_by         TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-          expires_at         INTEGER NOT NULL,
-          used_at            INTEGER,
-          claimed_by_client  TEXT
-        );
-
-        CREATE TABLE conversations (
-          id              TEXT PRIMARY KEY,
-          owner_user_id   TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-          title           TEXT NOT NULL,
-          active_leaf_id  TEXT,
-          created_at      TEXT NOT NULL,
-          updated_at      TEXT NOT NULL
-        );
-        CREATE INDEX conversations_by_owner ON conversations(owner_user_id, updated_at DESC);
-
-        CREATE TABLE messages (
-          id               TEXT PRIMARY KEY,
-          conversation_id  TEXT NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
-          parent_id        TEXT REFERENCES messages(id) ON DELETE CASCADE,
-          role             TEXT NOT NULL CHECK (role IN ({roles})),
-          content          TEXT NOT NULL,
-          status           TEXT NOT NULL CHECK (status IN ({statuses})),
-          error            TEXT,
-          attempt_id       TEXT,
-          attempts         INTEGER NOT NULL DEFAULT 0,
-          client_id        TEXT REFERENCES clients(client_id) ON DELETE SET NULL,
-          client_label     TEXT,
-          model            TEXT,
-          created_at       TEXT NOT NULL,
-          completed_at     TEXT,
-          meta_json        TEXT
-        );
-        CREATE INDEX messages_by_parent ON messages(conversation_id, parent_id, created_at);
-        -- Small: only replies being generated. Backs the per-conversation
-        -- and per-user limits.
-        CREATE INDEX messages_active ON messages(conversation_id) WHERE status IN ({active});
-        -- So deleting a client (ON DELETE SET NULL) doesn't scan every message.
-        CREATE INDEX messages_by_client ON messages(client_id);
-        "
-    )
-}
-
-fn sql_list<'a>(items: impl Iterator<Item = &'a str>) -> String {
-    items.map(|s| format!("'{s}'")).collect::<Vec<_>>().join(",")
 }
 
 /// `GET /api/health`: the database answers.
@@ -539,7 +393,7 @@ pub mod tests {
 
     /// A fresh in-memory database with the full schema.
     pub fn memory_db() -> Db {
-        open(":memory:").unwrap()
+        open(":memory:", 3).unwrap()
     }
 
     /// Inserts a user directly (no password hashing), returning its id.
@@ -580,7 +434,7 @@ pub mod tests {
     #[test]
     fn pragmas_are_set_and_the_schema_is_versioned() {
         let (dir, path) = temp_path("pragmas");
-        let db = open(&path).unwrap();
+        let db = open(&path, 3).unwrap();
         db.blocking(|c| {
             let mode: String = c.query_row("PRAGMA journal_mode", [], |r| r.get(0))?;
             assert_eq!(mode, "wal");
@@ -595,7 +449,7 @@ pub mod tests {
         .unwrap();
         drop(db);
         // Reopening a current database is fine.
-        open(&path).unwrap();
+        open(&path, 3).unwrap();
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -611,7 +465,7 @@ pub mod tests {
             )
             .unwrap();
         }
-        let err = open(&path).err().expect("refused").to_string();
+        let err = open(&path, 3).err().expect("refused").to_string();
         assert!(err.contains("delete"), "explains the reset: {err}");
 
         let (dir2, path2) = temp_path("older-version");
@@ -622,7 +476,7 @@ pub mod tests {
             conn.execute_batch(&format!("PRAGMA user_version = {}", SCHEMA_VERSION + 1))
                 .unwrap();
         }
-        assert!(open(&path2).err().unwrap().to_string().contains("newer"));
+        assert!(open(&path2, 3).err().unwrap().to_string().contains("newer"));
         let _ = std::fs::remove_dir_all(&dir);
         let _ = std::fs::remove_dir_all(&dir2);
     }
@@ -761,14 +615,14 @@ pub mod tests {
     #[test]
     fn backup_produces_a_database_with_the_rows() {
         let (dir, path) = temp_path("backup");
-        let db = open(&path).unwrap();
+        let db = open(&path, 3).unwrap();
         let alice = add_user(&db, "alice", "user");
         add_client(&db, "c1", &alice);
         let dest = dir.join("backup.db").to_str().unwrap().to_string();
         db.blocking(|c| backup(c, &dest)).unwrap();
         assert!(db.blocking(|c| backup(c, &dest)).is_err(), "won't overwrite");
 
-        let copy = open(&dest).unwrap();
+        let copy = open(&dest, 3).unwrap();
         copy.blocking(|c| {
             let users: i64 = c.query_row("SELECT COUNT(*) FROM users", [], |r| r.get(0))?;
             let clients: i64 = c.query_row("SELECT COUNT(*) FROM clients", [], |r| r.get(0))?;

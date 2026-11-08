@@ -1,0 +1,115 @@
+index|clients_by_owner|clients|CREATE INDEX clients_by_owner ON clients(owner_user_id)
+----
+index|conversations_by_owner|conversations|CREATE INDEX conversations_by_owner ON conversations(owner_user_id, updated_at DESC)
+----
+index|messages_active|messages|CREATE INDEX messages_active ON messages(conversation_id) WHERE status IN ('queued','assigned','running')
+----
+index|messages_by_client|messages|CREATE INDEX messages_by_client ON messages(client_id)
+----
+index|messages_by_parent|messages|CREATE INDEX messages_by_parent ON messages(conversation_id, parent_id, created_at)
+----
+index|one_admin|users|CREATE UNIQUE INDEX one_admin ON users(role) WHERE role = 'admin'
+----
+index|password_resets_by_user|password_resets|CREATE INDEX password_resets_by_user ON password_resets(user_id)
+----
+index|sessions_by_user|sessions|CREATE INDEX sessions_by_user ON sessions(user_id)
+----
+index|sqlite_autoindex_clients_1|clients|
+----
+index|sqlite_autoindex_conversations_1|conversations|
+----
+index|sqlite_autoindex_messages_1|messages|
+----
+index|sqlite_autoindex_pairing_codes_1|pairing_codes|
+----
+index|sqlite_autoindex_password_resets_1|password_resets|
+----
+index|sqlite_autoindex_password_resets_2|password_resets|
+----
+index|sqlite_autoindex_sessions_1|sessions|
+----
+index|sqlite_autoindex_users_1|users|
+----
+index|sqlite_autoindex_users_2|users|
+----
+table|clients|clients|CREATE TABLE clients (
+          client_id        TEXT PRIMARY KEY,
+          owner_user_id    TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+          public_key       TEXT NOT NULL,
+          hostname         TEXT NOT NULL,
+          -- Set from the dashboard. NULL means use the hostname, so an
+          -- unrenamed client keeps following hostname changes.
+          friendly_name    TEXT,
+          enrolled_at      TEXT NOT NULL,
+          last_seen_at     TEXT,
+          os               TEXT,
+          client_version   TEXT,
+          specs_json       TEXT,
+          info_updated_at  TEXT
+        )
+----
+table|conversations|conversations|CREATE TABLE conversations (
+          id              TEXT PRIMARY KEY,
+          owner_user_id   TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+          title           TEXT NOT NULL,
+          active_leaf_id  TEXT,
+          created_at      TEXT NOT NULL,
+          updated_at      TEXT NOT NULL
+        )
+----
+table|messages|messages|CREATE TABLE messages (
+          id               TEXT PRIMARY KEY,
+          conversation_id  TEXT NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
+          parent_id        TEXT REFERENCES messages(id) ON DELETE CASCADE,
+          role             TEXT NOT NULL CHECK (role IN ('system','user','assistant')),
+          content          TEXT NOT NULL,
+          status           TEXT NOT NULL CHECK (status IN ('queued','assigned','running','completed','failed','cancelled','orphaned')),
+          error            TEXT,
+          attempt_id       TEXT,
+          attempts         INTEGER NOT NULL DEFAULT 0,
+          client_id        TEXT REFERENCES clients(client_id) ON DELETE SET NULL,
+          client_label     TEXT,
+          model            TEXT,
+          created_at       TEXT NOT NULL,
+          completed_at     TEXT,
+          meta_json        TEXT
+        )
+----
+table|pairing_codes|pairing_codes|CREATE TABLE pairing_codes (
+          code               TEXT PRIMARY KEY,
+          created_by         TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+          expires_at         INTEGER NOT NULL,
+          used_at            INTEGER,
+          claimed_by_client  TEXT
+        )
+----
+table|password_resets|password_resets|CREATE TABLE password_resets (
+          id          TEXT PRIMARY KEY,
+          token_hash  TEXT NOT NULL UNIQUE,
+          user_id     TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+          created_by  TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+          created_at  TEXT NOT NULL,
+          expires_at  TEXT NOT NULL,
+          used_at     TEXT
+        )
+----
+table|sessions|sessions|CREATE TABLE sessions (
+          token_hash    TEXT PRIMARY KEY,
+          user_id       TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+          created_at    TEXT NOT NULL,
+          last_seen_at  TEXT NOT NULL,
+          expires_at    TEXT NOT NULL,
+          persistent    INTEGER NOT NULL,
+          user_agent    TEXT,
+          ip            TEXT
+        )
+----
+table|users|users|CREATE TABLE users (
+          id                   TEXT PRIMARY KEY,
+          username             TEXT NOT NULL UNIQUE COLLATE NOCASE,
+          password_hash        TEXT NOT NULL,
+          role                 TEXT NOT NULL CHECK (role IN ('admin','user')),
+          created_at           TEXT NOT NULL,
+          password_changed_at  TEXT NOT NULL,
+          disabled_at          TEXT
+        )

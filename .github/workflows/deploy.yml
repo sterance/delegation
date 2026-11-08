@@ -16,3 +16,4 @@ jobs:
       dockerfile: "server/Dockerfile"
       data_dir: "/app/data"
       subdomain: "llm"
+      health_path: "/api/health"

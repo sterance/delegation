@@ -1,6 +1,6 @@
 # Local dev stack: server + client on a private compose network, no
-# cloudflared, no public hostname. Fully isolated from the deploy stacks
-# (server/docker-compose.yml, client/docker-compose.yml): different
+# cloudflared, no public hostname. Fully isolated from the client's own
+# stack (client/docker-compose.yml) and from production: different
 # compose project name ("delegation-dev") and its own named volumes, so
 # `dev/dev.sh reset` can never touch production data or identities.
 name: delegation-dev

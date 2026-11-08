@@ -93,6 +93,8 @@ pub struct Settings {
     pub debug_logging: bool,
     pub auth_timeout: Duration,
     pub db_path: String,
+    /// Pre-migration backups to keep next to the database.
+    pub db_migration_backups_keep: usize,
     pub frontend_dir: String,
     /// Pushed to every client in `welcome`.
     pub client: ClientSettings,
@@ -245,6 +247,7 @@ impl Settings {
         };
         let auth_timeout_ms = p.int("SERVER_AUTH_TIMEOUT_MS", 5_000, 1);
         let db_path = p.string("DB_PATH", "data/delegation.db");
+        let db_migration_backups_keep = p.int("DB_MIGRATION_BACKUPS_KEEP", 3, 1);
         let frontend_dir = p.string("FRONTEND_DIR", "frontend/dist");
 
         // ---- tick and liveness ----
@@ -370,6 +373,7 @@ impl Settings {
             debug_logging,
             auth_timeout: Duration::from_millis(auth_timeout_ms),
             db_path,
+            db_migration_backups_keep: db_migration_backups_keep as usize,
             frontend_dir,
             client: ClientSettings {
                 tick_interval_ms: tick,
@@ -448,11 +452,13 @@ impl Settings {
         let a = &self.auth;
         vec![
             format!(
-                "server: port {}, log level {}, auth timeout {} ms, db {}, frontend {}",
+                "server: port {}, log level {}, auth timeout {} ms, db {} (keeping {} pre-migration backups), \
+                 frontend {}",
                 self.port,
                 if self.debug_logging { "debug" } else { "info" },
                 self.auth_timeout.as_millis(),
                 self.db_path,
+                self.db_migration_backups_keep,
                 self.frontend_dir
             ),
             format!(
