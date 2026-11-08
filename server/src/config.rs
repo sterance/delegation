@@ -1099,14 +1099,18 @@ mod tests {
             ("INFERENCE_MAX_CONCURRENT", "2"),
             ("INFERENCE_THREADS", "8"),
             ("INFERENCE_IDLE_UNLOAD_SECS", "0"),
-            ("INFERENCE_ECHO_MODEL", "false"),
+            ("INFERENCE_ECHO_MODEL", "true"),
             ("TEST_MODEL_SHA256", &"AB".repeat(32)),
         ])
         .unwrap();
         assert_eq!(s.client.inference.max_concurrent, 2);
         assert_eq!(s.client.inference.threads, 8);
         assert_eq!(s.client.inference.idle_unload_secs, 0);
-        assert!(!s.client.inference.echo_model_enabled);
+        assert!(s.client.inference.echo_model_enabled);
+        assert!(
+            !parse(&[]).unwrap().client.inference.echo_model_enabled,
+            "off by default"
+        );
         assert_eq!(s.test_model.source.sha256, "ab".repeat(32), "normalised to lowercase");
 
         rejects(&[("INFERENCE_MAX_CONCURRENT", "0")], "INFERENCE_MAX_CONCURRENT");

@@ -28,7 +28,10 @@ fn fast_settings() -> ClientSettings {
         server_silence_timeout_ms: 400,
         reconnect_backoff_initial_ms: 50,
         reconnect_backoff_max_ms: 100,
-        inference: InferenceSettings::default(),
+        inference: InferenceSettings {
+            echo_model_enabled: true,
+            ..InferenceSettings::default()
+        },
     }
 }
 

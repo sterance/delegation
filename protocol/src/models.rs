@@ -232,7 +232,7 @@ pub struct InferenceSettings {
     pub threads: u32,
     /// Free space a pull must leave on the data volume.
     pub disk_reserve_mb: u64,
-    /// Offer the built-in `echo` test model.
+    /// Offer the built-in `echo` test model. Off unless the server turns it on.
     pub echo_model_enabled: bool,
 }
 
@@ -254,7 +254,7 @@ impl Default for InferenceSettings {
             default_context: 4_096,
             threads: 0,
             disk_reserve_mb: 2_048,
-            echo_model_enabled: true,
+            echo_model_enabled: false,
         }
     }
 }

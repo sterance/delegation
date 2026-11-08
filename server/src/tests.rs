@@ -37,6 +37,8 @@ fn settings(extra: &[(&str, &str)]) -> Settings {
         ("AUTH_ARGON2_ITERATIONS", "1"),
         ("CHAT_FLUSH_INTERVAL_MS", "50"),
         ("FRONTEND_DIR", "/nonexistent-frontend"),
+        // Off by default; most tests chat with it.
+        ("INFERENCE_ECHO_MODEL", "true"),
     ]
     .iter()
     .map(|(k, v)| (k.to_string(), v.to_string()))

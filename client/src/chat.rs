@@ -143,6 +143,10 @@ mod tests {
     async fn run(model: &str, messages: Vec<ChatTurn>) -> Vec<ClientMessage> {
         let dir = TempDir::new("chat");
         let inference = Inference::new(&dir.0);
+        inference.apply_settings(&protocol::InferenceSettings {
+            echo_model_enabled: true,
+            ..protocol::InferenceSettings::default()
+        });
         let (tx, mut rx) = mpsc::channel(64);
         respond("r".into(), model.into(), messages, None, inference, tx).await;
         let mut got = Vec::new();

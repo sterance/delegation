@@ -2,8 +2,8 @@
 # Using the official rust image means a volunteer only needs Docker
 # installed, not a matching Rust toolchain or glibc version on their host.
 # This also sidesteps the whole "distro rustc is years out of date"
-# problem from earlier entirely: this image ships a current stable Rust.
-FROM rust:1-slim-bookworm AS builder
+# problem from earlier entirely. Same version as rust-toolchain.toml.
+FROM rust:1.99.1-slim-bookworm AS builder
 WORKDIR /build
 # Build context is now the repo root (see client/docker-compose.yml's
 # `context: ..`), since this crate depends on the shared protocol/

@@ -270,7 +270,7 @@ mod tests {
         .unwrap();
         assert_eq!(
             json,
-            r#"{"type":"welcome","settings":{"tick_interval_ms":1000,"sampler_interval_ms":500,"sample_max_age_ms":3000,"server_silence_timeout_ms":6000,"reconnect_backoff_initial_ms":1000,"reconnect_backoff_max_ms":30000,"inference":{"progress_interval_ms":1000,"idle_unload_secs":600,"model_load_timeout_ms":120000,"max_concurrent":1,"max_tokens":2048,"default_context":4096,"threads":0,"disk_reserve_mb":2048,"echo_model_enabled":true}}}"#
+            r#"{"type":"welcome","settings":{"tick_interval_ms":1000,"sampler_interval_ms":500,"sample_max_age_ms":3000,"server_silence_timeout_ms":6000,"reconnect_backoff_initial_ms":1000,"reconnect_backoff_max_ms":30000,"inference":{"progress_interval_ms":1000,"idle_unload_secs":600,"model_load_timeout_ms":120000,"max_concurrent":1,"max_tokens":2048,"default_context":4096,"threads":0,"disk_reserve_mb":2048,"echo_model_enabled":false}}}"#
         );
         let ServerMessage::Welcome { settings } = serde_json::from_str(&json).unwrap() else {
             panic!("not welcome")

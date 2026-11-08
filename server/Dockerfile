@@ -16,7 +16,8 @@ RUN npm run build
 # system SQLite dependency and no musl/Alpine native-build story here
 # at all (this is the thing that made the node:sqlite-vs-better-sqlite3
 # question from the Node version moot).
-FROM rust:1-slim-bookworm AS builder
+# Same Rust version as rust-toolchain.toml.
+FROM rust:1.99.1-slim-bookworm AS builder
 RUN apt-get update && apt-get install -y --no-install-recommends build-essential \
     && rm -rf /var/lib/apt/lists/*
 WORKDIR /build

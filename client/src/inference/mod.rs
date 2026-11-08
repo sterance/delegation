@@ -294,7 +294,7 @@ mod tests {
 
     /// An Inference over a temp dir that may download over plain HTTP and
     /// has a runtime that's already "installed" (a dummy file), so pulls
-    /// only fetch the model.
+    /// only fetch the model. Echo is on, as a server would turn it on.
     fn inference(dir: &TempDir) -> Inference {
         let store = store::Store::open_with(&dir.0, true, Arc::new(|_| None));
         let asset = runtime::pinned_for_this_platform().or(runtime::PINNED.first());
@@ -305,7 +305,12 @@ mod tests {
             std::fs::write(install.join(runtime::SERVER_EXE), b"").unwrap();
             std::fs::write(install.join(".installed"), asset.sha256).unwrap();
         }
-        Inference::from_parts(store, runtime)
+        let inf = Inference::from_parts(store, runtime);
+        inf.apply_settings(&InferenceSettings {
+            echo_model_enabled: true,
+            ..InferenceSettings::default()
+        });
+        inf
     }
 
     async fn statuses_until_final(rx: &mut mpsc::Receiver<CommandStatus>) -> Vec<CommandStatus> {

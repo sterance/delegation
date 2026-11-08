@@ -189,7 +189,7 @@ struct Slot(Arc<AtomicUsize>);
 impl Slot {
     fn take(active: &Arc<AtomicUsize>, max: u32) -> Option<Slot> {
         active
-            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| {
+            .try_update(Ordering::SeqCst, Ordering::SeqCst, |n| {
                 (n < max as usize).then_some(n + 1)
             })
             .ok()?;
