@@ -2,7 +2,7 @@
 # below receives nothing but the static dist/ output, and no Node
 # process ever runs in production. package*.json are copied first so
 # the `npm ci` layer stays cached until dependencies actually change.
-FROM node:20-alpine AS frontend
+FROM node:24-alpine AS frontend
 WORKDIR /build/frontend
 COPY frontend/package.json frontend/package-lock.json ./
 RUN npm ci

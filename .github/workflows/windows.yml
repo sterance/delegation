@@ -1,12 +1,16 @@
 # Builds the Windows tray client and its installer. ci.yml calls this after
 # its checks pass, for PRs and pushes to main; it can also be run by hand, which
-# skips CI. Pushes to main also publish both as a GitHub Release (tag
-# v<APP_VERSION>), marked latest; for PRs and manual runs,
-# download them from the run's "Artifacts" section instead.
+# skips CI. Pushes to main also sign both through SignPath (once it's set up:
+# installer/SIGNING.md) and publish them as a GitHub Release (tag
+# v<APP_VERSION>), marked latest; for PRs and manual runs, download the
+# unsigned builds from the run's "Artifacts" section instead.
 name: Windows
 
 on:
   workflow_call:
+    secrets:
+      SIGNPATH_API_TOKEN:
+        required: false
   workflow_dispatch:
 
 # Read-only by default; only the release job below can write.
@@ -16,10 +20,20 @@ permissions:
 jobs:
   tray:
     runs-on: windows-latest
+    # SignPath reads the unsigned files from this run's artifacts.
+    permissions:
+      contents: read
+      actions: read
+    outputs:
+      signed: ${{ steps.signing.outputs.signed }}
     env:
       APP_VERSION: 0.1.0.${{ github.run_number }}
+      # Only pushes to main are signed (never PR code), and only once the
+      # SignPath variables exist. Signing policies with manual approval
+      # wait here until someone approves in SignPath.
+      SIGN: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' && vars.SIGNPATH_ORGANIZATION_ID != '' }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       # Same version as rust-toolchain.toml.
       - uses: dtolnay/rust-toolchain@master
         with:
@@ -42,6 +56,47 @@ jobs:
           Write-Output $json
           $null = $json | ConvertFrom-Json
 
+      - name: Signing
+        id: signing
+        shell: pwsh
+        run: |
+          "signed=$env:SIGN" >> $env:GITHUB_OUTPUT
+          if ($env:SIGN -ne 'true') { Write-Output "Not signing: only pushes to main are signed, once SIGNPATH_ORGANIZATION_ID is set." }
+
+      # ---- Sign the tray exe first, so the installer packages the signed one ----
+      - name: Upload unsigned tray exe
+        id: unsigned-tray
+        if: env.SIGN == 'true'
+        uses: actions/upload-artifact@v7
+        with:
+          name: unsigned-tray
+          path: target/release/delegation-tray.exe
+          if-no-files-found: error
+          retention-days: 1
+
+      - name: Sign tray exe
+        if: env.SIGN == 'true'
+        uses: signpath/github-action-submit-signing-request@v3
+        with:
+          api-token: ${{ secrets.SIGNPATH_API_TOKEN }}
+          organization-id: ${{ vars.SIGNPATH_ORGANIZATION_ID }}
+          project-slug: ${{ vars.SIGNPATH_PROJECT_SLUG }}
+          signing-policy-slug: ${{ vars.SIGNPATH_SIGNING_POLICY_SLUG }}
+          github-artifact-id: ${{ steps.unsigned-tray.outputs.artifact-id }}
+          wait-for-completion: true
+          # Room for a manual approval in SignPath.
+          wait-for-completion-timeout-in-seconds: 3600
+          output-artifact-directory: signed/tray
+
+      - name: Use the signed tray exe
+        if: env.SIGN == 'true'
+        shell: pwsh
+        run: |
+          Copy-Item signed\tray\delegation-tray.exe target\release\delegation-tray.exe -Force
+          $sig = Get-AuthenticodeSignature target\release\delegation-tray.exe
+          Write-Output "$($sig.Status): $($sig.SignerCertificate.Subject)"
+          if ($sig.Status -ne 'Valid') { exit 1 }
+
       - name: Install Inno Setup
         shell: pwsh
         run: |
@@ -55,7 +110,41 @@ jobs:
           & "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe" /DAppVersion=$env:APP_VERSION installer\delegation.iss
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
-      - uses: actions/upload-artifact@v4
+      # ---- Then the installer itself ----
+      - name: Upload unsigned installer
+        id: unsigned-installer
+        if: env.SIGN == 'true'
+        uses: actions/upload-artifact@v7
+        with:
+          name: unsigned-installer
+          path: installer/Output/DelegationTray-Setup-${{ env.APP_VERSION }}.exe
+          if-no-files-found: error
+          retention-days: 1
+
+      - name: Sign installer
+        if: env.SIGN == 'true'
+        uses: signpath/github-action-submit-signing-request@v3
+        with:
+          api-token: ${{ secrets.SIGNPATH_API_TOKEN }}
+          organization-id: ${{ vars.SIGNPATH_ORGANIZATION_ID }}
+          project-slug: ${{ vars.SIGNPATH_PROJECT_SLUG }}
+          signing-policy-slug: ${{ vars.SIGNPATH_SIGNING_POLICY_SLUG }}
+          github-artifact-id: ${{ steps.unsigned-installer.outputs.artifact-id }}
+          wait-for-completion: true
+          wait-for-completion-timeout-in-seconds: 3600
+          output-artifact-directory: signed/installer
+
+      - name: Use the signed installer
+        if: env.SIGN == 'true'
+        shell: pwsh
+        run: |
+          $name = "DelegationTray-Setup-$env:APP_VERSION.exe"
+          Copy-Item "signed\installer\$name" "installer\Output\$name" -Force
+          $sig = Get-AuthenticodeSignature "installer\Output\$name"
+          Write-Output "$($sig.Status): $($sig.SignerCertificate.Subject)"
+          if ($sig.Status -ne 'Valid') { exit 1 }
+
+      - uses: actions/upload-artifact@v7
         with:
           name: DelegationTray-Setup-${{ env.APP_VERSION }}
           path: installer/Output/DelegationTray-Setup-${{ env.APP_VERSION }}.exe
@@ -66,7 +155,7 @@ jobs:
         shell: pwsh
         run: Copy-Item target\release\delegation-tray.exe "installer\Output\DelegationTray-$env:APP_VERSION-portable.exe"
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: DelegationTray-${{ env.APP_VERSION }}-portable
           path: installer/Output/DelegationTray-${{ env.APP_VERSION }}-portable.exe
@@ -84,8 +173,9 @@ jobs:
     env:
       # Same run, so the same number as the build job's APP_VERSION.
       VERSION: 0.1.0.${{ github.run_number }}
+      SIGNED: ${{ needs.tray.outputs.signed }}
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           pattern: DelegationTray-*
           merge-multiple: true
@@ -97,6 +187,11 @@ jobs:
         # A re-run keeps the same run_number, so the release may already
         # exist: then replace its files instead of failing on the tag.
         run: |
+          if [ "$SIGNED" = "true" ]; then
+            signing="Free code signing provided by SignPath.io, certificate by SignPath Foundation. Code signing policy: https://github.com/$GITHUB_REPOSITORY#code-signing-policy"
+          else
+            signing="Not code signed: SmartScreen will warn (More info, then Run anyway)."
+          fi
           if gh release view "v$VERSION" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
             gh release upload "v$VERSION" dist/*.exe --repo "$GITHUB_REPOSITORY" --clobber
             gh release edit "v$VERSION" --repo "$GITHUB_REPOSITORY" --latest
@@ -105,6 +200,6 @@ jobs:
               --repo "$GITHUB_REPOSITORY" \
               --target "$GITHUB_SHA" \
               --title "Delegation tray $VERSION" \
-              --notes "Windows tray client built from $GITHUB_SHA. Install with DelegationTray-Setup-$VERSION.exe, or run the portable exe without installing. Not code signed: SmartScreen will warn (More info, then Run anyway)." \
+              --notes "Windows tray client built from $GITHUB_SHA. Install with DelegationTray-Setup-$VERSION.exe, or run the portable exe without installing. $signing" \
               --latest
           fi

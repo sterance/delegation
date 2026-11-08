@@ -1,0 +1,18 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  SignPath artifact configuration for the Windows build (installer/SIGNING.md).
+  Paste it into the SignPath project as its default artifact configuration.
+
+  windows.yml submits two signing requests per release, each a GitHub
+  artifact (a zip) holding one exe: first delegation-tray.exe, then the
+  installer built around the signed tray exe. This signs the one exe in
+  the zip.
+-->
+<artifact-configuration xmlns="http://signpath.io/artifact-configuration/v1">
+  <zip-file>
+    <!-- A wildcard matches exactly one file by default: the one exe. -->
+    <pe-file path="*.exe">
+      <authenticode-sign hash-algorithm="sha256" description="Delegation tray client" />
+    </pe-file>
+  </zip-file>
+</artifact-configuration>

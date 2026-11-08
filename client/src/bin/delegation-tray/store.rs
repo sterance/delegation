@@ -3,7 +3,7 @@
 //! keypair, so servers can't correlate this machine by public key.
 
 use anyhow::{bail, Context, Result};
-use delegation_client::identity::Identity;
+use delegation_client::identity::{Identity, StoredKey};
 use delegation_client::settings::CachedTimeouts;
 use protocol::ClientSettings;
 use serde::{Deserialize, Serialize};
@@ -24,7 +24,9 @@ pub struct SavedServer {
     /// Both cleared when the server says it no longer knows this machine,
     /// so it can be re-paired without losing its place in the list.
     pub client_id: Option<String>,
-    pub signing_key_b64: Option<String>,
+    /// DPAPI-protected (see [`StoredKey`]).
+    #[serde(flatten)]
+    pub key: StoredKey,
     /// The timeouts this server last sent in `welcome`, so the reconnect
     /// backoff follows its values before the tray has connected this run.
     /// (Earlier versions kept every setting here, as `settings`.)
@@ -35,7 +37,14 @@ pub struct SavedServer {
 impl SavedServer {
     pub fn identity(&self) -> Option<Identity> {
         let client_id = self.client_id.clone()?;
-        Identity::from_b64(client_id, self.signing_key_b64.as_deref()?).ok()
+        match self.key.open() {
+            Ok(Some(signing_key)) => Some(Identity { client_id, signing_key }),
+            Ok(None) => None,
+            Err(e) => {
+                log::error!(target: "tray", "can't read the key for {}: {e:#}", self.url);
+                None
+            }
+        }
     }
 }
 
@@ -50,8 +59,16 @@ impl Store {
         let Ok(raw) = std::fs::read_to_string(path) else {
             return Store::default();
         };
-        match serde_json::from_str(&raw) {
-            Ok(store) => store,
+        match serde_json::from_str::<Store>(&raw) {
+            Ok(mut store) => {
+                if store.seal_plain_keys() {
+                    match store.save(path) {
+                        Ok(()) => log::info!(target: "tray", "protected the saved keys with DPAPI"),
+                        Err(e) => log::warn!(target: "tray", "couldn't protect the saved keys: {e:#}"),
+                    }
+                }
+                store
+            }
             Err(e) => {
                 let aside = path.with_extension(format!("json.corrupt-{}", std::process::id()));
                 log::error!(target: "tray", "can't parse {}: {e}; moved it to {}", path.display(), aside.display());
@@ -94,11 +111,11 @@ impl Store {
     /// if it's already in the list (its cached settings are kept, since
     /// they're the server's, not the identity's), and makes it the active
     /// server.
-    pub fn upsert(&mut self, url: &str, identity: &Identity) -> usize {
+    pub fn upsert(&mut self, url: &str, identity: &Identity) -> Result<usize> {
         let mut entry = SavedServer {
             url: url.to_string(),
             client_id: Some(identity.client_id.clone()),
-            signing_key_b64: Some(identity.signing_key_b64()),
+            key: StoredKey::seal(&identity.signing_key)?,
             timeouts: None,
         };
         let index = match self.find(url) {
@@ -114,7 +131,31 @@ impl Store {
         };
         self.active = index;
         self.manually_disconnected = false;
-        index
+        Ok(index)
+    }
+
+    /// Protects keys an earlier version saved in plain form (Windows).
+    /// Returns whether any changed (and so the store needs saving).
+    fn seal_plain_keys(&mut self) -> bool {
+        let mut changed = false;
+        for server in &mut self.servers {
+            if !server.key.needs_sealing() {
+                continue;
+            }
+            let sealed = server
+                .key
+                .open()
+                .and_then(|key| key.map(|key| StoredKey::seal(&key)).transpose());
+            match sealed {
+                Ok(Some(sealed)) => {
+                    server.key = sealed;
+                    changed = true;
+                }
+                Ok(None) => {}
+                Err(e) => log::warn!(target: "tray", "couldn't protect the key for {}: {e:#}", server.url),
+            }
+        }
+        changed
     }
 
     /// The settings to connect to `url` with: its cached timeouts, and
@@ -142,7 +183,7 @@ impl Store {
     pub fn forget_identity(&mut self, index: usize) {
         if let Some(server) = self.servers.get_mut(index) {
             server.client_id = None;
-            server.signing_key_b64 = None;
+            server.key = StoredKey::default();
         }
     }
 }
@@ -202,14 +243,14 @@ mod tests {
             manually_disconnected: true,
             ..Store::default()
         };
-        assert_eq!(store.upsert("https://a.example", &identity), 0);
-        assert_eq!(store.upsert("https://b.example", &identity), 1);
+        assert_eq!(store.upsert("https://a.example", &identity).unwrap(), 0);
+        assert_eq!(store.upsert("https://b.example", &identity).unwrap(), 1);
         assert_eq!(store.active, 1);
         assert!(!store.manually_disconnected);
 
         assert_eq!(store.find("A.EXAMPLE/"), Some(0));
         assert_eq!(
-            store.upsert("a.example", &identity),
+            store.upsert("a.example", &identity).unwrap(),
             0,
             "same server must not be added twice"
         );
@@ -224,7 +265,7 @@ mod tests {
     fn settings_are_cached_per_server_and_survive_re_pairing() {
         let identity = Identity::from_b64("id-1".into(), "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=").unwrap();
         let mut store = Store::default();
-        store.upsert("https://a.example", &identity);
+        store.upsert("https://a.example", &identity).unwrap();
         assert_eq!(store.settings_for("https://a.example"), ClientSettings::default());
 
         let pushed = ClientSettings {
@@ -244,9 +285,34 @@ mod tests {
         assert_eq!(store.settings_for("A.EXAMPLE"), pushed);
 
         store.forget_identity(0);
-        store.upsert("https://a.example", &identity);
+        store.upsert("https://a.example", &identity).unwrap();
         assert_eq!(store.settings_for("https://a.example"), pushed);
         assert_eq!(store.settings_for("https://unknown.example"), ClientSettings::default());
+    }
+
+    #[test]
+    fn an_older_store_with_plain_keys_loads_and_is_protected_on_windows() {
+        let dir = std::env::temp_dir().join(format!("delegation-store-legacy-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("servers.json");
+        let seed = "BwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwc=";
+        std::fs::write(
+            &path,
+            format!(
+                r#"{{"active":0,"servers":[{{"url":"https://a","client_id":"c1","signing_key_b64":"{seed}",
+                "settings":{{"tick_interval_ms":1000,"server_silence_timeout_ms":9000,
+                "reconnect_backoff_initial_ms":1000,"reconnect_backoff_max_ms":30000}}}}]}}"#
+            ),
+        )
+        .unwrap();
+        let store = Store::load(&path);
+        let identity = store.servers[0].identity().expect("the old key still works");
+        assert_eq!(identity.signing_key_b64(), seed);
+        assert_eq!(store.servers[0].timeouts.unwrap().server_silence_timeout_ms, 9_000);
+        let raw = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(!raw.contains(seed), cfg!(windows), "{raw}");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

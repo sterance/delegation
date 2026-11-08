@@ -249,7 +249,10 @@ impl App {
                     }
                 };
                 let count = self.store.servers.len();
-                self.store.upsert(&url, &identity);
+                if let Err(e) = self.store.upsert(&url, &identity) {
+                    error!(target: "tray", "couldn't save the identity for {url}: {e:#}");
+                    return;
+                }
                 self.save();
                 info!(target: "tray", "paired with {url}");
                 if self.store.servers.len() != count {

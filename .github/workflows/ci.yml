@@ -15,7 +15,7 @@ jobs:
   rust:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@master
         with:
           toolchain: 1.99.1
@@ -31,10 +31,12 @@ jobs:
       run:
         working-directory: frontend
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@v7
+      # Node only builds the frontend (dev and CI): the server serves the
+      # built files and the client never needs it.
+      - uses: actions/setup-node@v7
         with:
-          node-version: 20
+          node-version: 24
           cache: npm
           cache-dependency-path: frontend/package-lock.json
       - run: npm ci
@@ -44,21 +46,27 @@ jobs:
   docker:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Build client image
         run: docker build -f client/Dockerfile -t delegation-client .
       - name: Build server image
         run: docker build -f server/Dockerfile -t delegation-server .
 
   # Builds the tray app and installer for PRs and pushes to main (not other
-  # branch pushes); on pushes to main it also publishes a GitHub Release,
-  # which needs contents: write.
+  # branch pushes); on pushes to main it also signs them (once SignPath is
+  # set up, see installer/SIGNING.md) and publishes a GitHub Release, which
+  # needs contents: write. actions: read lets SignPath fetch the unsigned
+  # files from the run.
   windows:
     needs: [rust, frontend, docker]
     if: github.event_name == 'pull_request' || github.ref == 'refs/heads/main'
     uses: ./.github/workflows/windows.yml
     permissions:
       contents: write
+      actions: read
+    # Only the signing token; the build never sees other secrets.
+    secrets:
+      SIGNPATH_API_TOKEN: ${{ secrets.SIGNPATH_API_TOKEN }}
 
   # A called workflow can't have more permissions than its caller grants,
   # so these match deploy.yml's.

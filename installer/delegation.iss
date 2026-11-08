@@ -34,6 +34,13 @@ ArchitecturesInstallIn64BitMode=x64compatible
 CloseApplications=force
 RestartApplications=no
 
+; Code signing: CI signs delegation-tray.exe before this script packages it,
+; and the finished setup exe afterwards (installer/SIGNING.md). The
+; uninstaller Inno writes at install time stays unsigned: signing it would
+; need SignedUninstaller=yes with a signing tool ISCC can run locally, which
+; a remote signing service isn't. It's never downloaded, so SmartScreen
+; doesn't check it.
+
 [Files]
 Source: "..\target\release\{#AppExe}"; DestDir: "{app}"; Flags: ignoreversion
 
