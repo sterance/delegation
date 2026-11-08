@@ -17,4 +17,9 @@ rand = "0.8"
 anyhow = "1"
 futures-util = "0.3"
 uuid = { version = "1", features = ["v4"] }
+argon2 = { version = "0.5", features = ["std"] }
+sha2 = "0.10"
+rpassword = "7"
 
+[dev-dependencies]
+tower = { version = "0.5", features = ["util"] }

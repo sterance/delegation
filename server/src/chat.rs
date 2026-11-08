@@ -1,14 +1,28 @@
-//! Chat relay: `POST /api/chat` sends the dashboard's conversation to a
-//! connected client as a `chat_request`, and streams the client's
-//! `chat_chunk`s back to the dashboard as server-sent events.
+//! Chat over HTTP: conversations, sending, and streaming replies.
 //!
-//! The server never generates anything itself. It routes by `request_id`,
-//! checks each reply comes from the connection the request went to, and
-//! cancels the request on the client if nobody is listening any more.
+//! The server builds each request's history and owns each reply's
+//! lifecycle (`replies.rs`). Replies stream to the dashboard as server-sent
+//! events, from the reply's hub, so a stream can close and reconnect
+//! without affecting generation:
+//!
+//! - `created` (send and retry only): the messages the request created,
+//!   `{ conversation?, user_message?, reply }`
+//! - `snapshot`: the full text so far and the current status
+//! - `status`: a status change, with who's answering
+//! - `chunk`: `{ delta }`
+//! - `end`: the final status and error, last
+//!
+//! Errors found before a stream starts are plain JSON `{ error }`.
 
-use crate::{db, log, AppState};
+use crate::access::{self, Check, ClientAction};
+use crate::auth::{CurrentUser, User};
+use crate::conversations::{self, Busy, Message, MessageRole, SetLeaf, TurnOutcome, RENAME_MAX_CHARS};
+use crate::http::{ApiError, ApiJson, ApiResult};
+use crate::replies::{ReplyEvent, RetryError, StartError, Target};
+use crate::{log, AppState};
 use axum::{
-    extract::State,
+    body::Bytes,
+    extract::{Path, Query, State},
     http::StatusCode,
     response::{
         sse::{Event, KeepAlive, Sse},
@@ -17,191 +31,13 @@ use axum::{
     Json,
 };
 use futures_util::stream;
-use protocol::{ChatTurn, ServerMessage};
 use serde::{Deserialize, Serialize};
+use serde_json::json;
 use std::collections::HashMap;
 use std::convert::Infallible;
-use std::sync::{Arc, Mutex};
 use std::time::Duration;
-use tokio::sync::mpsc;
+use tokio::sync::{broadcast::error::RecvError, mpsc};
 use uuid::Uuid;
-
-/// One piece of a client's reply, on its way to the dashboard.
-#[derive(Debug, PartialEq)]
-pub enum ChatEvent {
-    Chunk(String),
-    Done,
-    Error(String),
-}
-
-struct Pending {
-    /// The connection the request was sent on: only it may answer.
-    conn_id: u64,
-    /// Unbounded so delivering never blocks (or drops pieces in) the
-    /// client's socket loop; a reply is only ever as big as the reply.
-    tx: mpsc::UnboundedSender<ChatEvent>,
-}
-
-/// Requests sent to a client that haven't finished yet, by request_id.
-#[derive(Default)]
-pub struct Chats {
-    pending: Mutex<HashMap<String, Pending>>,
-}
-
-impl Chats {
-    fn lock(&self) -> std::sync::MutexGuard<'_, HashMap<String, Pending>> {
-        self.pending.lock().unwrap_or_else(|e| e.into_inner())
-    }
-
-    fn register(&self, request_id: &str, conn_id: u64) -> mpsc::UnboundedReceiver<ChatEvent> {
-        let (tx, rx) = mpsc::unbounded_channel();
-        self.lock().insert(request_id.to_string(), Pending { conn_id, tx });
-        rx
-    }
-
-    /// Removes the request; returns whether it was still pending.
-    fn remove(&self, request_id: &str) -> bool {
-        self.lock().remove(request_id).is_some()
-    }
-
-    /// Passes an event from connection `conn_id` to whoever is waiting on
-    /// `request_id`. Ignored (returns false) if the request is unknown or
-    /// was sent to a different connection. `Done` and `Error` finish it.
-    pub fn deliver(&self, conn_id: u64, request_id: &str, event: ChatEvent) -> bool {
-        let mut pending = self.lock();
-        let Some(p) = pending.get(request_id).filter(|p| p.conn_id == conn_id) else {
-            return false;
-        };
-        let finished = !matches!(event, ChatEvent::Chunk(_));
-        let _ = p.tx.send(event);
-        if finished {
-            pending.remove(request_id);
-        }
-        true
-    }
-
-    /// Fails every request still waiting on `conn_id`, which has closed.
-    pub fn fail_conn(&self, conn_id: u64, reason: &str) {
-        self.lock().retain(|_, p| {
-            if p.conn_id != conn_id {
-                return true;
-            }
-            let _ = p.tx.send(ChatEvent::Error(reason.to_string()));
-            false
-        });
-    }
-}
-
-/// Lives as long as the response stream. If the stream goes away while
-/// the request is still pending (the browser left, or it timed out), the
-/// client is told to stop generating.
-struct CancelOnDrop {
-    chats: Arc<Chats>,
-    request_id: String,
-    tx: mpsc::Sender<ServerMessage>,
-}
-
-impl Drop for CancelOnDrop {
-    fn drop(&mut self) {
-        if self.chats.remove(&self.request_id) {
-            log(format!("[chat] {} cancelled", self.request_id));
-            let _ = self.tx.try_send(ServerMessage::ChatCancel {
-                request_id: self.request_id.clone(),
-            });
-        }
-    }
-}
-
-#[derive(Deserialize)]
-pub struct ChatBody {
-    client_id: String,
-    model: String,
-    /// The conversation so far, oldest first, ending with the new message.
-    messages: Vec<ChatTurn>,
-}
-
-fn reject(status: StatusCode, error: impl Into<String>) -> Response {
-    (status, Json(serde_json::json!({ "error": error.into() }))).into_response()
-}
-
-fn sse(name: &str, data: serde_json::Value) -> Result<Event, Infallible> {
-    Ok(Event::default().event(name).data(data.to_string()))
-}
-
-/// `POST /api/chat`. Errors found before anything is sent to the client
-/// are plain JSON `{error}` responses; after that, everything arrives as
-/// SSE: `chunk` `{delta}`s, then exactly one `done` `{}` or `error` `{error}`.
-pub async fn post_chat(State(state): State<AppState>, Json(body): Json<ChatBody>) -> Response {
-    if body.messages.is_empty() {
-        return reject(StatusCode::BAD_REQUEST, "messages is empty");
-    }
-    let Some(conn) = state.live.sender(&body.client_id) else {
-        return reject(StatusCode::NOT_FOUND, "that client isn't connected");
-    };
-    if !conn.models.iter().any(|m| m.id == body.model) {
-        return reject(
-            StatusCode::BAD_REQUEST,
-            format!("that client doesn't offer the model {:?}", body.model),
-        );
-    }
-
-    let request_id = Uuid::new_v4().to_string();
-    let rx = state.chats.register(&request_id, conn.conn_id);
-    let turns = body.messages.len();
-    let request = ServerMessage::ChatRequest {
-        request_id: request_id.clone(),
-        model: body.model.clone(),
-        messages: body.messages,
-    };
-    if conn.tx.try_send(request).is_err() {
-        state.chats.remove(&request_id);
-        return reject(StatusCode::SERVICE_UNAVAILABLE, "that client is busy, try again");
-    }
-    log(format!(
-        "[chat] {request_id} sent to {} ({}, {turns} message(s))",
-        body.client_id, body.model
-    ));
-
-    let guard = CancelOnDrop {
-        chats: state.chats.clone(),
-        request_id,
-        tx: conn.tx,
-    };
-    let idle = state.settings.chat_idle_timeout;
-    // Keep-alive comments stop proxies (Cloudflare drops idle responses
-    // after 100 s) from cutting off a slow first token.
-    Sse::new(reply_stream(rx, guard, idle))
-        .keep_alive(KeepAlive::default())
-        .into_response()
-}
-
-fn reply_stream(
-    rx: mpsc::UnboundedReceiver<ChatEvent>,
-    guard: CancelOnDrop,
-    idle: Duration,
-) -> impl futures_util::Stream<Item = Result<Event, Infallible>> {
-    // The state is None once the final event has gone out, which ends the
-    // stream and drops the guard.
-    stream::unfold(Some((rx, guard)), move |state| async move {
-        let (mut rx, guard) = state?;
-        let last = match tokio::time::timeout(idle, rx.recv()).await {
-            Ok(Some(ChatEvent::Chunk(delta))) => {
-                return Some((sse("chunk", serde_json::json!({ "delta": delta })), Some((rx, guard))));
-            }
-            Ok(Some(ChatEvent::Done)) => sse("done", serde_json::json!({})),
-            Ok(Some(ChatEvent::Error(error))) => sse("error", serde_json::json!({ "error": error })),
-            Ok(None) => sse("error", serde_json::json!({ "error": "the reply ended unexpectedly" })),
-            Err(_) => sse(
-                "error",
-                serde_json::json!({
-                    "error": format!("the client sent nothing for {} s", idle.as_secs())
-                }),
-            ),
-        };
-        drop(guard);
-        Some((last, None))
-    })
-}
 
 #[derive(Serialize)]
 struct ChatModel {
@@ -211,111 +47,456 @@ struct ChatModel {
     model: String,
 }
 
-/// `GET /api/chat/models`: every model offered by a connected client.
-pub async fn list_models(State(state): State<AppState>) -> Response {
-    let models = state.live.models();
-    if models.is_empty() {
-        return Json(Vec::<ChatModel>::new()).into_response();
+/// `GET /api/chat/models`: the models on connected clients this user can Use.
+pub async fn list_models(State(state): State<AppState>, CurrentUser(user): CurrentUser) -> ApiResult<Response> {
+    let live = state.live.models();
+    if live.is_empty() {
+        return Ok(Json(Vec::<ChatModel>::new()).into_response());
     }
-    let names: HashMap<String, String> = match db::list_clients(&state.db) {
-        Ok(rows) => rows.into_iter().map(|r| (r.client_id, r.friendly_name)).collect(),
-        Err(e) => {
-            log(format!("[chat] error listing clients: {e:#}"));
-            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
-        }
-    };
-    let mut list: Vec<ChatModel> = models
+    let viewer = user.clone();
+    let rows = state.db.call(move |c| access::visible_clients(c, &viewer)).await?;
+    let usable: HashMap<String, String> = rows
         .into_iter()
-        .map(|(client_id, model)| ChatModel {
-            client_name: names.get(&client_id).cloned().unwrap_or_else(|| client_id.clone()),
-            client_id,
-            model: model.id,
+        .filter(|r| access::client_access(&user, r).is_some_and(|a| access::allows(a, ClientAction::Use)))
+        .map(|r| (r.client_id, r.friendly_name))
+        .collect();
+    let mut list: Vec<ChatModel> = live
+        .into_iter()
+        .filter_map(|(client_id, model)| {
+            Some(ChatModel {
+                client_name: usable.get(&client_id)?.clone(),
+                client_id,
+                model: model.id,
+            })
         })
         .collect();
     list.sort_by(|a, b| (&a.client_name, &a.model).cmp(&(&b.client_name, &b.model)));
-    Json(list).into_response()
+    Ok(Json(list).into_response())
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn events_reach_the_right_request_and_finish_it() {
-        let chats = Chats::default();
-        let mut a = chats.register("a", 1);
-        let mut b = chats.register("b", 1);
-
-        assert!(chats.deliver(1, "a", ChatEvent::Chunk("hi".into())));
-        assert!(chats.deliver(1, "a", ChatEvent::Done));
-        assert_eq!(a.try_recv(), Ok(ChatEvent::Chunk("hi".into())));
-        assert_eq!(a.try_recv(), Ok(ChatEvent::Done));
-        assert!(b.try_recv().is_err(), "b got nothing");
-
-        // Finished: later events are ignored, and removing is a no-op.
-        assert!(!chats.deliver(1, "a", ChatEvent::Chunk("late".into())));
-        assert!(!chats.remove("a"));
-
-        assert!(chats.deliver(1, "b", ChatEvent::Error("boom".into())));
-        assert_eq!(b.try_recv(), Ok(ChatEvent::Error("boom".into())));
-        assert!(!chats.remove("b"));
+/// The user may Use the target client, it's connected and offers the model.
+async fn check_target(state: &AppState, user: &User, target: &Target) -> ApiResult<()> {
+    let Target::Client { client_id, model } = target;
+    let (viewer, id) = (user.clone(), client_id.clone());
+    let row = match state
+        .db
+        .call(move |c| access::check(c, &viewer, &id, ClientAction::Use))
+        .await?
+    {
+        Check::Allowed(row) => row,
+        Check::Denied => return Err(ApiError::forbidden("You can't chat with that client.")),
+        Check::Hidden => return Err(ApiError::new(StatusCode::NOT_FOUND, "That client doesn't exist.")),
+    };
+    let Some(conn) = state.live.sender(client_id) else {
+        return Err(ApiError::conflict(format!("{} isn't connected.", row.friendly_name)));
+    };
+    if !conn.models.iter().any(|m| &m.id == model) {
+        return Err(ApiError::bad_request(format!(
+            "{} doesn't offer the model {model:?}.",
+            row.friendly_name
+        )));
     }
+    Ok(())
+}
 
-    #[test]
-    fn events_from_another_connection_are_ignored() {
-        let chats = Chats::default();
-        let mut rx = chats.register("r", 1);
-        assert!(!chats.deliver(2, "r", ChatEvent::Chunk("injected".into())));
-        assert!(!chats.deliver(2, "r", ChatEvent::Done));
-        assert!(rx.try_recv().is_err());
-        assert!(chats.remove("r"), "still pending");
+fn busy_error(busy: Busy) -> ApiError {
+    match busy {
+        Busy::Conversation => {
+            ApiError::conflict("A reply is still being generated in this conversation. Stop it or wait for it.")
+        }
+        Busy::User => ApiError::too_many(
+            Duration::from_secs(5),
+            "You have too many replies being generated at once. Wait for one to finish.",
+        ),
     }
+}
 
-    #[test]
-    fn a_closed_connection_fails_only_its_own_requests() {
-        let chats = Chats::default();
-        let mut on_1 = chats.register("x", 1);
-        let mut on_2 = chats.register("y", 2);
-        chats.fail_conn(1, "the client disconnected");
-        assert_eq!(on_1.try_recv(), Ok(ChatEvent::Error("the client disconnected".into())));
-        assert!(!chats.remove("x"));
-        assert!(on_2.try_recv().is_err());
-        assert!(chats.remove("y"));
+// ---------------- conversations ----------------
+
+#[derive(Deserialize)]
+pub struct ListQuery {
+    /// `updated_at` of the last conversation already shown.
+    before: Option<String>,
+    limit: Option<usize>,
+}
+
+#[derive(Serialize)]
+pub struct ConversationPage {
+    conversations: Vec<conversations::ConversationSummary>,
+    /// Pass as `before` for the next page; null on the last one.
+    next_before: Option<String>,
+}
+
+/// `GET /api/conversations?before=&limit=`: newest first.
+pub async fn list_conversations(
+    State(state): State<AppState>,
+    CurrentUser(user): CurrentUser,
+    Query(query): Query<ListQuery>,
+) -> ApiResult<Json<ConversationPage>> {
+    let limit = query.limit.unwrap_or(50).clamp(1, 200);
+    let before = query.before.filter(|b| !b.is_empty());
+    let list = state
+        .db
+        .call(move |c| conversations::list_conversations(c, &user.id, before.as_deref(), limit))
+        .await?;
+    let next_before = (list.len() == limit)
+        .then(|| list.last().map(|c| c.updated_at.clone()))
+        .flatten();
+    Ok(Json(ConversationPage {
+        conversations: list,
+        next_before,
+    }))
+}
+
+/// `GET /api/conversations/:id`: with every message.
+pub async fn get_conversation(
+    State(state): State<AppState>,
+    CurrentUser(user): CurrentUser,
+    Path(id): Path<String>,
+) -> ApiResult<Response> {
+    let mut conversation = state
+        .db
+        .call(move |c| conversations::get_conversation(c, &user.id, &id))
+        .await?
+        .ok_or_else(ApiError::not_found)?;
+    state.replies.overlay(&mut conversation.messages);
+    Ok(Json(conversation).into_response())
+}
+
+#[derive(Deserialize)]
+pub struct PatchConversation {
+    title: Option<String>,
+    /// Switching branch.
+    active_leaf_id: Option<String>,
+}
+
+/// `PATCH /api/conversations/:id`: rename, or switch branch.
+pub async fn patch_conversation(
+    State(state): State<AppState>,
+    CurrentUser(user): CurrentUser,
+    Path(id): Path<String>,
+    ApiJson(body): ApiJson<PatchConversation>,
+) -> ApiResult<StatusCode> {
+    if let Some(title) = &body.title {
+        let title = title.trim().to_string();
+        if title.is_empty() || title.chars().count() > RENAME_MAX_CHARS {
+            return Err(ApiError::bad_request(format!(
+                "Titles are 1 to {RENAME_MAX_CHARS} characters long."
+            )));
+        }
+        let (owner, cid) = (user.id.clone(), id.clone());
+        if !state
+            .db
+            .call(move |c| conversations::rename_conversation(c, &owner, &cid, &title))
+            .await?
+        {
+            return Err(ApiError::not_found());
+        }
     }
+    if let Some(leaf) = body.active_leaf_id {
+        let (owner, cid) = (user.id.clone(), id.clone());
+        match state
+            .db
+            .call(move |c| conversations::set_active_leaf(c, &owner, &cid, &leaf))
+            .await?
+        {
+            SetLeaf::Done => {}
+            SetLeaf::NoConversation => return Err(ApiError::not_found()),
+            SetLeaf::BadLeaf => return Err(ApiError::bad_request("active_leaf_id isn't in this conversation.")),
+        }
+    }
+    Ok(StatusCode::NO_CONTENT)
+}
 
-    #[tokio::test]
-    async fn dropping_a_pending_stream_cancels_it_on_the_client() {
-        let chats = Arc::new(Chats::default());
-        let (tx, mut client) = mpsc::channel(4);
+/// `DELETE /api/conversations/:id`: with all its messages. Replies still
+/// being generated are stopped first.
+pub async fn delete_conversation(
+    State(state): State<AppState>,
+    CurrentUser(user): CurrentUser,
+    Path(id): Path<String>,
+) -> ApiResult<StatusCode> {
+    let (owner, cid) = (user.id.clone(), id.clone());
+    let exists = state
+        .db
+        .call(move |c| Ok(conversations::get_conversation(c, &owner, &cid)?.is_some()))
+        .await?;
+    if !exists {
+        return Err(ApiError::not_found());
+    }
+    state.replies.cancel_conversation(&id).await;
+    let owner = user.id.clone();
+    if !state
+        .db
+        .call(move |c| conversations::delete_conversation(c, &owner, &id))
+        .await?
+    {
+        return Err(ApiError::not_found());
+    }
+    Ok(StatusCode::NO_CONTENT)
+}
 
-        // Dropped while pending: cancel sent.
-        let rx = chats.register("r1", 1);
-        drop(reply_stream(
-            rx,
-            CancelOnDrop {
-                chats: chats.clone(),
-                request_id: "r1".into(),
-                tx: tx.clone(),
+// ---------------- sending and streaming ----------------
+
+#[derive(Deserialize)]
+pub struct SendBody {
+    /// The new user message. Leave it out to regenerate: a new reply to
+    /// `parent_id`, which must then be a user message.
+    content: Option<String>,
+    /// What this answers: normally the current leaf (a reply), an earlier
+    /// reply when editing, or null to start a new first message.
+    parent_id: Option<String>,
+    target: Target,
+}
+
+/// `POST /api/conversations/:id/messages`. A new conversation id (a UUID
+/// made by the browser) creates the conversation. Streams the reply; closing
+/// the stream doesn't stop it.
+pub async fn send_message(
+    State(state): State<AppState>,
+    CurrentUser(user): CurrentUser,
+    Path(conversation_id): Path<String>,
+    ApiJson(body): ApiJson<SendBody>,
+) -> ApiResult<Response> {
+    if Uuid::parse_str(&conversation_id).is_err() {
+        return Err(ApiError::bad_request("Conversation ids are UUIDs."));
+    }
+    if let Some(content) = &body.content {
+        if content.trim().is_empty() {
+            return Err(ApiError::bad_request("The message is empty."));
+        }
+        let max = state.settings.chat.max_message_chars;
+        if content.chars().count() > max {
+            return Err(ApiError::bad_request(format!(
+                "Messages can be at most {max} characters long."
+            )));
+        }
+    }
+    check_target(&state, &user, &body.target).await?;
+
+    let max_active = state.settings.chat.max_active_replies_per_user;
+    let (owner, cid) = (user.id.clone(), conversation_id.clone());
+    let (content, parent_id) = (body.content, body.parent_id);
+    let outcome = state
+        .db
+        .call(move |c| {
+            conversations::create_turn(
+                c,
+                conversations::NewTurn {
+                    owner: &owner,
+                    conversation_id: &cid,
+                    content: content.as_deref(),
+                    parent_id: parent_id.as_deref(),
+                    max_active_per_user: max_active,
+                },
+            )
+        })
+        .await?;
+    let (new_conversation, user_message, reply) = match outcome {
+        TurnOutcome::Created(turn) => (turn.new_conversation, turn.user_message, turn.reply),
+        TurnOutcome::NotFound => return Err(ApiError::not_found()),
+        TurnOutcome::BadParent(why) => return Err(ApiError::bad_request(why)),
+        TurnOutcome::Busy(busy) => return Err(busy_error(busy)),
+    };
+    let created = event(
+        "created",
+        json!({ "conversation": new_conversation, "user_message": user_message, "reply": reply }),
+    );
+    if let Err(StartError::Internal(e)) = state.replies.start(&reply.id, &body.target).await {
+        log(format!("[chat] couldn't start {}: {e:#}", reply.id));
+    }
+    Ok(reply_stream(state, user.id, reply.id, Some(created)))
+}
+
+/// `GET /api/messages/:id/stream`: reconnect to a reply. A finished one gets
+/// its snapshot and `end` straight away.
+pub async fn stream_message(
+    State(state): State<AppState>,
+    CurrentUser(user): CurrentUser,
+    Path(message_id): Path<String>,
+) -> ApiResult<Response> {
+    let message = load_message(&state, &user, &message_id).await?;
+    if message.role != MessageRole::Assistant {
+        return Err(ApiError::bad_request("Only replies stream."));
+    }
+    Ok(reply_stream(state, user.id, message_id, None))
+}
+
+/// `POST /api/messages/:id/cancel`: the Stop button. Keeps the text so far.
+pub async fn cancel_message(
+    State(state): State<AppState>,
+    CurrentUser(user): CurrentUser,
+    Path(message_id): Path<String>,
+) -> ApiResult<Json<Message>> {
+    let message = load_message(&state, &user, &message_id).await?;
+    if message.role != MessageRole::Assistant {
+        return Err(ApiError::bad_request("Only replies can be stopped."));
+    }
+    state.replies.cancel(&message_id).await;
+    Ok(Json(load_message(&state, &user, &message_id).await?))
+}
+
+#[derive(Deserialize, Default)]
+pub struct RetryBody {
+    /// Default: the client and model that answered last time.
+    target: Option<Target>,
+}
+
+/// `POST /api/messages/:id/retry`: a new attempt at a `failed` or `orphaned`
+/// reply, in place. The body (`{ target }`) is optional. Streams like a send.
+pub async fn retry_message(
+    State(state): State<AppState>,
+    CurrentUser(user): CurrentUser,
+    Path(message_id): Path<String>,
+    body: Bytes,
+) -> ApiResult<Response> {
+    let body: RetryBody = if body.iter().all(u8::is_ascii_whitespace) {
+        RetryBody::default()
+    } else {
+        serde_json::from_slice(&body).map_err(|e| ApiError::bad_request(format!("Invalid request body: {e}")))?
+    };
+    let message = load_message(&state, &user, &message_id).await?;
+    if message.role != MessageRole::Assistant {
+        return Err(ApiError::bad_request("Only replies can be retried."));
+    }
+    let target = match body.target {
+        Some(target) => target,
+        None => match (&message.client_id, &message.model) {
+            (Some(client_id), Some(model)) => Target::Client {
+                client_id: client_id.clone(),
+                model: model.clone(),
             },
-            Duration::from_secs(60),
-        ));
-        assert!(matches!(
-            client.try_recv(),
-            Ok(ServerMessage::ChatCancel { request_id }) if request_id == "r1"
-        ));
-
-        // Finished normally: no cancel.
-        let rx = chats.register("r2", 1);
-        chats.deliver(1, "r2", ChatEvent::Done);
-        drop(reply_stream(
-            rx,
-            CancelOnDrop {
-                chats: chats.clone(),
-                request_id: "r2".into(),
-                tx,
-            },
-            Duration::from_secs(60),
-        ));
-        assert!(client.try_recv().is_err());
+            _ => {
+                return Err(ApiError::bad_request(
+                    "The client that answered no longer exists. Choose another one.",
+                ))
+            }
+        },
+    };
+    check_target(&state, &user, &target).await?;
+    match state.replies.retry(&user.id, &message_id, &target).await {
+        Ok(()) => {}
+        Err(RetryError::NotFound) => return Err(ApiError::not_found()),
+        Err(RetryError::NotRetryable(_)) => {
+            return Err(ApiError::conflict("Only failed or interrupted replies can be retried."))
+        }
+        Err(RetryError::Busy(busy)) => return Err(busy_error(busy)),
+        Err(RetryError::Internal(e)) => return Err(e.into()),
     }
+    let reply = load_message(&state, &user, &message_id).await?;
+    let created = event("created", json!({ "reply": reply }));
+    Ok(reply_stream(state, user.id, message_id, Some(created)))
+}
+
+/// 404 unless `user` owns the message's conversation.
+async fn load_message(state: &AppState, user: &User, message_id: &str) -> ApiResult<Message> {
+    let (owner, id) = (user.id.clone(), message_id.to_string());
+    let mut message = state
+        .db
+        .call(move |c| conversations::get_message(c, &owner, &id))
+        .await?
+        .ok_or_else(ApiError::not_found)?;
+    state.replies.overlay(std::slice::from_mut(&mut message));
+    Ok(message)
+}
+
+fn event(name: &str, data: serde_json::Value) -> Event {
+    Event::default().event(name).data(data.to_string())
+}
+
+/// An SSE response fed by a task that follows the reply's hub. Dropping the
+/// response (the browser went away) only stops the task.
+fn reply_stream(state: AppState, owner: String, message_id: String, first: Option<Event>) -> Response {
+    let (tx, rx) = mpsc::channel::<Event>(64);
+    tokio::spawn(pump(state, owner, message_id, first, tx));
+    let events = stream::unfold(rx, |mut rx| async move {
+        rx.recv().await.map(|e| (Ok::<_, Infallible>(e), rx))
+    });
+    // Keep-alive comments stop proxies (Cloudflare drops idle responses
+    // after 100 s) from cutting off a slow first token.
+    Sse::new(events).keep_alive(KeepAlive::default()).into_response()
+}
+
+async fn pump(state: AppState, owner: String, message_id: String, first: Option<Event>, tx: mpsc::Sender<Event>) {
+    if let Some(first) = first {
+        if tx.send(first).await.is_err() {
+            return;
+        }
+    }
+    let mut misses = 0;
+    loop {
+        let Some((snapshot, mut rx)) = state.replies.attach(&message_id) else {
+            // Finished: everything is in the database.
+            let (o, id) = (owner.clone(), message_id.clone());
+            let message = match state.db.call(move |c| conversations::get_message(c, &o, &id)).await {
+                Ok(Some(m)) => m,
+                Ok(None) => return,
+                Err(e) => {
+                    log(format!("[chat] stream for {message_id}: {e:#}"));
+                    return;
+                }
+            };
+            // Active with no hub only for a reply between being created and
+            // started; give it a moment.
+            if message.status.is_active() && misses < 10 {
+                misses += 1;
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                continue;
+            }
+            let _ = tx.send(event("snapshot", snapshot_json(&message))).await;
+            let _ = tx
+                .send(event(
+                    "end",
+                    json!({ "status": message.status, "error": message.error }),
+                ))
+                .await;
+            return;
+        };
+        if tx
+            .send(event("snapshot", serde_json::to_value(&snapshot).unwrap_or_default()))
+            .await
+            .is_err()
+        {
+            return;
+        }
+        loop {
+            let next = tokio::select! {
+                _ = tx.closed() => return,
+                next = rx.recv() => next,
+            };
+            let out = match next {
+                Ok(ReplyEvent::Chunk(delta)) => event("chunk", json!({ "delta": delta })),
+                Ok(ReplyEvent::Status(s)) => event(
+                    "status",
+                    json!({
+                        "status": s.status,
+                        "client_id": s.client_id,
+                        "client_label": s.client_label,
+                        "model": s.model,
+                    }),
+                ),
+                Ok(ReplyEvent::End { status, error }) => {
+                    let _ = tx.send(event("end", json!({ "status": status, "error": error }))).await;
+                    return;
+                }
+                // Too slow to keep up, or the hub went: start over from a
+                // fresh snapshot.
+                Err(RecvError::Lagged(_)) | Err(RecvError::Closed) => break,
+            };
+            if tx.send(out).await.is_err() {
+                return;
+            }
+        }
+    }
+}
+
+fn snapshot_json(m: &Message) -> serde_json::Value {
+    json!({
+        "message_id": m.id,
+        "status": m.status,
+        "content": m.content,
+        "error": m.error,
+        "client_id": m.client_id,
+        "client_label": m.client_label,
+        "model": m.model,
+    })
 }

@@ -1,4 +1,5 @@
 import SendIcon from '@mui/icons-material/Send'
+import StopCircleIcon from '@mui/icons-material/StopCircle'
 import IconButton from '@mui/material/IconButton'
 import InputBase from '@mui/material/InputBase'
 import Paper from '@mui/material/Paper'
@@ -12,23 +13,39 @@ import ModelPicker from './ModelPicker'
 const MAX_LINES = 15
 
 interface Props {
-  onSend: (text: string) => void
-  /** Blocks sending (e.g. while a reply is pending); typing is still allowed. */
+  /** Resolves false if the message wasn't accepted, to put the text back. */
+  onSend: (text: string) => Promise<boolean> | boolean
+  /** Blocks sending (e.g. no model); typing is still allowed. */
   disabled?: boolean
+  /** A reply is being generated: Stop replaces Send. */
+  generating?: boolean
+  canStop?: boolean
+  onStop?: () => void
   models: ModelOption[]
   modelId: string | null
   onSelectModel: (id: string) => void
   onOpenModels?: () => void
 }
 
-export default function Composer({ onSend, disabled = false, models, modelId, onSelectModel, onOpenModels }: Props) {
+export default function Composer({
+  onSend,
+  disabled = false,
+  generating = false,
+  canStop = false,
+  onStop,
+  models,
+  modelId,
+  onSelectModel,
+  onOpenModels,
+}: Props) {
   const [text, setText] = useState('')
-  const canSend = !disabled && text.trim().length > 0
+  const canSend = !disabled && !generating && text.trim().length > 0
 
-  const submit = () => {
+  const submit = async () => {
     if (!canSend) return
-    onSend(text.trim())
+    const sent = text.trim()
     setText('')
+    if (!(await onSend(sent))) setText((current) => current || sent)
   }
 
   // Enter sends, Shift+Enter is a newline. Ignored mid-IME composition so
@@ -36,7 +53,7 @@ export default function Composer({ onSend, disabled = false, models, modelId, on
   const handleKeyDown = (e: KeyboardEvent) => {
     if (e.key === 'Enter' && !e.shiftKey && !e.nativeEvent.isComposing) {
       e.preventDefault()
-      submit()
+      void submit()
     }
   }
 
@@ -55,16 +72,26 @@ export default function Composer({ onSend, disabled = false, models, modelId, on
         inputProps={{ 'aria-label': 'Message' }}
         sx={{ p: 0 }}
       />
-      <Stack direction="row" sx={{ alignItems: 'center', justifyContent: 'space-between', mt: 1, ml: -1 }}>
+      <Stack direction="row" sx={{ alignItems: 'center', justifyContent: 'space-between', mt: 1, ml: -1, minWidth: 0 }}>
         <ModelPicker models={models} selectedId={modelId} onSelect={onSelectModel} onOpen={onOpenModels} />
-        <Tooltip title="Send (Enter)">
-          {/* span: Tooltip needs an element that fires events even when the button is disabled. */}
-          <span>
-            <IconButton color="primary" onClick={submit} disabled={!canSend} aria-label="Send message">
-              <SendIcon />
-            </IconButton>
-          </span>
-        </Tooltip>
+        {generating ? (
+          <Tooltip title="Stop generating">
+            {/* span: Tooltip needs an element that fires events even when the button is disabled. */}
+            <span>
+              <IconButton color="primary" onClick={onStop} disabled={!canStop} aria-label="Stop generating">
+                <StopCircleIcon />
+              </IconButton>
+            </span>
+          </Tooltip>
+        ) : (
+          <Tooltip title="Send (Enter)">
+            <span>
+              <IconButton color="primary" onClick={() => void submit()} disabled={!canSend} aria-label="Send message">
+                <SendIcon />
+              </IconButton>
+            </span>
+          </Tooltip>
+        )}
       </Stack>
     </Paper>
   )

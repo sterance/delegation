@@ -101,9 +101,71 @@ pub struct Settings {
     pub last_seen_flush_interval: Duration,
     pub metrics: MetricsLimits,
     pub pairing_code_ttl_secs: u64,
-    /// The longest a chat reply may go without a chunk (or its first one) before it's abandoned.
-    pub chat_idle_timeout: Duration,
+    pub chat: ChatSettings,
     pub dashboard: DashboardConfig,
+    pub http: HttpSettings,
+    pub auth: AuthSettings,
+}
+
+/// How the server sits on the internet: origins, cookies, client IPs.
+#[derive(Debug, Clone, PartialEq)]
+pub struct HttpSettings {
+    /// Normalised (`scheme://host[:port]`, lowercase, no default port).
+    pub public_origin: String,
+    /// Also normalised. Accepted for `Origin` checks alongside `public_origin`.
+    pub extra_allowed_origins: Vec<String>,
+    pub cookie_secure: bool,
+    pub trust_cf_connecting_ip: bool,
+}
+
+impl HttpSettings {
+    /// Whether a request's `Origin` header value is one this site accepts.
+    pub fn origin_allowed(&self, origin: &str) -> bool {
+        normalize_origin(origin).is_some_and(|o| o == self.public_origin || self.extra_allowed_origins.contains(&o))
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Argon2Settings {
+    pub memory_kib: u32,
+    pub iterations: u32,
+    pub parallelism: u32,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct AuthSettings {
+    pub session_idle_timeout: Duration,
+    /// Lifetime of a "Remember me" session.
+    pub session_absolute_timeout: Duration,
+    /// `SESSION_ABSOLUTE_TIMEOUT_DAYS`, for the login page's checkbox.
+    pub remember_days: u64,
+    /// Lifetime of a session without "Remember me".
+    pub session_short_timeout: Duration,
+    pub session_touch_interval: Duration,
+    pub password_min_len: usize,
+    pub password_max_len: usize,
+    pub argon2: Argon2Settings,
+    pub login_max_failures: usize,
+    pub login_max_failures_per_ip: usize,
+    pub login_window: Duration,
+    pub enroll_max_attempts_per_ip: usize,
+    pub signup_enabled: bool,
+    pub signup_max_per_ip: usize,
+    pub signup_window: Duration,
+    pub password_reset_ttl: Duration,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ChatSettings {
+    /// The longest a reply may go without a chunk (or its first one) before it's failed.
+    pub idle_timeout: Duration,
+    /// How often a streaming reply's text is written to the database.
+    pub flush_interval: Duration,
+    /// 0 keeps conversations forever.
+    pub retention_days: u64,
+    pub max_message_chars: usize,
+    pub max_reply_chars: usize,
+    pub max_active_replies_per_user: usize,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -115,7 +177,7 @@ pub struct MetricsLimits {
     pub max_string_len: usize,
 }
 
-/// What `GET /api/admin/dashboard-config` returns. Field names are the
+/// What `GET /api/dashboard-config` returns. Field names are the
 /// variable names, lowercased, minus the `DASHBOARD_` prefix; mirrored by
 /// hand in `frontend/src/api.ts`.
 #[derive(Debug, Clone, Serialize, PartialEq)]
@@ -214,6 +276,36 @@ impl Settings {
         // ---- chat ----
         // Generous: a model's first token can take a while if it has to load.
         let chat_idle = p.int("CHAT_IDLE_TIMEOUT_MS", 120_000, 1);
+        let chat_flush = p.int("CHAT_FLUSH_INTERVAL_MS", 3_000, 1);
+        let chat_retention_days = p.int("CHAT_RETENTION_DAYS", 0, 0);
+        let chat_max_message = p.int("CHAT_MAX_MESSAGE_CHARS", 100_000, 1);
+        let chat_max_reply = p.int("CHAT_MAX_REPLY_CHARS", 400_000, 1);
+        let chat_max_active = p.int("CHAT_MAX_ACTIVE_REPLIES_PER_USER", 3, 1);
+
+        // ---- http: origins, cookies, client IPs ----
+        let public_origin = p.origin("PUBLIC_ORIGIN", "https://llm.smith-c.com");
+        let extra_origins = p.origin_list("EXTRA_ALLOWED_ORIGINS");
+        let cookie_secure = p.bool("COOKIE_SECURE", true);
+        let trust_cf_ip = p.bool("TRUST_CF_CONNECTING_IP", true);
+
+        // ---- auth ----
+        let idle_hours = p.int("SESSION_IDLE_TIMEOUT_HOURS", 168, 1);
+        let absolute_days = p.int("SESSION_ABSOLUTE_TIMEOUT_DAYS", 30, 1);
+        let short_hours = p.int("SESSION_SHORT_TIMEOUT_HOURS", 12, 1);
+        let touch_secs = p.int("SESSION_TOUCH_INTERVAL_SECS", 300, 1);
+        let password_min = p.int("AUTH_PASSWORD_MIN_LEN", 12, 1);
+        let password_max = p.int("AUTH_PASSWORD_MAX_LEN", 256, 1);
+        let argon2_memory = p.int("AUTH_ARGON2_MEMORY_KIB", 19_456, 8);
+        let argon2_iterations = p.int("AUTH_ARGON2_ITERATIONS", 2, 1);
+        let argon2_parallelism = p.int("AUTH_ARGON2_PARALLELISM", 1, 1);
+        let login_max = p.int("AUTH_LOGIN_MAX_FAILURES", 5, 1);
+        let login_max_ip = p.int("AUTH_LOGIN_MAX_FAILURES_PER_IP", 20, 1);
+        let login_window = p.int("AUTH_LOGIN_WINDOW_SECS", 900, 1);
+        let enroll_max_ip = p.int("ENROLL_MAX_ATTEMPTS_PER_IP", 10, 1);
+        let signup_enabled = p.bool("AUTH_SIGNUP_ENABLED", true);
+        let signup_max_ip = p.int("AUTH_SIGNUP_MAX_PER_IP", 5, 1);
+        let signup_window = p.int("AUTH_SIGNUP_WINDOW_SECS", 3_600, 1);
+        let reset_ttl_hours = p.int("PASSWORD_RESET_TTL_HOURS", 24, 1);
 
         // ---- dashboard ----
         let poll = p.int("DASHBOARD_POLL_INTERVAL_MS", 1_000, 1);
@@ -240,6 +332,33 @@ impl Settings {
             p.errors.push(format!(
                 "METRICS_MIN_SPACING_MS ({min_spacing}) must be less than TICK_INTERVAL_MS ({tick}), \
                  or every sample would be dropped"
+            ));
+        }
+        if password_max < password_min {
+            p.errors.push(format!(
+                "AUTH_PASSWORD_MAX_LEN ({password_max}) must be at least AUTH_PASSWORD_MIN_LEN ({password_min})"
+            ));
+        }
+        // Argon2's own limits: lanes up to 2^24 - 1, and at least 8 KiB of memory per lane.
+        let argon2 = Argon2Settings {
+            memory_kib: u32::try_from(argon2_memory).unwrap_or(u32::MAX),
+            iterations: u32::try_from(argon2_iterations).unwrap_or(u32::MAX),
+            parallelism: u32::try_from(argon2_parallelism).unwrap_or(u32::MAX),
+        };
+        if argon2_parallelism > 0xff_ffff {
+            p.errors.push(format!(
+                "AUTH_ARGON2_PARALLELISM must be at most 16777215, got {argon2_parallelism}"
+            ));
+        } else if argon2_memory < 8 * argon2_parallelism {
+            p.errors.push(format!(
+                "AUTH_ARGON2_MEMORY_KIB ({argon2_memory}) must be at least 8 x AUTH_ARGON2_PARALLELISM ({argon2_parallelism}), \
+                 i.e. at least {}",
+                8 * argon2_parallelism
+            ));
+        } else if argon2::Params::new(argon2.memory_kib, argon2.iterations, argon2.parallelism, None).is_err() {
+            p.errors.push(format!(
+                "AUTH_ARGON2_MEMORY_KIB ({argon2_memory}), AUTH_ARGON2_ITERATIONS ({argon2_iterations}) and \
+                 AUTH_ARGON2_PARALLELISM ({argon2_parallelism}) aren't valid Argon2 parameters"
             ));
         }
 
@@ -270,7 +389,38 @@ impl Settings {
                 max_string_len: max_string_len as usize,
             },
             pairing_code_ttl_secs: pairing_ttl,
-            chat_idle_timeout: Duration::from_millis(chat_idle),
+            chat: ChatSettings {
+                idle_timeout: Duration::from_millis(chat_idle),
+                flush_interval: Duration::from_millis(chat_flush),
+                retention_days: chat_retention_days,
+                max_message_chars: chat_max_message as usize,
+                max_reply_chars: chat_max_reply as usize,
+                max_active_replies_per_user: chat_max_active as usize,
+            },
+            http: HttpSettings {
+                public_origin,
+                extra_allowed_origins: extra_origins,
+                cookie_secure,
+                trust_cf_connecting_ip: trust_cf_ip,
+            },
+            auth: AuthSettings {
+                session_idle_timeout: hours(idle_hours),
+                session_absolute_timeout: hours(absolute_days.saturating_mul(24)),
+                remember_days: absolute_days,
+                session_short_timeout: hours(short_hours),
+                session_touch_interval: Duration::from_secs(touch_secs),
+                password_min_len: password_min as usize,
+                password_max_len: password_max as usize,
+                argon2,
+                login_max_failures: login_max as usize,
+                login_max_failures_per_ip: login_max_ip as usize,
+                login_window: Duration::from_secs(login_window),
+                enroll_max_attempts_per_ip: enroll_max_ip as usize,
+                signup_enabled,
+                signup_max_per_ip: signup_max_ip as usize,
+                signup_window: Duration::from_secs(signup_window),
+                password_reset_ttl: hours(reset_ttl_hours),
+            },
             dashboard: DashboardConfig {
                 poll_interval_ms: poll,
                 pause_when_hidden,
@@ -295,6 +445,7 @@ impl Settings {
         let c = &self.client;
         let m = &self.metrics;
         let d = &self.dashboard;
+        let a = &self.auth;
         vec![
             format!(
                 "server: port {}, log level {}, auth timeout {} ms, db {}, frontend {}",
@@ -331,7 +482,51 @@ impl Settings {
                 "pairing: code TTL {} s, dashboard polls its status every {} ms",
                 self.pairing_code_ttl_secs, d.pairing_poll_interval_ms
             ),
-            format!("chat: idle timeout {} ms", self.chat_idle_timeout.as_millis()),
+            format!(
+                "chat: idle timeout {} ms, flush every {} ms, retention {}, max message {} chars, \
+                 max reply {} chars, {} active repl(ies) per user",
+                self.chat.idle_timeout.as_millis(),
+                self.chat.flush_interval.as_millis(),
+                match self.chat.retention_days {
+                    0 => "forever".to_string(),
+                    days => format!("{days} day(s)"),
+                },
+                self.chat.max_message_chars,
+                self.chat.max_reply_chars,
+                self.chat.max_active_replies_per_user
+            ),
+            format!(
+                "http: public origin {}, extra origins [{}], secure cookie {}, trust CF-Connecting-IP {}",
+                self.http.public_origin,
+                self.http.extra_allowed_origins.join(", "),
+                self.http.cookie_secure,
+                self.http.trust_cf_connecting_ip
+            ),
+            format!(
+                "auth: sign-up {}, sessions idle {} h / remember-me {} d / otherwise {} h, touch every {} s, \
+                 passwords {}..{} chars, argon2id m={} KiB t={} p={}, reset links valid {} h",
+                if a.signup_enabled { "enabled" } else { "disabled" },
+                a.session_idle_timeout.as_secs() / 3600,
+                a.remember_days,
+                a.session_short_timeout.as_secs() / 3600,
+                a.session_touch_interval.as_secs(),
+                a.password_min_len,
+                a.password_max_len,
+                a.argon2.memory_kib,
+                a.argon2.iterations,
+                a.argon2.parallelism,
+                a.password_reset_ttl.as_secs() / 3600
+            ),
+            format!(
+                "rate limits: {} failed logins per username+IP and {} per IP every {} s, {} enrolls per IP \
+                 in the same window, {} sign-ups per IP every {} s",
+                a.login_max_failures,
+                a.login_max_failures_per_ip,
+                a.login_window.as_secs(),
+                a.enroll_max_attempts_per_ip,
+                a.signup_max_per_ip,
+                a.signup_window.as_secs()
+            ),
             format!(
                 "dashboard: poll every {} ms, pause when hidden {}, graph {}x{} px grid {} px, \
                  colours line {} grid {} bg {}, {} GPU(s) when collapsed, blink every {} ms",
@@ -348,6 +543,52 @@ impl Settings {
             ),
         ]
     }
+}
+
+impl Settings {
+    /// Valid but probably unintended combinations, for startup warnings.
+    pub fn warnings(&self) -> Vec<String> {
+        let mut warnings = Vec::new();
+        if self.http.cookie_secure && self.http.public_origin.starts_with("http://") {
+            warnings.push(format!(
+                "COOKIE_SECURE is true but PUBLIC_ORIGIN ({}) is plain http: browsers won't send the session \
+                 cookie except on localhost. Set COOKIE_SECURE=false for plain-http deployments.",
+                self.http.public_origin
+            ));
+        }
+        warnings
+    }
+}
+
+fn hours(n: u64) -> Duration {
+    Duration::from_secs(n.saturating_mul(3600))
+}
+
+/// `scheme://host[:port]` as a browser sends it in `Origin`: lowercase, no
+/// path, no default port. None if it isn't an http(s) origin.
+pub fn normalize_origin(raw: &str) -> Option<String> {
+    let value = raw.trim().trim_end_matches('/');
+    let (scheme, authority) = value.split_once("://")?;
+    let scheme = scheme.to_ascii_lowercase();
+    let default_port = match scheme.as_str() {
+        "https" => ":443",
+        "http" => ":80",
+        _ => return None,
+    };
+    let authority = authority.to_ascii_lowercase();
+    if authority.is_empty() || authority.contains(|c: char| matches!(c, '/' | '?' | '#' | '@') || c.is_whitespace()) {
+        return None;
+    }
+    let (host, port) = match authority.rsplit_once(':') {
+        // An IPv6 literal's colons sit inside brackets.
+        Some((host, port)) if !port.contains(']') => (host, Some(port)),
+        _ => (authority.as_str(), None),
+    };
+    if host.is_empty() || port.is_some_and(|p| p.is_empty() || !p.chars().all(|c| c.is_ascii_digit())) {
+        return None;
+    }
+    let authority = authority.strip_suffix(default_port).unwrap_or(&authority);
+    Some(format!("{scheme}://{authority}"))
 }
 
 struct Parser<'a> {
@@ -412,6 +653,31 @@ impl Parser<'_> {
         }
     }
 
+    fn origin(&mut self, key: &str, default: &str) -> String {
+        let raw = self.string(key, default);
+        normalize_origin(&raw).unwrap_or_else(|| {
+            self.errors.push(format!(
+                "{key} must be an origin like https://example.com or http://localhost:5173 (no path), got {raw:?}"
+            ));
+            default.to_string()
+        })
+    }
+
+    /// Comma-separated origins; blank entries are skipped.
+    fn origin_list(&mut self, key: &str) -> Vec<String> {
+        let raw = self.string(key, "");
+        let mut origins = Vec::new();
+        for entry in raw.split(',').map(str::trim).filter(|e| !e.is_empty()) {
+            match normalize_origin(entry) {
+                Some(origin) => origins.push(origin),
+                None => self.errors.push(format!(
+                    "{key} must be comma-separated origins like http://localhost:5173 (no paths), got {entry:?}"
+                )),
+            }
+        }
+        origins
+    }
+
     fn at_least_twice(&mut self, key: &str, value: u64, other_key: &str, other: u64) {
         if value < other.saturating_mul(2) {
             self.errors.push(format!(
@@ -467,7 +733,52 @@ mod tests {
             }
         );
         assert_eq!(s.pairing_code_ttl_secs, 600);
-        assert_eq!(s.chat_idle_timeout, Duration::from_millis(120_000));
+        assert_eq!(
+            s.chat,
+            ChatSettings {
+                idle_timeout: Duration::from_millis(120_000),
+                flush_interval: Duration::from_millis(3_000),
+                retention_days: 0,
+                max_message_chars: 100_000,
+                max_reply_chars: 400_000,
+                max_active_replies_per_user: 3,
+            }
+        );
+        assert_eq!(
+            s.http,
+            HttpSettings {
+                public_origin: "https://llm.smith-c.com".into(),
+                extra_allowed_origins: vec![],
+                cookie_secure: true,
+                trust_cf_connecting_ip: true,
+            }
+        );
+        assert_eq!(
+            s.auth,
+            AuthSettings {
+                session_idle_timeout: Duration::from_secs(168 * 3600),
+                session_absolute_timeout: Duration::from_secs(30 * 24 * 3600),
+                remember_days: 30,
+                session_short_timeout: Duration::from_secs(12 * 3600),
+                session_touch_interval: Duration::from_secs(300),
+                password_min_len: 12,
+                password_max_len: 256,
+                argon2: Argon2Settings {
+                    memory_kib: 19_456,
+                    iterations: 2,
+                    parallelism: 1,
+                },
+                login_max_failures: 5,
+                login_max_failures_per_ip: 20,
+                login_window: Duration::from_secs(900),
+                enroll_max_attempts_per_ip: 10,
+                signup_enabled: true,
+                signup_max_per_ip: 5,
+                signup_window: Duration::from_secs(3600),
+                password_reset_ttl: Duration::from_secs(24 * 3600),
+            }
+        );
+        assert!(s.warnings().is_empty());
         assert_eq!(
             s.dashboard,
             DashboardConfig {
@@ -574,6 +885,54 @@ mod tests {
     fn reports_every_problem_at_once() {
         let errors = parse(&[("TICK_INTERVAL_MS", "x"), ("DASHBOARD_GRAPH_BG_COLOR", "black")]).unwrap_err();
         assert_eq!(errors.len(), 2, "{errors:?}");
+    }
+
+    #[test]
+    fn origins_are_normalised_and_validated() {
+        let s = parse(&[
+            ("PUBLIC_ORIGIN", "HTTPS://Example.com:443/"),
+            ("EXTRA_ALLOWED_ORIGINS", "http://localhost:5173, ,http://127.0.0.1:80"),
+        ])
+        .unwrap();
+        assert_eq!(s.http.public_origin, "https://example.com");
+        assert_eq!(
+            s.http.extra_allowed_origins,
+            vec!["http://localhost:5173".to_string(), "http://127.0.0.1".to_string()]
+        );
+        assert!(s.http.origin_allowed("https://example.com"));
+        assert!(s.http.origin_allowed("http://localhost:5173"));
+        assert!(!s.http.origin_allowed("https://evil.example"));
+        assert!(!s.http.origin_allowed("null"));
+        assert!(!s.http.origin_allowed("http://localhost:5174"));
+
+        rejects(&[("PUBLIC_ORIGIN", "llm.smith-c.com")], "PUBLIC_ORIGIN");
+        rejects(&[("PUBLIC_ORIGIN", "https://llm.smith-c.com/app")], "PUBLIC_ORIGIN");
+        rejects(&[("PUBLIC_ORIGIN", "ftp://llm.smith-c.com")], "PUBLIC_ORIGIN");
+        rejects(
+            &[("EXTRA_ALLOWED_ORIGINS", "http://ok.test,http://bad.test:x")],
+            "EXTRA_ALLOWED_ORIGINS",
+        );
+    }
+
+    #[test]
+    fn auth_rules_between_values() {
+        rejects(
+            &[("AUTH_PASSWORD_MIN_LEN", "20"), ("AUTH_PASSWORD_MAX_LEN", "19")],
+            "AUTH_PASSWORD_MAX_LEN",
+        );
+        rejects(
+            &[("AUTH_ARGON2_PARALLELISM", "4"), ("AUTH_ARGON2_MEMORY_KIB", "31")],
+            "AUTH_ARGON2_MEMORY_KIB",
+        );
+        rejects(&[("AUTH_ARGON2_ITERATIONS", "0")], "AUTH_ARGON2_ITERATIONS");
+        rejects(&[("AUTH_SIGNUP_ENABLED", "sometimes")], "AUTH_SIGNUP_ENABLED");
+        let s = parse(&[("COOKIE_SECURE", "false"), ("SESSION_ABSOLUTE_TIMEOUT_DAYS", "7")]).unwrap();
+        assert!(!s.http.cookie_secure);
+        assert_eq!(s.auth.remember_days, 7);
+        assert_eq!(s.auth.session_absolute_timeout, Duration::from_secs(7 * 86400));
+        // Allowed but warned about.
+        let s = parse(&[("PUBLIC_ORIGIN", "http://192.168.1.5:7070")]).unwrap();
+        assert_eq!(s.warnings().len(), 1);
     }
 
     #[test]

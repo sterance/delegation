@@ -2,10 +2,22 @@
 // always relative: in production this app is served same-origin by the
 // Rust server, and in dev Vite proxies them (see vite.config.ts).
 //
-// No auth here on purpose — Cloudflare Access sits in front of the whole
-// origin, and same-origin fetches already carry its cookie.
+// Every call sends the session cookie. Any 401 (outside the login calls
+// themselves) tells the app the session has gone, and it shows the login
+// page; see setUnauthorizedHandler.
 
-import type { ChatModel, ChatRequest } from './types/chat'
+import type {
+  ChatMessage,
+  ChatModel,
+  Conversation,
+  ConversationPage,
+  MessageStatus,
+  ReplyEvent,
+  SendRequest,
+  Target,
+} from './types/chat'
+
+export type AccessKind = 'admin' | 'owner'
 
 export interface Client {
   client_id: string
@@ -17,6 +29,14 @@ export interface Client {
   last_seen_at: string | null
   /** Live: true only while the client has an authenticated WebSocket open. */
   connected: boolean
+  /** Whoever minted the pairing code it enrolled with. */
+  owner: { user_id: string; username: string }
+  access: AccessKind
+  /** Decide what to offer from these, never from the user's role. */
+  can_use: boolean
+  can_manage: boolean
+  /** Jobs (chat replies) it's working on now, whoever started them; the card's blue dot blinks while above 0. */
+  active_jobs: number
   // From the client's `info` message: null until the client has connected once.
   os: string | null
   client_version: string | null
@@ -30,7 +50,7 @@ export interface Client {
 export interface ClientsResponse {
   /** Random per server start. A change means the server restarted and `seq` numbering began again. */
   epoch: string
-  /** Newest sample seq across all clients: the next poll's `since`. */
+  /** The next poll's `since`. */
   latest_seq: number
   clients: Client[]
 }
@@ -74,7 +94,7 @@ export interface DashboardConfig {
   graph_grid_color: string
   graph_bg_color: string
   collapsed_max_gpus: number
-  /** One full bright-dim-bright cycle of the blue dot. */
+  /** One full bright-dim-bright cycle of the blue dot, which blinks while the client is working on a job. */
   blink_period_ms: number
   /** Samples kept per client, which is also each graph's width in samples. */
   metrics_history_samples: number
@@ -82,7 +102,7 @@ export interface DashboardConfig {
   pairing_code_ttl_secs: number
 }
 
-/** Used if `/api/admin/dashboard-config` can't be loaded. Matches the server's compiled defaults. */
+/** Used if `/api/dashboard-config` can't be loaded. Matches the server's compiled defaults. */
 export const DEFAULT_DASHBOARD_CONFIG: DashboardConfig = {
   poll_interval_ms: 1000,
   pause_when_hidden: true,
@@ -155,6 +175,50 @@ export interface PairingCodeStatus {
   claimed_by: ClaimedBy | null
 }
 
+// ---- auth: mirrors server/src/auth ----
+
+export type Role = 'admin' | 'user'
+
+export interface User {
+  id: string
+  username: string
+  role: Role
+}
+
+/** `GET /api/auth/status`. */
+export interface AuthStatus {
+  /** No admin yet: everyone goes to /setup. */
+  setup_required: boolean
+  signup_enabled: boolean
+  password_min_len: number
+  password_max_len: number
+  /** SESSION_ABSOLUTE_TIMEOUT_DAYS, for "Remember me for N days". */
+  remember_days: number
+}
+
+export interface UserSummary {
+  id: string
+  username: string
+  role: Role
+  created_at: string
+  disabled_at: string | null
+  client_count: number
+  conversation_count: number
+  last_active_at: string | null
+}
+
+export interface UsersResponse {
+  signup_enabled: boolean
+  /** Newest first. */
+  users: UserSummary[]
+}
+
+export interface ResetLink {
+  /** Shown once: the server only keeps its hash. */
+  url: string
+  expires_at: string
+}
+
 export class ApiError extends Error {
   readonly status: number
 
@@ -165,7 +229,23 @@ export class ApiError extends Error {
   }
 }
 
-async function request<T>(method: 'GET' | 'POST' | 'PATCH' | 'DELETE', path: string, body?: unknown): Promise<T> {
+let unauthorized: (() => void) | null = null
+
+/** Called on any 401 except from the sign-in calls, which use 401 for wrong passwords. */
+export function setUnauthorizedHandler(handler: (() => void) | null): void {
+  unauthorized = handler
+}
+
+/** The server's `{ error }` message, or a generic one. */
+async function failure(res: Response, method: string, path: string): Promise<ApiError> {
+  const body = (await res.json().catch(() => null)) as { error?: string } | null
+  if (res.status === 401 && !path.startsWith('/api/auth/')) unauthorized?.()
+  return new ApiError(res.status, body?.error ?? `${method} ${path} failed: ${res.status} ${res.statusText}`)
+}
+
+type Method = 'GET' | 'POST' | 'PATCH' | 'DELETE'
+
+async function request<T>(method: Method, path: string, body?: unknown): Promise<T> {
   const res = await fetch(path, {
     method,
     headers: {
@@ -173,15 +253,79 @@ async function request<T>(method: 'GET' | 'POST' | 'PATCH' | 'DELETE', path: str
       ...(body !== undefined && { 'Content-Type': 'application/json' }),
     },
     body: body === undefined ? undefined : JSON.stringify(body),
-    // These are all polled for live state; never serve them from cache.
+    credentials: 'same-origin',
+    // These are all live state; never serve them from cache.
     cache: 'no-store',
   })
-  if (!res.ok) {
-    throw new ApiError(res.status, `${method} ${path} failed: ${res.status} ${res.statusText}`)
-  }
+  if (!res.ok) throw await failure(res, method, path)
   if (res.status === 204) return undefined as T
   return (await res.json()) as T
 }
+
+// ---- auth ----
+
+export function getAuthStatus(): Promise<AuthStatus> {
+  return request<AuthStatus>('GET', '/api/auth/status')
+}
+
+/** Null when signed out. */
+export async function getMe(): Promise<User | null> {
+  try {
+    return await request<User>('GET', '/api/me')
+  } catch (err) {
+    if (err instanceof ApiError && err.status === 401) return null
+    throw err
+  }
+}
+
+export function login(username: string, password: string, remember: boolean): Promise<User> {
+  return request<User>('POST', '/api/auth/login', { username, password, remember })
+}
+
+export function signup(username: string, password: string, remember: boolean): Promise<User> {
+  return request<User>('POST', '/api/auth/signup', { username, password, remember })
+}
+
+export function setup(token: string, username: string, password: string, remember: boolean): Promise<User> {
+  return request<User>('POST', '/api/auth/setup', { token, username, password, remember })
+}
+
+export function logout(): Promise<void> {
+  return request<void>('POST', '/api/auth/logout', {})
+}
+
+/** Signs out every other session. */
+export function changePassword(currentPassword: string, newPassword: string): Promise<void> {
+  return request<void>('POST', '/api/me/password', { current_password: currentPassword, new_password: newPassword })
+}
+
+export function getResetInfo(token: string): Promise<{ username: string; expires_at: string }> {
+  return request('GET', `/api/password-reset/${encodeURIComponent(token)}`)
+}
+
+export function resetPassword(token: string, password: string): Promise<void> {
+  return request<void>('POST', `/api/password-reset/${encodeURIComponent(token)}`, { password })
+}
+
+// ---- the admin ----
+
+export function listUsers(): Promise<UsersResponse> {
+  return request<UsersResponse>('GET', '/api/admin/users')
+}
+
+export function createResetLink(userId: string): Promise<ResetLink> {
+  return request<ResetLink>('POST', `/api/admin/users/${encodeURIComponent(userId)}/reset-link`, {})
+}
+
+export function setUserDisabled(userId: string, disabled: boolean): Promise<void> {
+  return request<void>('PATCH', `/api/admin/users/${encodeURIComponent(userId)}`, { disabled })
+}
+
+export function deleteUser(userId: string): Promise<void> {
+  return request<void>('DELETE', `/api/admin/users/${encodeURIComponent(userId)}`)
+}
+
+// ---- clients ----
 
 /** `since` 0 returns each connected client's full sample history. */
 export function listClients(since: number): Promise<ClientsResponse> {
@@ -190,11 +334,11 @@ export function listClients(since: number): Promise<ClientsResponse> {
 
 /** Fields missing from the response (an older server) fall back to the defaults. */
 export async function getDashboardConfig(): Promise<DashboardConfig> {
-  const config = await request<Partial<DashboardConfig>>('GET', '/api/admin/dashboard-config')
+  const config = await request<Partial<DashboardConfig>>('GET', '/api/dashboard-config')
   return { ...DEFAULT_DASHBOARD_CONFIG, ...config }
 }
 
-/** Must match MAX_FRIENDLY_NAME_CHARS in server/src/main.rs. */
+/** Must match MAX_FRIENDLY_NAME_CHARS in server/src/clients.rs. */
 export const MAX_FRIENDLY_NAME_LENGTH = 64
 
 /** A blank name resets it to the client's hostname. */
@@ -207,73 +351,131 @@ export function deleteClient(clientId: string): Promise<void> {
   return request<void>('DELETE', `/api/clients/${encodeURIComponent(clientId)}`)
 }
 
-/** Mints a new one-time pairing code, valid for `pairing_code_ttl_secs`. */
+/** Mints a new one-time pairing code, valid for `pairing_code_ttl_secs`. The client it enrolls is yours. */
 export async function createPairingCode(): Promise<string> {
-  const { code } = await request<{ code: string }>('POST', '/api/admin/pairing-code')
+  const { code } = await request<{ code: string }>('POST', '/api/pairing-codes', {})
   return code
 }
 
 /** Throws an ApiError with status 404 if the server doesn't know the code. */
 export function getPairingCodeStatus(code: string): Promise<PairingCodeStatus> {
-  return request<PairingCodeStatus>('GET', `/api/admin/pairing-code/${encodeURIComponent(code)}/status`)
+  return request<PairingCodeStatus>('GET', `/api/pairing-codes/${encodeURIComponent(code)}/status`)
 }
 
-/** Every model offered by a connected client. */
+// ---- chat ----
+
+/** Models on connected clients you can chat with. */
 export function listChatModels(): Promise<ChatModel[]> {
   return request<ChatModel[]>('GET', '/api/chat/models')
 }
 
+export function listConversations(before?: string | null): Promise<ConversationPage> {
+  const query = before ? `?before=${encodeURIComponent(before)}` : ''
+  return request<ConversationPage>('GET', `/api/conversations${query}`)
+}
+
+export function getConversation(id: string): Promise<Conversation> {
+  return request<Conversation>('GET', `/api/conversations/${encodeURIComponent(id)}`)
+}
+
+export function updateConversation(id: string, patch: { title?: string; active_leaf_id?: string }): Promise<void> {
+  return request<void>('PATCH', `/api/conversations/${encodeURIComponent(id)}`, patch)
+}
+
+export function deleteConversation(id: string): Promise<void> {
+  return request<void>('DELETE', `/api/conversations/${encodeURIComponent(id)}`)
+}
+
+/** Stop: the reply keeps its text so far. */
+export function cancelMessage(id: string): Promise<ChatMessage> {
+  return request<ChatMessage>('POST', `/api/messages/${encodeURIComponent(id)}/cancel`, {})
+}
+
 /**
- * `POST /api/chat`: streams the reply, calling `onDelta` with each piece as
- * it arrives. Resolves once the reply is complete; rejects with the
- * server's or client's error, or if the stream breaks off. Aborting
- * `signal` stops it, and the server then cancels the request on the client.
+ * Streams server-sent events from a reply, calling `onEvent` for each, and
+ * resolves after `end`. Rejects with the server's error if it refused before
+ * streaming, or if the stream breaks off. Aborting `signal` only stops
+ * listening: the reply keeps generating on the server.
  */
-export async function streamChat(req: ChatRequest, onDelta: (delta: string) => void, signal?: AbortSignal): Promise<void> {
-  const res = await fetch('/api/chat', {
-    method: 'POST',
-    headers: { Accept: 'text/event-stream', 'Content-Type': 'application/json' },
-    body: JSON.stringify(req),
+async function streamReply(
+  method: 'GET' | 'POST',
+  path: string,
+  body: unknown,
+  onEvent: (event: ReplyEvent) => void,
+  signal?: AbortSignal,
+): Promise<void> {
+  const res = await fetch(path, {
+    method,
+    headers: {
+      Accept: 'text/event-stream',
+      ...(body !== undefined && { 'Content-Type': 'application/json' }),
+    },
+    body: body === undefined ? undefined : JSON.stringify(body),
+    credentials: 'same-origin',
     signal,
     cache: 'no-store',
   })
-  if (!res.ok) {
-    // Errors found before the reply starts come back as JSON `{error}`.
-    const body = (await res.json().catch(() => null)) as { error?: string } | null
-    throw new ApiError(res.status, body?.error ?? `POST /api/chat failed: ${res.status} ${res.statusText}`)
-  }
+  if (!res.ok) throw await failure(res, method, path)
   if (!res.body) throw new Error('The reply had no body')
 
-  // Server-sent events: blocks separated by a blank line, each with an
-  // `event:` and a `data:` line. Lines starting with `:` are keep-alives.
-  // EventSource can't POST, so this parses them by hand.
+  // Blocks separated by a blank line, each with an `event:` and a `data:`
+  // line. Lines starting with `:` are keep-alives. EventSource can't POST
+  // (or be told not to reconnect), so this parses them by hand.
   const reader = res.body.pipeThrough(new TextDecoderStream()).getReader()
   let buffer = ''
   try {
     for (;;) {
       const { value, done } = await reader.read()
-      if (done) throw new Error('The reply broke off before it finished')
+      if (done) throw new Error('The connection to the reply broke off')
       buffer += value.replace(/\r/g, '')
       let end: number
       while ((end = buffer.indexOf('\n\n')) !== -1) {
         const block = buffer.slice(0, end)
         buffer = buffer.slice(end + 2)
-        let event = 'message'
+        let name = 'message'
         let data = ''
         for (const line of block.split('\n')) {
-          if (line.startsWith('event:')) event = line.slice(6).trim()
+          if (line.startsWith('event:')) name = line.slice(6).trim()
           else if (line.startsWith('data:')) data += line.slice(5).trimStart()
         }
         if (!data) continue
-        const payload = JSON.parse(data) as { delta?: string; error?: string }
-        if (event === 'chunk') onDelta(payload.delta ?? '')
-        else if (event === 'done') return
-        else if (event === 'error') throw new Error(payload.error ?? 'The reply failed')
+        const event = { type: name, ...(JSON.parse(data) as object) } as ReplyEvent
+        onEvent(event)
+        if (event.type === 'end') return
       }
     }
   } finally {
     reader.cancel().catch(() => {})
   }
+}
+
+/** Sends a message (or, without `content`, regenerates the reply to `parent_id`) and streams the reply. */
+export function sendMessage(
+  conversationId: string,
+  req: SendRequest,
+  onEvent: (event: ReplyEvent) => void,
+  signal?: AbortSignal,
+): Promise<void> {
+  return streamReply('POST', `/api/conversations/${encodeURIComponent(conversationId)}/messages`, req, onEvent, signal)
+}
+
+/** Reconnects to a reply: a snapshot, then what follows. */
+export function streamMessage(id: string, onEvent: (event: ReplyEvent) => void, signal?: AbortSignal): Promise<void> {
+  return streamReply('GET', `/api/messages/${encodeURIComponent(id)}/stream`, undefined, onEvent, signal)
+}
+
+/** A new attempt at a failed or interrupted reply; `target` defaults to the client that answered last time. */
+export function retryMessage(
+  id: string,
+  target: Target | null,
+  onEvent: (event: ReplyEvent) => void,
+  signal?: AbortSignal,
+): Promise<void> {
+  return streamReply('POST', `/api/messages/${encodeURIComponent(id)}/retry`, target ? { target } : {}, onEvent, signal)
+}
+
+export function isActive(status: MessageStatus): boolean {
+  return status === 'queued' || status === 'assigned' || status === 'running'
 }
 
 export function errorMessage(err: unknown): string {

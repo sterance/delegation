@@ -4,10 +4,13 @@ import Box from '@mui/material/Box'
 import Button from '@mui/material/Button'
 import CircularProgress from '@mui/material/CircularProgress'
 import Container from '@mui/material/Container'
+import MenuItem from '@mui/material/MenuItem'
 import Stack from '@mui/material/Stack'
+import TextField from '@mui/material/TextField'
 import Typography from '@mui/material/Typography'
-import { useEffect, useState } from 'react'
-import { DEFAULT_DASHBOARD_CONFIG, errorMessage, getDashboardConfig, type DashboardConfig } from '../api'
+import { useEffect, useMemo, useState } from 'react'
+import { DEFAULT_DASHBOARD_CONFIG, errorMessage, getDashboardConfig, type Client, type DashboardConfig } from '../api'
+import { useAuth } from '../auth/context'
 import AddClientModal from '../components/clients/AddClientModal'
 import ClientList from '../components/clients/ClientList'
 import { useClients } from '../hooks/useClients'
@@ -25,7 +28,7 @@ function useDashboardConfig(): DashboardConfig | null {
         if (!cancelled) setConfig(loaded)
       },
       (err: unknown) => {
-        console.error(`Couldn't load /api/admin/dashboard-config, using defaults: ${errorMessage(err)}`)
+        console.error(`Couldn't load /api/dashboard-config, using defaults: ${errorMessage(err)}`)
         if (!cancelled) setConfig(DEFAULT_DASHBOARD_CONFIG)
       },
     )
@@ -36,17 +39,37 @@ function useDashboardConfig(): DashboardConfig | null {
   return config
 }
 
+/** The admin's filter: everyone's clients, their own, or one user's (`user:<id>`). */
+type OwnerFilter = 'all' | 'mine' | `user:${string}`
+
+/** Everyone but `meId` who owns at least one of `clients`, by name. */
+function otherOwners(clients: Client[] | null, meId: string): { id: string; username: string }[] {
+  const owners = new Map<string, string>()
+  for (const c of clients ?? []) if (c.owner.user_id !== meId) owners.set(c.owner.user_id, c.owner.username)
+  return [...owners].map(([id, username]) => ({ id, username })).sort((a, b) => a.username.localeCompare(b.username))
+}
+
 export default function Clients() {
   const config = useDashboardConfig()
+  const { user } = useAuth()
+  const meId = user?.id ?? ''
+  const isAdmin = user?.role === 'admin'
   const { clients, history, error, refresh } = useClients(config)
   const [addOpen, setAddOpen] = useState(false)
+  const [filter, setFilter] = useState<OwnerFilter>('all')
 
   const handleAddClose = (clientAdded: boolean) => {
     setAddOpen(false)
     if (clientAdded) void refresh()
   }
 
-  const connectedCount = clients?.filter((c) => c.connected).length ?? 0
+  const owners = useMemo(() => otherOwners(clients, meId), [clients, meId])
+  const shown = useMemo(() => {
+    if (!clients || !isAdmin || filter === 'all') return clients
+    const ownerId = filter === 'mine' ? meId : filter.slice('user:'.length)
+    return clients.filter((c) => c.owner.user_id === ownerId)
+  }, [clients, isAdmin, filter, meId])
+  const connectedCount = shown?.filter((c) => c.connected).length ?? 0
 
   return (
     <>
@@ -56,15 +79,35 @@ export default function Clients() {
             <Typography variant="h5" component="h2">
               Clients
             </Typography>
-            {clients && (
+            {shown && (
               <Typography variant="body2" color="text.secondary">
-                {connectedCount} of {clients.length} connected
+                {connectedCount} of {shown.length} connected
               </Typography>
             )}
           </Box>
-          <Button variant="contained" startIcon={<AddIcon />} onClick={() => setAddOpen(true)}>
-            Add client
-          </Button>
+          <Stack direction="row" spacing={1.5} sx={{ alignItems: 'center' }}>
+            {isAdmin && (
+              <TextField
+                select
+                size="small"
+                label="Owner"
+                value={filter === 'all' || filter === 'mine' || owners.some((o) => filter === `user:${o.id}`) ? filter : 'all'}
+                onChange={(e) => setFilter(e.target.value as OwnerFilter)}
+                sx={{ minWidth: 130 }}
+              >
+                <MenuItem value="all">All</MenuItem>
+                <MenuItem value="mine">Mine</MenuItem>
+                {owners.map((o) => (
+                  <MenuItem key={o.id} value={`user:${o.id}`}>
+                    {o.username}
+                  </MenuItem>
+                ))}
+              </TextField>
+            )}
+            <Button variant="contained" startIcon={<AddIcon />} onClick={() => setAddOpen(true)}>
+              Add client
+            </Button>
+          </Stack>
         </Stack>
 
         {error && (
@@ -75,8 +118,8 @@ export default function Clients() {
           </Alert>
         )}
 
-        {clients && config ? (
-          <ClientList clients={clients} history={history} config={config} refresh={refresh} />
+        {shown && config ? (
+          <ClientList clients={shown} history={history} config={config} refresh={refresh} meId={meId} />
         ) : (
           !error && (
             <Box sx={{ display: 'flex', justifyContent: 'center', py: 6 }}>

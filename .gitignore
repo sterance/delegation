@@ -40,4 +40,6 @@ Thumbs.db
 *.tmp
 *.temp
 dev/.native-home/
+# dev/dev.sh's session cookie for the dev admin
+dev/.cookies
 /docs

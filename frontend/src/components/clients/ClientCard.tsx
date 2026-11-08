@@ -44,24 +44,35 @@ function StatusDot({ connected }: { connected: boolean }) {
   );
 }
 
+const BRIGHT_BLUE = "#2196f3";
+const DIM_BLUE = "#0d2f52";
+
 const blink = keyframes`
-  0%, 100% { background-color: #2196f3; }
-  50% { background-color: #0d2f52; }
+  0%, 100% { background-color: ${BRIGHT_BLUE}; }
+  50% { background-color: ${DIM_BLUE}; }
 `;
 
-/** Cycles bright blue / dim blue, one full cycle per DASHBOARD_BLINK_PERIOD_MS. */
-function BlinkDot({ periodMs }: { periodMs: number }) {
+/**
+ * While the client is working on a job, cycles bright blue / dim blue, one
+ * full cycle per DASHBOARD_BLINK_PERIOD_MS. Idle, it's a steady dim blue.
+ */
+function JobDot({ jobs, periodMs }: { jobs: number; periodMs: number }) {
+  const label = jobs === 0 ? "Idle" : jobs === 1 ? "Working on a job" : `Working on ${jobs} jobs`;
   return (
     <Box
       component="span"
-      aria-hidden
+      role="img"
+      aria-label={label}
+      title={label}
       sx={{
         width: 10,
         height: 10,
         borderRadius: "50%",
         flexShrink: 0,
-        bgcolor: "#2196f3",
-        animation: `${blink} ${periodMs}ms ease-in-out infinite`,
+        bgcolor: jobs > 0 ? BRIGHT_BLUE : DIM_BLUE,
+        animation: jobs > 0 ? `${blink} ${periodMs}ms ease-in-out infinite` : "none",
+        // Still shows it's working, just without the motion.
+        "@media (prefers-reduced-motion: reduce)": { animation: "none" },
       }}
     />
   );
@@ -171,15 +182,19 @@ interface Props {
   /** Undefined while disconnected. */
   history: History | undefined;
   config: DashboardConfig;
+  /** The signed-in user, for "Owner: you". */
+  meId: string;
   onRename: (friendlyName: string) => Promise<void>;
   onDelete: () => void;
 }
 
-export default function ClientCard({ client, history, config, onRename, onDelete }: Props) {
+export default function ClientCard({ client, history, config, meId, onRename, onDelete }: Props) {
   const [expanded, setExpanded] = useState(false);
   const detailsId = `client-${client.client_id}-details`;
   const gpuCount = metricsGpuCount(history, client.specs);
   const collapsedGpus = Math.min(gpuCount, config.collapsed_max_gpus);
+  const mine = client.owner.user_id === meId;
+  const owner = `Owner: ${mine ? "you" : client.owner.username}`;
 
   return (
     <Card
@@ -207,16 +222,40 @@ export default function ClientCard({ client, history, config, onRename, onDelete
         >
           <Box sx={{ flex: "0 1 auto", minWidth: 0, display: "flex", alignItems: "center", columnGap: 1 }}>
             <StatusDot connected={client.connected} />
-            <BlinkDot periodMs={config.blink_period_ms} />
+            <JobDot
+              jobs={client.active_jobs}
+              periodMs={config.blink_period_ms}
+            />
             <Box sx={{ flex: "0 1 15rem", minWidth: 0, ml: 1 }}>
-              <InlineTextEdit
-                value={client.friendly_name}
-                onSave={onRename}
-                label="Client name"
-                placeholder={`Blank resets to ${client.hostname}`}
-                maxLength={MAX_FRIENDLY_NAME_LENGTH}
-                typographyProps={{ variant: "body1", sx: { fontWeight: 500 } }}
-              />
+              {client.can_manage ? (
+                <InlineTextEdit
+                  value={client.friendly_name}
+                  onSave={onRename}
+                  label="Client name"
+                  placeholder={`Blank resets to ${client.hostname}`}
+                  maxLength={MAX_FRIENDLY_NAME_LENGTH}
+                  typographyProps={{ variant: "body1", sx: { fontWeight: 500 } }}
+                />
+              ) : (
+                <Typography
+                  noWrap
+                  variant="body1"
+                  sx={{ fontWeight: 500 }}
+                >
+                  {client.friendly_name}
+                </Typography>
+              )}
+              {/* Collapsed, only when it says something: everyone's own cards would all say "you". */}
+              {!mine && (
+                <Typography
+                  variant="caption"
+                  color="text.secondary"
+                  noWrap
+                  component="div"
+                >
+                  {owner}
+                </Typography>
+              )}
             </Box>
           </Box>
           <ClientUsage
@@ -228,15 +267,17 @@ export default function ClientCard({ client, history, config, onRename, onDelete
             sx={{ flex: "1 1 auto" }}
           />
         </Box>
-        <Tooltip title="Delete client">
-          <IconButton
-            onClick={onDelete}
-            aria-label={`Delete ${client.friendly_name}`}
-            size="small"
-          >
-            <DeleteOutlinedIcon />
-          </IconButton>
-        </Tooltip>
+        {client.can_manage && (
+          <Tooltip title="Delete client">
+            <IconButton
+              onClick={onDelete}
+              aria-label={`Delete ${client.friendly_name}`}
+              size="small"
+            >
+              <DeleteOutlinedIcon />
+            </IconButton>
+          </Tooltip>
+        )}
         <IconButton
           onClick={() => setExpanded((v) => !v)}
           aria-expanded={expanded}
@@ -286,6 +327,10 @@ export default function ClientCard({ client, history, config, onRename, onDelete
           </Stack>
           <Divider sx={{ my: 1.5 }} />
           <Stack spacing={0.5}>
+            <DetailRow
+              label="Owner"
+              value={mine ? "You" : client.owner.username}
+            />
             <DetailRow
               label="Hostname"
               value={client.hostname}

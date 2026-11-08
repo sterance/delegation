@@ -14,9 +14,11 @@ interface Props {
   config: DashboardConfig
   /** Refetches the list; awaited after a change so the UI never shows stale data in between. */
   refresh: () => Promise<void>
+  /** The signed-in user, for "Owner: you". */
+  meId: string
 }
 
-export default function ClientList({ clients, history, config, refresh }: Props) {
+export default function ClientList({ clients, history, config, refresh, meId }: Props) {
   // Kept separate from `open` so the dialog's text survives its close
   // animation, and lives here rather than in the card so it isn't torn
   // down when the deleted card disappears from the list.
@@ -50,6 +52,7 @@ export default function ClientList({ clients, history, config, refresh }: Props)
               client={client}
               history={history[client.client_id]}
               config={config}
+              meId={meId}
               onRename={(name) => rename(client, name)}
               onDelete={() => {
                 setToDelete(client)
