@@ -47,6 +47,12 @@ pub struct Gpu {
     /// Integrated GPU using system RAM; `vram_bytes` is then not meaningful.
     pub vram_shared: bool,
     pub max_core_mhz: Option<u32>,
+    /// NVIDIA only (NVML): the driver, e.g. "570.153.02".
+    pub driver_version: Option<String>,
+    /// NVIDIA only: the newest CUDA version the driver supports, e.g. "12.8".
+    pub cuda_driver_version: Option<String>,
+    /// NVIDIA only: the GPU's CUDA compute capability, e.g. "8.6".
+    pub compute_capability: Option<String>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq)]

@@ -1,0 +1,201 @@
+{
+  "schema": 1,
+  "backend": "llama_cpp",
+  "version": "b12110",
+  "variants": [
+    {
+      "os": "linux",
+      "arch": "x86_64",
+      "variant": "cpu",
+      "requires": {},
+      "archives": [
+        {
+          "url": "https://github.com/ggml-org/llama.cpp/releases/download/b12110/llama-b12110-bin-ubuntu-x64.tar.gz",
+          "sha256": "368227edcc229be5f9bed16a2223d79b5e41d0ac2e19bcf5825e82291c060e55",
+          "size_bytes": 23051958,
+          "format": "tar_gz"
+        }
+      ]
+    },
+    {
+      "os": "linux",
+      "arch": "x86_64",
+      "variant": "cuda-12",
+      "requires": {
+        "cuda_driver": "12.8"
+      },
+      "archives": [
+        {
+          "url": "https://github.com/ggml-org/llama.cpp/releases/download/b12110/llama-b12110-bin-ubuntu-cuda-12.8-x64.tar.gz",
+          "sha256": "4af1e1da23661db4a5b84b29aae16ebc053df689c5b8b1427c4670f2c6406d8c",
+          "size_bytes": 187314621,
+          "format": "tar_gz"
+        },
+        {
+          "url": "https://github.com/ggml-org/llama.cpp/releases/download/b12110/cudart-llama-b12110-bin-ubuntu-cuda-12.8-x64.tar.gz",
+          "sha256": "6f1d562086d84ae85df880d3711079ec225602b51d530608e5001600625067dd",
+          "size_bytes": 594371477,
+          "format": "tar_gz"
+        }
+      ]
+    },
+    {
+      "os": "linux",
+      "arch": "x86_64",
+      "variant": "cuda-13",
+      "requires": {
+        "cuda_driver": "13.4"
+      },
+      "archives": [
+        {
+          "url": "https://github.com/ggml-org/llama.cpp/releases/download/b12110/llama-b12110-bin-ubuntu-cuda-13.4-x64.tar.gz",
+          "sha256": "2afd2ca540da119570b1dac36b5a2c862bb03a3b789c46661dfa55e600f5b19b",
+          "size_bytes": 168275993,
+          "format": "tar_gz"
+        },
+        {
+          "url": "https://github.com/ggml-org/llama.cpp/releases/download/b12110/cudart-llama-b12110-bin-ubuntu-cuda-13.4-x64.tar.gz",
+          "sha256": "9b1110161943882ec85c8e9ae641075ee8c962a50f8f1e36534ee65ea1e56ed9",
+          "size_bytes": 440232657,
+          "format": "tar_gz"
+        }
+      ]
+    },
+    {
+      "os": "linux",
+      "arch": "x86_64",
+      "variant": "vulkan",
+      "requires": {},
+      "archives": [
+        {
+          "url": "https://github.com/ggml-org/llama.cpp/releases/download/b12110/llama-b12110-bin-ubuntu-vulkan-x64.tar.gz",
+          "sha256": "a5d741940956ec62e8783aee7e5a4c7c761af867d6f027c3277a51e1a3ac59b0",
+          "size_bytes": 35858360,
+          "format": "tar_gz"
+        }
+      ]
+    },
+    {
+      "os": "linux",
+      "arch": "aarch64",
+      "variant": "cpu",
+      "requires": {},
+      "archives": [
+        {
+          "url": "https://github.com/ggml-org/llama.cpp/releases/download/b12110/llama-b12110-bin-ubuntu-arm64.tar.gz",
+          "sha256": "4758b51335e37b4346251f2687d64841ff1c07ecb27fc46323945bb2ec9c44d2",
+          "size_bytes": 18723578,
+          "format": "tar_gz"
+        }
+      ]
+    },
+    {
+      "os": "linux",
+      "arch": "aarch64",
+      "variant": "cuda-13",
+      "requires": {
+        "cuda_driver": "13.4"
+      },
+      "archives": [
+        {
+          "url": "https://github.com/ggml-org/llama.cpp/releases/download/b12110/llama-b12110-bin-ubuntu-cuda-13.4-arm64.tar.gz",
+          "sha256": "77b300bfc55955e5b6ae82cdb44fe4af8306f82d06309364b1e4e4a5c33242d6",
+          "size_bytes": 163315223,
+          "format": "tar_gz"
+        },
+        {
+          "url": "https://github.com/ggml-org/llama.cpp/releases/download/b12110/cudart-llama-b12110-bin-ubuntu-cuda-13.4-arm64.tar.gz",
+          "sha256": "75aae17d1e44a7516ea1e593141acde379cdd287c58b93015b37d254df05c78a",
+          "size_bytes": 552521396,
+          "format": "tar_gz"
+        }
+      ]
+    },
+    {
+      "os": "linux",
+      "arch": "aarch64",
+      "variant": "vulkan",
+      "requires": {},
+      "archives": [
+        {
+          "url": "https://github.com/ggml-org/llama.cpp/releases/download/b12110/llama-b12110-bin-ubuntu-vulkan-arm64.tar.gz",
+          "sha256": "1c68bf23d35230cc607e3d30f8d447d21fef500d9fa8d65e15520dfa3619ad73",
+          "size_bytes": 29168359,
+          "format": "tar_gz"
+        }
+      ]
+    },
+    {
+      "os": "windows",
+      "arch": "x86_64",
+      "variant": "cpu",
+      "requires": {},
+      "archives": [
+        {
+          "url": "https://github.com/ggml-org/llama.cpp/releases/download/b12110/llama-b12110-bin-win-cpu-x64.zip",
+          "sha256": "98901e327c252875accaf2d1bf364e10e868843b0b63468baad1aa945cdc5da2",
+          "size_bytes": 24708445,
+          "format": "zip"
+        }
+      ]
+    },
+    {
+      "os": "windows",
+      "arch": "x86_64",
+      "variant": "cuda-12",
+      "requires": {
+        "cuda_driver": "12.4"
+      },
+      "archives": [
+        {
+          "url": "https://github.com/ggml-org/llama.cpp/releases/download/b12110/llama-b12110-bin-win-cuda-12.4-x64.zip",
+          "sha256": "1ce755bc3a061889234048f88e33328e17971eaad73c4666cfeb26026b317fee",
+          "size_bytes": 287014657,
+          "format": "zip"
+        },
+        {
+          "url": "https://github.com/ggml-org/llama.cpp/releases/download/b12110/cudart-llama-bin-win-cuda-12.4-x64.zip",
+          "sha256": "8c79a9b226de4b3cacfd1f83d24f962d0773be79f1e7b75c6af4ded7e32ae1d6",
+          "size_bytes": 391443627,
+          "format": "zip"
+        }
+      ]
+    },
+    {
+      "os": "windows",
+      "arch": "x86_64",
+      "variant": "cuda-13",
+      "requires": {
+        "cuda_driver": "13.4"
+      },
+      "archives": [
+        {
+          "url": "https://github.com/ggml-org/llama.cpp/releases/download/b12110/llama-b12110-bin-win-cuda-13.4-x64.zip",
+          "sha256": "dc910a969190b5d42e189afd73117f6bbdd8dd8ed6586342c5e0b82cab62c673",
+          "size_bytes": 169175655,
+          "format": "zip"
+        },
+        {
+          "url": "https://github.com/ggml-org/llama.cpp/releases/download/b12110/cudart-llama-bin-win-cuda-13.4-x64.zip",
+          "sha256": "738f8c251ac22b70c3ae6f83a10cf222725df0395246a2cf58f32bdb85fbe668",
+          "size_bytes": 423535356,
+          "format": "zip"
+        }
+      ]
+    },
+    {
+      "os": "windows",
+      "arch": "x86_64",
+      "variant": "vulkan",
+      "requires": {},
+      "archives": [
+        {
+          "url": "https://github.com/ggml-org/llama.cpp/releases/download/b12110/llama-b12110-bin-win-vulkan-x64.zip",
+          "sha256": "9732a5e48887ca54d0bfe4af4324dc85fd56cd8cda19b52df3542fa6ebe6874f",
+          "size_bytes": 37661146,
+          "format": "zip"
+        }
+      ]
+    }
+  ]
+}

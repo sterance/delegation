@@ -99,8 +99,10 @@ pub struct Settings {
     pub frontend_dir: String,
     /// Pushed to every client in `welcome`, `INFERENCE_*` included.
     pub client: ClientSettings,
-    /// `TEST_MODEL_*`: the catalog's one entry.
+    /// `TEST_MODEL_*`: the catalog's first entry.
     pub test_model: ModelSpec,
+    /// More catalog entries, from the JSON file at `MODEL_CATALOG_PATH`.
+    pub catalog_extra: Vec<ModelSpec>,
     pub liveness_timeout: Duration,
     pub ws_ping_interval: Duration,
     pub last_seen_flush_interval: Duration,
@@ -312,6 +314,12 @@ impl Settings {
         let inf_threads = p.int_in("INFERENCE_THREADS", inference_defaults.threads, 0, 1_024);
         let inf_reserve = p.int("INFERENCE_DISK_RESERVE_MB", inference_defaults.disk_reserve_mb, 0);
         let inf_echo = p.bool("INFERENCE_ECHO_MODEL", inference_defaults.echo_model_enabled);
+        let inf_fit_margin = p.int("INFERENCE_GPU_FIT_MARGIN_MB", inference_defaults.gpu_fit_margin_mib, 0);
+        if inf_fit_margin > 1 << 20 {
+            p.errors.push(format!(
+                "INFERENCE_GPU_FIT_MARGIN_MB must be at most 1048576, got {inf_fit_margin}"
+            ));
+        }
 
         // ---- the test model (the catalog's one entry) ----
         let test_id = p.string("TEST_MODEL_ID", DEFAULT_TEST_MODEL_ID);
@@ -342,6 +350,31 @@ impl Settings {
         }
         let test_size = p.int("TEST_MODEL_SIZE_BYTES", DEFAULT_TEST_MODEL_SIZE_BYTES, 1);
         let test_context = p.int_in("TEST_MODEL_CONTEXT", 4_096, MIN_CONTEXT, 1 << 22);
+
+        // ---- more catalog entries ----
+        let catalog_path = (p.lookup)("MODEL_CATALOG_PATH").filter(|v| !v.trim().is_empty());
+        let catalog_extra = match &catalog_path {
+            None => Vec::new(),
+            Some(path) => match std::fs::read_to_string(path) {
+                Ok(text) => match catalog_from_json(&text, inf_max_tokens) {
+                    Ok(entries) => entries,
+                    Err(errors) => {
+                        p.errors
+                            .extend(errors.into_iter().map(|e| format!("MODEL_CATALOG_PATH ({path}): {e}")));
+                        Vec::new()
+                    }
+                },
+                Err(e) => {
+                    p.errors.push(format!("MODEL_CATALOG_PATH: couldn't read {path}: {e}"));
+                    Vec::new()
+                }
+            },
+        };
+        if catalog_extra.iter().any(|e| e.id == test_id) {
+            p.errors.push(format!(
+                "MODEL_CATALOG_PATH: an entry has the same id as TEST_MODEL_ID ({test_id})"
+            ));
+        }
 
         // ---- http: origins, cookies, client IPs ----
         let public_origin = p.origin("PUBLIC_ORIGIN", "https://llm.smith-c.com");
@@ -461,6 +494,7 @@ impl Settings {
                     threads: inf_threads,
                     disk_reserve_mb: inf_reserve,
                     echo_model_enabled: inf_echo,
+                    gpu_fit_margin_mib: inf_fit_margin,
                 },
             },
             test_model: ModelSpec {
@@ -474,7 +508,9 @@ impl Settings {
                 },
                 context_length: Some(test_context),
                 meta: ModelMeta::default(),
+                min_runtime_version: None,
             },
+            catalog_extra,
             liveness_timeout: Duration::from_millis(liveness),
             ws_ping_interval: Duration::from_millis(ping),
             last_seen_flush_interval: Duration::from_millis(flush),
@@ -610,12 +646,25 @@ impl Settings {
                 if c.inference.echo_model_enabled { "on" } else { "off" }
             ),
             format!(
-                "catalog: {} ({}, {} bytes, context {}) from {}",
+                "catalog: {} ({}, {} bytes, context {}) from {}{}",
                 self.test_model.id,
                 self.test_model.display_name,
                 self.test_model.source.size_bytes,
                 self.test_model.context_length.unwrap_or(0),
-                self.test_model.source.url
+                self.test_model.source.url,
+                if self.catalog_extra.is_empty() {
+                    String::new()
+                } else {
+                    format!(
+                        ", plus {} from MODEL_CATALOG_PATH: {}",
+                        self.catalog_extra.len(),
+                        self.catalog_extra
+                            .iter()
+                            .map(|e| e.id.as_str())
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    )
+                }
             ),
             format!(
                 "http: public origin {}, extra origins [{}], secure cookie {}, trust CF-Connecting-IP {}",
@@ -679,6 +728,93 @@ impl Settings {
             ));
         }
         warnings
+    }
+}
+
+/// One entry of the `MODEL_CATALOG_PATH` file: the same fields as the
+/// `TEST_MODEL_*` settings, plus optional details.
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CatalogFileEntry {
+    id: String,
+    name: String,
+    url: String,
+    sha256: String,
+    size_bytes: u64,
+    #[serde(default)]
+    context: Option<u32>,
+    #[serde(default)]
+    min_runtime_version: Option<String>,
+    #[serde(default)]
+    family: Option<String>,
+    #[serde(default)]
+    parameters: Option<String>,
+    #[serde(default)]
+    quantization: Option<String>,
+}
+
+/// The `MODEL_CATALOG_PATH` file: a JSON array of entries, checked like
+/// the `TEST_MODEL_*` settings. Every problem is reported.
+pub fn catalog_from_json(text: &str, max_tokens: u32) -> Result<Vec<ModelSpec>, Vec<String>> {
+    let entries: Vec<CatalogFileEntry> = serde_json::from_str(text).map_err(|e| vec![format!("invalid JSON: {e}")])?;
+    let mut errors = Vec::new();
+    let mut specs: Vec<ModelSpec> = Vec::new();
+    for (i, e) in entries.into_iter().enumerate() {
+        let at = format!("entry {} ({:?})", i + 1, e.id);
+        if !valid_model_id(&e.id) {
+            errors.push(format!("{at}: id must be lowercase letters, digits, '.', '_' and '-'"));
+        }
+        if specs.iter().any(|s| s.id == e.id) {
+            errors.push(format!("{at}: the id is used twice"));
+        }
+        if e.name.is_empty() || e.name.chars().count() > 200 {
+            errors.push(format!("{at}: name must be 1 to 200 characters"));
+        }
+        if !e.url.starts_with("https://") || e.url.len() <= "https://".len() || e.url.contains(char::is_whitespace) {
+            errors.push(format!("{at}: url must be an https:// URL"));
+        }
+        let sha = e.sha256.to_ascii_lowercase();
+        if sha.len() != 64 || !sha.bytes().all(|b| b.is_ascii_hexdigit()) {
+            errors.push(format!("{at}: sha256 must be 64 hex digits"));
+        }
+        if e.size_bytes == 0 {
+            errors.push(format!("{at}: size_bytes must be at least 1"));
+        }
+        let context = e.context.unwrap_or(4_096);
+        if !(MIN_CONTEXT..=1 << 22).contains(&context) {
+            errors.push(format!("{at}: context must be between {MIN_CONTEXT} and {}", 1 << 22));
+        } else if max_tokens >= context {
+            errors.push(format!(
+                "{at}: context ({context}) must be more than INFERENCE_MAX_TOKENS ({max_tokens})"
+            ));
+        }
+        if let Some(v) = &e.min_runtime_version {
+            if protocol::LlamaCppVersion::parse(v).is_none() {
+                errors.push(format!("{at}: min_runtime_version must look like \"b12110\""));
+            }
+        }
+        specs.push(ModelSpec {
+            id: e.id,
+            display_name: e.name,
+            backend: Backend::LlamaCpp,
+            source: ModelSource {
+                url: e.url,
+                sha256: sha,
+                size_bytes: e.size_bytes,
+            },
+            context_length: Some(context),
+            meta: ModelMeta {
+                family: e.family,
+                parameters: e.parameters,
+                quantization: e.quantization,
+            },
+            min_runtime_version: e.min_runtime_version,
+        });
+    }
+    if errors.is_empty() {
+        Ok(specs)
+    } else {
+        Err(errors)
     }
 }
 
@@ -1091,6 +1227,52 @@ mod tests {
         assert_eq!(s.client, defaults.client, "the pushed values, inference included");
         assert_eq!(s.test_model, defaults.test_model);
         assert_eq!(s.chat, defaults.chat);
+    }
+
+    #[test]
+    fn catalog_files_are_checked_like_the_test_model() {
+        let entry = |extra: serde_json::Value| {
+            let mut e = serde_json::json!({
+                "id": "qwen2.5-7b-instruct-q4_k_m",
+                "name": "Qwen2.5 7B Instruct (Q4_K_M)",
+                "url": "https://huggingface.co/bartowski/Qwen2.5-7B-Instruct-GGUF/resolve/main/Qwen2.5-7B-Instruct-Q4_K_M.gguf",
+                "sha256": "65b8fcd92af6b4fefa935c625d1ac27ea29dcb6ee14589c55a8f115ceaaa1423",
+                "size_bytes": 4683074240u64,
+                "context": 8192
+            });
+            for (k, v) in extra.as_object().unwrap() {
+                e[k] = v.clone();
+            }
+            serde_json::Value::Array(vec![e]).to_string()
+        };
+        let ok = catalog_from_json(&entry(serde_json::json!({})), 2048).unwrap();
+        assert_eq!(ok[0].source.size_bytes, 4_683_074_240);
+        assert_eq!(ok[0].context_length, Some(8192));
+        assert_eq!(ok[0].min_runtime_version, None);
+        let bad = |extra: serde_json::Value, expect: &str| {
+            let errors = catalog_from_json(&entry(extra), 2048).unwrap_err();
+            assert!(errors.iter().any(|e| e.contains(expect)), "{expect}: {errors:?}");
+        };
+        bad(serde_json::json!({ "id": "../x" }), "id must be");
+        bad(serde_json::json!({ "url": "http://x/y.gguf" }), "https://");
+        bad(serde_json::json!({ "sha256": "abc" }), "sha256");
+        bad(serde_json::json!({ "size_bytes": 0 }), "size_bytes");
+        bad(serde_json::json!({ "context": 1024 }), "INFERENCE_MAX_TOKENS");
+        bad(
+            serde_json::json!({ "min_runtime_version": "12110" }),
+            "min_runtime_version",
+        );
+        bad(serde_json::json!({ "surprise": 1 }), "unknown field");
+        let twice = format!(
+            "[{0},{0}]",
+            entry(serde_json::json!({}))
+                .trim_start_matches('[')
+                .trim_end_matches(']')
+        );
+        assert!(catalog_from_json(&twice, 2048).unwrap_err()[0].contains("used twice"));
+        let errors =
+            Settings::parse(|k| (k == "MODEL_CATALOG_PATH").then(|| "/nonexistent/catalog.json".into())).unwrap_err();
+        assert!(errors.iter().any(|e| e.contains("MODEL_CATALOG_PATH")), "{errors:?}");
     }
 
     #[test]

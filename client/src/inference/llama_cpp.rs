@@ -12,19 +12,25 @@
 //! - It's stopped after `idle_unload_secs` without requests, giving the
 //!   memory back to the volunteer.
 //! - It never outlives the client: `PR_SET_PDEATHSIG` on Linux, a
-//!   kill-on-close job object on Windows, and a kill on drop and on clean
-//!   shutdown everywhere.
+//!   kill-on-close job object on Windows (see `process.rs`), and a kill on
+//!   drop and on clean shutdown everywhere.
+//! - It runs on the runtime variant `runtime.rs` resolves (CPU, CUDA or
+//!   Vulkan). GPU layers follow the model's settings; by default llama.cpp
+//!   fits as many as the free VRAM allows (`--fit`). If a GPU variant
+//!   fails to load the model, that variant is marked failed and the load
+//!   is retried once on the next candidate.
 //! - A reply streams over its own local HTTP connection. Dropping the
 //!   `chat` future drops the socket, and llama-server stops generating
 //!   when its client goes away. That's why this talks HTTP/1.1 by hand over
 //!   a tokio socket instead of using the (blocking) ureq: a blocked read
 //!   would only notice the cancel after the next token.
 
+use super::process;
 use super::store::Manifest;
 use super::{ChatCompletion, InferenceError, InferenceEvent, Shared};
 use log::{debug, info, warn};
 use protocol::models::MIN_CONTEXT;
-use protocol::{InferenceSettings, Stage};
+use protocol::{GpuLayers, GpuOffload, InferenceSettings, RunInfo, Stage, Usage};
 use rand::Rng;
 use serde_json::{json, Value};
 use std::collections::VecDeque;
@@ -59,6 +65,8 @@ pub struct LlamaCpp {
     /// Replies being generated, whatever the model.
     active: Arc<AtomicUsize>,
     next_generation: AtomicU64,
+    /// Where the loaded model runs: (model id, run info).
+    run: Mutex<Option<(String, RunInfo)>>,
 }
 
 impl Default for LlamaCpp {
@@ -68,6 +76,7 @@ impl Default for LlamaCpp {
             status: Mutex::new(ProcStatus::Stopped),
             active: Arc::new(AtomicUsize::new(0)),
             next_generation: AtomicU64::new(1),
+            run: Mutex::new(None),
         }
     }
 }
@@ -77,7 +86,16 @@ impl LlamaCpp {
         self.status.lock().unwrap_or_else(|e| e.into_inner()).clone()
     }
 
+    /// What the loaded model runs on, if `model_id` is the loaded one.
+    pub fn run_info(&self, model_id: &str) -> Option<RunInfo> {
+        let run = self.run.lock().unwrap_or_else(|e| e.into_inner());
+        run.as_ref().filter(|(id, _)| id == model_id).map(|(_, r)| r.clone())
+    }
+
     fn set_status(&self, shared: &Shared, status: ProcStatus) {
+        if !matches!(status, ProcStatus::Loaded(_)) {
+            *self.run.lock().unwrap_or_else(|e| e.into_inner()) = None;
+        }
         let mut current = self.status.lock().unwrap_or_else(|e| e.into_inner());
         if *current != status {
             *current = status;
@@ -124,9 +142,66 @@ impl Tail {
     }
 }
 
+/// What llama-server's log says about GPU offload. In b12110, while
+/// loading: "llama_model_load_from_file_impl: using device CUDA0 (NVIDIA
+/// GeForce RTX 3070) (0000:01:00.0) - 7347 MiB free" for each GPU it uses,
+/// then "load_tensors: offloaded 29/29 layers to GPU". `--fit` may load
+/// more than once, so the last summary wins.
+#[derive(Debug, Clone, Default, PartialEq)]
+struct OffloadLog {
+    devices: Vec<String>,
+    layers: Option<GpuOffload>,
+}
+
+impl OffloadLog {
+    fn push(&mut self, line: &str) {
+        if let Some(layers) = parse_offloaded(line) {
+            self.layers = Some(layers);
+        } else if let Some(device) = parse_using_device(line) {
+            if !self.devices.contains(&device) {
+                self.devices.push(device);
+            }
+        }
+    }
+
+    fn run_info(&self, variant: &str) -> RunInfo {
+        let on_gpu = self.layers.is_some_and(|l| l.offloaded > 0);
+        RunInfo {
+            variant: variant.to_string(),
+            gpu_layers: self.layers,
+            device: (on_gpu && !self.devices.is_empty()).then(|| self.devices.join(", ")),
+        }
+    }
+}
+
+/// "…: offloaded 29/29 layers to GPU"
+fn parse_offloaded(line: &str) -> Option<GpuOffload> {
+    let rest = &line[line.find("offloaded ")? + "offloaded ".len()..];
+    let (counts, tail) = rest.split_once(' ')?;
+    if !tail.starts_with("layers to GPU") {
+        return None;
+    }
+    let (offloaded, total) = counts.split_once('/')?;
+    Some(GpuOffload {
+        offloaded: offloaded.parse().ok()?,
+        total: total.parse().ok()?,
+    })
+}
+
+/// "…: using device CUDA0 (NVIDIA GeForce RTX 3070) (0000:01:00.0) - 7347 MiB free"
+/// -> "NVIDIA GeForce RTX 3070"
+fn parse_using_device(line: &str) -> Option<String> {
+    let rest = &line[line.find("using device ")? + "using device ".len()..];
+    let rest = &rest[rest.find(" (")? + 2..];
+    let rest = &rest[..rest.rfind(" - ")?];
+    let description = &rest[..rest.rfind(") (")?];
+    Some(description.to_string()).filter(|d| !d.is_empty())
+}
+
 struct Running {
     generation: u64,
     model_id: String,
+    run: RunInfo,
     child: Child,
     addr: SocketAddr,
     api_key: String,
@@ -142,6 +217,7 @@ impl Running {
         *self.last_used.lock().unwrap_or_else(|e| e.into_inner()) = Instant::now();
         Lease {
             generation: self.generation,
+            run: self.run.clone(),
             addr: self.addr,
             api_key: self.api_key.clone(),
             users: self.users.clone(),
@@ -170,6 +246,7 @@ impl Running {
 /// A request's hold on the process: it isn't idle (or swapped) while held.
 struct Lease {
     generation: u64,
+    run: RunInfo,
     addr: SocketAddr,
     api_key: String,
     users: Arc<AtomicUsize>,
@@ -225,7 +302,7 @@ pub(crate) async fn chat(
     req: &ChatCompletion,
     max_tokens: u32,
     out: &mpsc::Sender<InferenceEvent>,
-) -> Result<(), InferenceError> {
+) -> Result<Option<Usage>, InferenceError> {
     let settings = shared.settings();
     let _slot = Slot::take(&shared.llama.active, settings.max_concurrent).ok_or(InferenceError::Busy)?;
     let lease = acquire(shared, model, &settings, out).await?;
@@ -234,7 +311,10 @@ pub(crate) async fn chat(
         .map_err(|_| InferenceError::Closed)?;
     let body = request_body(&model.id, req, max_tokens);
     match stream_chat(lease.addr, &lease.api_key, &body, out).await {
-        Ok(()) => Ok(()),
+        Ok(usage) => Ok(usage.map(|u| Usage {
+            run: Some(lease.run.clone()),
+            ..u
+        })),
         Err(StreamError::Closed) => Err(InferenceError::Closed),
         Err(StreamError::Backend(message)) => Err(InferenceError::Backend(message)),
         Err(StreamError::Io(e)) => match crashed(shared, lease.generation).await {
@@ -285,12 +365,27 @@ async fn acquire(
         .map_err(|_| InferenceError::Closed)?;
     llama.set_status(shared, ProcStatus::Loading(model.id.clone()));
     let mut guard = LoadingGuard { shared, armed: true };
-    let running = start(shared, model, settings)
-        .await
-        .map_err(InferenceError::LoadFailed)?;
+    let running = match start(shared, model, settings).await {
+        Ok(running) => running,
+        // A GPU build that can't load it: that variant is out, and the
+        // load is tried once more on the next candidate.
+        Err(StartError {
+            variant: Some(variant),
+            why,
+        }) if variant != "cpu" => {
+            shared.runtime.mark_failed(&variant, &why);
+            shared.changed();
+            warn!(target: "llama", "retrying the load of {} without llama.cpp {variant}", model.id);
+            start(shared, model, settings)
+                .await
+                .map_err(|e| InferenceError::LoadFailed(e.why))?
+        }
+        Err(e) => return Err(InferenceError::LoadFailed(e.why)),
+    };
     guard.armed = false;
     let lease = running.lease();
     let generation = running.generation;
+    *llama.run.lock().unwrap_or_else(|e| e.into_inner()) = Some((model.id.clone(), running.run.clone()));
     *proc = Some(running);
     llama.set_status(shared, ProcStatus::Loaded(model.id.clone()));
     tokio::spawn(watch(shared.clone(), generation));
@@ -361,47 +456,85 @@ pub(crate) async fn stop(shared: &Shared) {
     shared.llama.set_status(shared, ProcStatus::Stopped);
 }
 
-/// Starts llama-server with `model` and waits until it's ready.
-async fn start(shared: &Arc<Shared>, model: &Manifest, settings: &InferenceSettings) -> Result<Running, String> {
-    let exe = match shared.runtime.server_exe() {
-        Some(exe) => exe,
-        // Only if the runtime was removed after the model was pulled.
-        None => {
-            let s = shared.clone();
-            tokio::task::spawn_blocking(move || {
-                s.runtime.ensure(
-                    s.store.agent(),
-                    &std::sync::atomic::AtomicBool::new(false),
-                    &mut |_, _| {},
-                    &|| s.changed(),
-                )
-            })
-            .await
-            .map_err(|e| e.to_string())?
-            .map_err(|e| format!("couldn't get llama.cpp: {e}"))?
-        }
-    };
+/// Why a start failed, and on which variant (None: before one was chosen).
+#[derive(Debug)]
+struct StartError {
+    variant: Option<String>,
+    why: String,
+}
+
+/// The context a model runs with: its settings, else its own, else the default.
+pub(crate) fn context_for(model: &Manifest, settings: &InferenceSettings) -> u32 {
+    model
+        .settings
+        .context_length
+        .or(model.context_length)
+        .unwrap_or(settings.default_context)
+        .max(MIN_CONTEXT)
+}
+
+/// Starts llama-server with `model` on the runtime variant to use, and
+/// waits until it's ready.
+async fn start(shared: &Arc<Shared>, model: &Manifest, settings: &InferenceSettings) -> Result<Running, StartError> {
+    // Installs (or checks) a variant only if that hasn't happened yet.
+    let s = shared.clone();
+    let reserve = settings.disk_reserve_mb.saturating_mul(1024 * 1024);
+    let resolved = tokio::task::spawn_blocking(move || {
+        s.runtime.resolve(
+            s.store.agent(),
+            &std::sync::atomic::AtomicBool::new(false),
+            reserve,
+            &mut |_, _| {},
+            &|| s.changed(),
+        )
+    })
+    .await
+    .map_err(|e| StartError {
+        variant: None,
+        why: e.to_string(),
+    })?
+    .map_err(|e| StartError {
+        variant: None,
+        why: format!("couldn't get llama.cpp: {e}"),
+    })?;
+    let variant = resolved.variant.clone();
+    start_on(shared, model, settings, &resolved.exe, &variant)
+        .await
+        .map_err(|why| StartError {
+            variant: Some(variant),
+            why,
+        })
+}
+
+async fn start_on(
+    shared: &Arc<Shared>,
+    model: &Manifest,
+    settings: &InferenceSettings,
+    exe: &std::path::Path,
+    variant: &str,
+) -> Result<Running, String> {
     let model_path = shared.store.model_path(&model.id);
-    let context = u64::from(
-        model
-            .context_length
-            .unwrap_or(settings.default_context)
-            .max(MIN_CONTEXT),
-    );
+    let context = u64::from(context_for(model, settings));
     let parallel = settings.max_concurrent.max(1);
     let port = free_port().map_err(|e| format!("couldn't find a free port: {e}"))?;
     let addr = SocketAddr::from(([127, 0, 0, 1], port));
     let api_key = hex::encode(rand::thread_rng().gen::<[u8; 32]>());
-    let args = server_args(&model_path, port, context, parallel, settings.threads);
+    let gpu = GpuArgs {
+        variant: variant.to_string(),
+        layers: model.settings.gpu_layers,
+        fit_margin_mib: settings.gpu_fit_margin_mib,
+    };
+    let args = server_args(&model_path, port, context, parallel, settings.threads, &gpu);
     info!(
         target: "llama",
-        "starting llama-server for {} on {addr} ({} tokens of context, {parallel} slot(s))",
+        "starting llama-server ({variant}) for {} on {addr} ({} tokens of context, {parallel} slot(s), GPU layers {:?})",
         model.id,
-        context
+        context,
+        model.settings.gpu_layers
     );
     debug!(target: "llama", "{} {}", exe.display(), args.join(" "));
 
-    let mut cmd = Command::new(&exe);
+    let mut cmd = Command::new(exe);
     cmd.args(&args)
         .env("LLAMA_API_KEY", &api_key)
         .stdin(std::process::Stdio::null())
@@ -411,18 +544,19 @@ async fn start(shared: &Arc<Shared>, model: &Manifest, settings: &InferenceSetti
     if let Some(dir) = exe.parent() {
         cmd.current_dir(dir);
     }
-    platform::before_spawn(&mut cmd);
+    process::before_spawn(cmd.as_std_mut());
     let mut child = cmd
         .spawn()
         .map_err(|e| format!("couldn't start {}: {e}", exe.display()))?;
-    platform::after_spawn(&child);
+    process::after_spawn_tokio(&child);
 
     let tail = Tail::default();
+    let offload = Arc::new(Mutex::new(OffloadLog::default()));
     if let Some(stdout) = child.stdout.take() {
-        tokio::spawn(capture(BufReader::new(stdout), tail.clone()));
+        tokio::spawn(capture(BufReader::new(stdout), tail.clone(), offload.clone()));
     }
     if let Some(stderr) = child.stderr.take() {
-        tokio::spawn(capture(BufReader::new(stderr), tail.clone()));
+        tokio::spawn(capture(BufReader::new(stderr), tail.clone(), offload.clone()));
     }
 
     let started = Instant::now();
@@ -456,10 +590,24 @@ async fn start(shared: &Arc<Shared>, model: &Manifest, settings: &InferenceSetti
         }
         tokio::time::sleep(HEALTH_POLL).await;
     }
-    info!(target: "llama", "{} loaded in {:.1} s", model.id, started.elapsed().as_secs_f32());
+    // The log readers may be a line behind the health check.
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    let run = offload.lock().unwrap_or_else(|e| e.into_inner()).run_info(variant);
+    info!(
+        target: "llama",
+        "{} loaded in {:.1} s on {variant}: {}",
+        model.id,
+        started.elapsed().as_secs_f32(),
+        match (&run.gpu_layers, &run.device) {
+            (Some(l), Some(d)) => format!("{}/{} layers on {d}", l.offloaded, l.total),
+            (Some(l), None) => format!("{}/{} layers on the GPU", l.offloaded, l.total),
+            _ => "CPU only".into(),
+        }
+    );
     Ok(Running {
         generation: shared.llama.next_generation.fetch_add(1, Ordering::Relaxed),
         model_id: model.id.clone(),
+        run,
         child,
         addr,
         api_key,
@@ -469,9 +617,25 @@ async fn start(shared: &Arc<Shared>, model: &Manifest, settings: &InferenceSetti
     })
 }
 
-/// Checked against `llama-server --help` of the pinned release. The context
-/// is per slot: llama-server splits `-c` across its `-np` slots.
-fn server_args(model: &std::path::Path, port: u16, context: u64, parallel: u32, threads: u32) -> Vec<String> {
+/// What reaches the GPU.
+struct GpuArgs {
+    variant: String,
+    layers: GpuLayers,
+    fit_margin_mib: u64,
+}
+
+/// Checked against `llama-server --help` of the pinned release (b12110:
+/// `-ngl N|auto|all`, `--fit on|off`, `--fit-target MiB`). The context is
+/// per slot: llama-server splits `-c` across its `-np` slots. `--fit` only
+/// adjusts what isn't set, so with `-c` given it chooses the GPU layers.
+fn server_args(
+    model: &std::path::Path,
+    port: u16,
+    context: u64,
+    parallel: u32,
+    threads: u32,
+    gpu: &GpuArgs,
+) -> Vec<String> {
     let mut args: Vec<String> = vec![
         "-m".into(),
         model.to_string_lossy().into_owned(),
@@ -483,23 +647,39 @@ fn server_args(model: &std::path::Path, port: u16, context: u64, parallel: u32, 
         (context * u64::from(parallel)).to_string(),
         "-np".into(),
         parallel.to_string(),
-        // CPU only until GPU builds are pinned.
-        "-ngl".into(),
-        "0".into(),
         "--no-webui".into(),
         // Never fetch anything from the network.
         "--offline".into(),
     ];
+    let layers = if gpu.variant == "cpu" {
+        GpuLayers::Off
+    } else {
+        gpu.layers
+    };
+    match layers {
+        GpuLayers::Off => args.extend(["-ngl".into(), "0".into(), "--fit".into(), "off".into()]),
+        GpuLayers::All => args.extend(["-ngl".into(), "all".into(), "--fit".into(), "off".into()]),
+        GpuLayers::Count(n) => args.extend(["-ngl".into(), n.to_string(), "--fit".into(), "off".into()]),
+        GpuLayers::Auto => args.extend([
+            "-ngl".into(),
+            "auto".into(),
+            "--fit".into(),
+            "on".into(),
+            "--fit-target".into(),
+            gpu.fit_margin_mib.to_string(),
+        ]),
+    }
     if threads > 0 {
         args.extend(["-t".into(), threads.to_string()]);
     }
     args
 }
 
-async fn capture<R: tokio::io::AsyncRead + Unpin>(reader: BufReader<R>, tail: Tail) {
+async fn capture<R: tokio::io::AsyncRead + Unpin>(reader: BufReader<R>, tail: Tail, offload: Arc<Mutex<OffloadLog>>) {
     let mut lines = reader.lines();
     while let Ok(Some(line)) = lines.next_line().await {
         debug!(target: "llama", "{line}");
+        offload.lock().unwrap_or_else(|e| e.into_inner()).push(&line);
         tail.push(line);
     }
 }
@@ -541,13 +721,14 @@ pub(crate) enum StreamError {
 }
 
 /// POSTs a chat completion and forwards each `choices[0].delta.content`
-/// as a `Delta`, until `[DONE]`.
+/// as a `Delta`, until `[DONE]`. Returns the reply's token counts and
+/// speed, if llama-server sent its timings.
 pub(crate) async fn stream_chat(
     addr: SocketAddr,
     api_key: &str,
     body: &[u8],
     out: &mpsc::Sender<InferenceEvent>,
-) -> Result<(), StreamError> {
+) -> Result<Option<Usage>, StreamError> {
     let mut response = local_request(addr, "POST", "/v1/chat/completions", api_key, Some(body))
         .await
         .map_err(StreamError::Io)?;
@@ -557,14 +738,18 @@ pub(crate) async fn stream_chat(
     }
     let mut sse = SseParser::default();
     let mut finished = false;
+    let mut usage = None;
     while let Some(bytes) = response.body.next().await.map_err(StreamError::Io)? {
         for data in sse.push(&bytes) {
             if data.trim() == "[DONE]" {
-                return Ok(());
+                return Ok(usage);
             }
             let chunk = parse_chunk(&data);
             if let Some(error) = chunk.error {
                 return Err(StreamError::Backend(error));
+            }
+            if chunk.usage.is_some() {
+                usage = chunk.usage;
             }
             if let Some(delta) = chunk.delta {
                 out.send(InferenceEvent::Delta(delta))
@@ -575,7 +760,7 @@ pub(crate) async fn stream_chat(
         }
     }
     if finished {
-        Ok(())
+        Ok(usage)
     } else {
         Err(StreamError::Io(std::io::Error::new(
             std::io::ErrorKind::UnexpectedEof,
@@ -589,6 +774,25 @@ struct Chunk {
     delta: Option<String>,
     finished: bool,
     error: Option<String>,
+    usage: Option<Usage>,
+}
+
+/// llama-server's `timings` (b12110, on the last chunk): `cache_n` and
+/// `prompt_n` (prompt tokens reused and processed), `predicted_n`, and the
+/// `prompt_per_second` and `predicted_per_second` speeds.
+fn parse_timings(t: &Value) -> Option<Usage> {
+    let count = |key: &str| t[key].as_u64().map(|n| u32::try_from(n).unwrap_or(u32::MAX));
+    let speed = |key: &str| t[key].as_f64().filter(|v| v.is_finite() && *v >= 0.0);
+    let completion = count("predicted_n")?;
+    Some(Usage {
+        prompt_tokens: count("prompt_n")
+            .unwrap_or(0)
+            .saturating_add(count("cache_n").unwrap_or(0)),
+        completion_tokens: completion,
+        tokens_per_second: speed("predicted_per_second"),
+        prompt_tokens_per_second: speed("prompt_per_second"),
+        run: None,
+    })
 }
 
 fn parse_chunk(data: &str) -> Chunk {
@@ -615,6 +819,7 @@ fn parse_chunk(data: &str) -> Chunk {
             .map(str::to_string),
         finished: !choice["finish_reason"].is_null(),
         error: None,
+        usage: v.get("timings").and_then(parse_timings),
     }
 }
 
@@ -844,98 +1049,6 @@ impl Body {
     }
 }
 
-// ---------------- the process must never outlive the client ----------------
-
-#[cfg(target_os = "linux")]
-mod platform {
-    use tokio::process::{Child, Command};
-
-    /// Linux kills the child when the thread that spawned it exits. That's
-    /// a tokio worker thread here (never `spawn_blocking`, whose threads
-    /// come and go), and those live as long as the runtime, i.e. the client.
-    pub fn before_spawn(cmd: &mut Command) {
-        // SAFETY: getpid is async-signal-safe and runs before the fork.
-        let parent = unsafe { libc::getpid() };
-        // SAFETY: the closure runs in the forked child before exec and only
-        // calls async-signal-safe functions (prctl, getppid, _exit).
-        unsafe {
-            cmd.pre_exec(move || {
-                if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL) != 0 {
-                    return Err(std::io::Error::last_os_error());
-                }
-                // The parent died before prctl took effect.
-                if libc::getppid() != parent {
-                    libc::_exit(1);
-                }
-                Ok(())
-            });
-        }
-    }
-
-    pub fn after_spawn(_child: &Child) {}
-}
-
-#[cfg(windows)]
-mod platform {
-    use log::warn;
-    use std::sync::OnceLock;
-    use tokio::process::{Child, Command};
-    use windows::Win32::Foundation::HANDLE;
-    use windows::Win32::System::JobObjects::{
-        AssignProcessToJobObject, CreateJobObjectW, JobObjectExtendedLimitInformation, SetInformationJobObject,
-        JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
-    };
-
-    /// No console window flashing up from the tray app.
-    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-
-    pub fn before_spawn(cmd: &mut Command) {
-        cmd.creation_flags(CREATE_NO_WINDOW);
-    }
-
-    /// One job object for the life of the client, never closed: Windows
-    /// closes it when the client exits, however it exits, and that kills
-    /// every process in it.
-    fn job() -> Option<HANDLE> {
-        static JOB: OnceLock<Option<usize>> = OnceLock::new();
-        let raw = JOB.get_or_init(|| {
-            // SAFETY: plain Win32 calls; `info` outlives the call that reads it.
-            unsafe {
-                let job = CreateJobObjectW(None, windows::core::PCWSTR::null()).ok()?;
-                let mut info = JOBOBJECT_EXTENDED_LIMIT_INFORMATION::default();
-                info.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
-                SetInformationJobObject(
-                    job,
-                    JobObjectExtendedLimitInformation,
-                    &info as *const _ as *const core::ffi::c_void,
-                    std::mem::size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
-                )
-                .ok()?;
-                Some(job.0 as usize)
-            }
-        });
-        raw.map(|h| HANDLE(h as *mut core::ffi::c_void))
-    }
-
-    pub fn after_spawn(child: &Child) {
-        let (Some(job), Some(process)) = (job(), child.raw_handle()) else {
-            warn!(target: "llama", "couldn't put llama-server in a job object; it may outlive a crashed client");
-            return;
-        };
-        // SAFETY: both handles are valid; the child's stays open while `child` lives.
-        if let Err(e) = unsafe { AssignProcessToJobObject(job, HANDLE(process)) } {
-            warn!(target: "llama", "couldn't put llama-server in a job object: {e}");
-        }
-    }
-}
-
-#[cfg(not(any(target_os = "linux", windows)))]
-mod platform {
-    use tokio::process::{Child, Command};
-    pub fn before_spawn(_cmd: &mut Command) {}
-    pub fn after_spawn(_child: &Child) {}
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -983,16 +1096,112 @@ mod tests {
         assert_eq!(error_message(502, b""), "llama-server answered HTTP 502");
     }
 
+    fn gpu(variant: &str, layers: GpuLayers) -> GpuArgs {
+        GpuArgs {
+            variant: variant.into(),
+            layers,
+            fit_margin_mib: 1024,
+        }
+    }
+
     #[test]
     fn args_match_the_pinned_llama_server() {
-        let args = server_args(std::path::Path::new("/m/model.gguf"), 4242, 4096, 2, 0);
-        let joined = args.join(" ");
+        let m = std::path::Path::new("/m/model.gguf");
+        let base = "-m /m/model.gguf --host 127.0.0.1 --port 4242 -c 8192 -np 2 --no-webui --offline";
+        let args = |g: GpuArgs| server_args(m, 4242, 4096, 2, 0, &g).join(" ");
         assert_eq!(
-            joined,
-            "-m /m/model.gguf --host 127.0.0.1 --port 4242 -c 8192 -np 2 -ngl 0 --no-webui --offline"
+            args(gpu("cuda-13", GpuLayers::Auto)),
+            format!("{base} -ngl auto --fit on --fit-target 1024")
         );
-        assert!(!joined.contains("api-key"), "the key goes in the environment");
-        assert!(server_args(std::path::Path::new("m"), 1, 4096, 1, 6).ends_with(&["-t".into(), "6".into()]));
+        assert_eq!(args(gpu("cpu", GpuLayers::Auto)), format!("{base} -ngl 0 --fit off"));
+        assert_eq!(args(gpu("vulkan", GpuLayers::Off)), format!("{base} -ngl 0 --fit off"));
+        assert_eq!(
+            args(gpu("vulkan", GpuLayers::All)),
+            format!("{base} -ngl all --fit off")
+        );
+        assert_eq!(
+            args(gpu("cuda-12", GpuLayers::Count(12))),
+            format!("{base} -ngl 12 --fit off")
+        );
+        assert!(
+            !args(gpu("cpu", GpuLayers::Off)).contains("api-key"),
+            "the key goes in the environment"
+        );
+        assert!(
+            server_args(std::path::Path::new("m"), 1, 4096, 1, 6, &gpu("cpu", GpuLayers::Auto))
+                .ends_with(&["-t".into(), "6".into()])
+        );
+    }
+
+    /// A CUDA load as llama-server b12110 logs it. Built from the format
+    /// strings in b12110's `src/llama.cpp` and `src/llama-model.cpp`
+    /// (`using device …`, `offloaded %d/%d layers to GPU`); replace with a
+    /// captured log once one is recorded on NVIDIA hardware.
+    const CUDA_LOAD_LOG: &str = "\
+ggml_cuda_init: found 1 CUDA devices (Total VRAM: 8191 MiB):
+  Device 0: NVIDIA GeForce RTX 3070, compute capability 8.6, VMM: yes, VRAM: 8191 MiB
+load_backend: loaded CUDA backend from /data/runtime/cuda-13-b12110/libggml-cuda.so
+common_fit_params: fitting params to device memory, for bugs during this step try to reproduce them with -fit off
+llama_model_load_from_file_impl: using device CUDA0 (NVIDIA GeForce RTX 3070) (0000:01:00.0) - 7347 MiB free
+llama_model_loader: loaded meta data with 26 key-value pairs and 291 tensors from model.gguf (version GGUF V3 (latest))
+print_info: n_layer          = 28
+load_tensors: loading model tensors, this can take a while... (mmap = true, direct_io = false)
+load_tensors: offloading output layer to GPU
+load_tensors: offloading 28 repeating layers to GPU
+load_tensors: offloaded 29/29 layers to GPU
+load_tensors:        CUDA0 model buffer size =  4168.09 MiB
+load_tensors:   CPU_Mapped model buffer size =   292.36 MiB
+srv    load_model: initializing slots, n_slots = 1
+main: model loaded
+";
+
+    #[test]
+    fn the_offload_summary_is_read_from_the_log() {
+        let mut log = OffloadLog::default();
+        for line in CUDA_LOAD_LOG.lines() {
+            log.push(line);
+        }
+        assert_eq!(
+            log.run_info("cuda-13"),
+            RunInfo {
+                variant: "cuda-13".into(),
+                gpu_layers: Some(GpuOffload {
+                    offloaded: 29,
+                    total: 29
+                }),
+                device: Some("NVIDIA GeForce RTX 3070".into()),
+            }
+        );
+        // Off: nothing on the GPU, so no device.
+        let mut off = OffloadLog::default();
+        off.push("llama_model_load_from_file_impl: using device Vulkan0 (AMD Radeon RX 7900 XTX (RADV NAVI31)) (0000:03:00.0) - 24000 MiB free");
+        off.push("load_tensors: offloaded 0/29 layers to GPU");
+        assert_eq!(off.run_info("vulkan").device, None);
+        assert_eq!(off.devices, ["AMD Radeon RX 7900 XTX (RADV NAVI31)"]);
+        // The CPU build never prints a summary.
+        let cpu = OffloadLog::default().run_info("cpu");
+        assert_eq!((cpu.gpu_layers, cpu.device), (None, None));
+        assert_eq!(parse_offloaded("offloaded x/29 layers to GPU"), None);
+        assert_eq!(parse_using_device("using device"), None);
+    }
+
+    #[test]
+    fn timings_become_usage() {
+        // The final streamed chunk of b12110's /v1/chat/completions.
+        let last = r#"{"choices":[{"finish_reason":"stop","index":0,"delta":{}}],"created":1,"id":"chatcmpl-1","model":"m","system_fingerprint":"b12110-0","object":"chat.completion.chunk","timings":{"cache_n":3,"prompt_n":20,"prompt_ms":40.1,"prompt_per_token_ms":2.0,"prompt_per_second":498.7,"predicted_n":64,"predicted_ms":1250.0,"predicted_per_token_ms":19.5,"predicted_per_second":51.2}}"#;
+        let chunk = parse_chunk(last);
+        assert!(chunk.finished);
+        assert_eq!(
+            chunk.usage,
+            Some(Usage {
+                prompt_tokens: 23,
+                completion_tokens: 64,
+                tokens_per_second: Some(51.2),
+                prompt_tokens_per_second: Some(498.7),
+                run: None,
+            })
+        );
+        assert_eq!(parse_chunk(r#"{"choices":[{"delta":{"content":"x"}}]}"#).usage, None);
     }
 
     #[test]
@@ -1138,7 +1347,11 @@ mod tests {
         let (addr, request) = fake_server(Script::Events(events)).await;
         let (tx, mut rx) = mpsc::channel(64);
         let body = request_body("m", &completion(), 2048);
-        stream_chat(addr, "secret", &body, &tx).await.unwrap();
+        assert_eq!(
+            stream_chat(addr, "secret", &body, &tx).await.unwrap(),
+            None,
+            "no timings sent"
+        );
         assert_eq!(collect(&mut rx).await, vec!["Hel", "lo", " world"]);
 
         let (head, body) = request.await.unwrap();

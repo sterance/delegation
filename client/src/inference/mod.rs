@@ -8,21 +8,27 @@
 //! more methods here, not new code paths in the session.
 //!
 //! - `store`: models on disk (pull, verify, delete, list)
-//! - `runtime`: the pinned llama.cpp build, fetched on first use
+//! - `runtime`: the pinned llama.cpp builds (CPU and GPU variants),
+//!   fetched on first use, with fallback when one doesn't work
+//! - `select`: the automatic choice of variant from the hardware
 //! - `llama_cpp`: the `llama-server` process and chat streaming
+//! - `process`: keeping child processes tied to the client
 //! - `commands`: the server's model commands
 //! - `echo`: the built-in test model
 
 pub mod commands;
 pub mod echo;
 pub mod llama_cpp;
+pub mod process;
 pub mod runtime;
+pub mod select;
 pub mod store;
 
 use log::info;
+use protocol::hardware::Gpu;
 use protocol::{
     Backend, ChatTurn, ClientMessage, CommandState, InferenceSettings, Inventory, LocalModel, ModelCommandKind,
-    ModelState, Progress, Stage, Storage,
+    ModelSettings, ModelState, Progress, Stage, Storage, Usage,
 };
 use std::path::Path;
 use std::sync::{Arc, Mutex};
@@ -181,9 +187,12 @@ impl Inference {
                 backend: m.backend,
                 state,
                 size_bytes: m.size_bytes,
-                context_length: m.context_length,
+                // What it runs with, so the server trims history to fit.
+                context_length: m.settings.context_length.or(m.context_length),
                 meta: m.meta.clone(),
                 error: None,
+                settings: m.settings,
+                run: (state == ModelState::Loaded).then(|| s.llama.run_info(&m.id)).flatten(),
             });
         }
         let present = |id: &str| on_disk.iter().any(|m| m.id == id);
@@ -202,8 +211,18 @@ impl Inference {
                 models_bytes: s.store.models_bytes(),
                 free_bytes: s.store.free_bytes().unwrap_or(0),
             },
-            runtimes: s.runtime.info().into_iter().collect(),
+            runtimes: s.runtime.info(),
         }
+    }
+
+    /// The hardware scan is in: the automatic runtime choice uses it, and
+    /// an installed GPU runtime is checked in the background so the
+    /// inventory shows what it sees.
+    pub fn set_hardware(&self, gpus: Vec<Gpu>) {
+        self.shared.runtime.set_hardware(gpus);
+        self.shared.changed();
+        let shared = self.shared.clone();
+        std::thread::spawn(move || shared.runtime.check_installed(&|| shared.changed()));
     }
 
     /// Notified whenever the inventory changes (debounce in the session).
@@ -223,11 +242,16 @@ impl Inference {
     }
 
     /// Generic chat completion: streams `Status` and `Delta` events on
-    /// `out`. Dropping the future stops generation.
-    pub async fn chat(&self, req: ChatCompletion, out: mpsc::Sender<InferenceEvent>) -> Result<(), InferenceError> {
+    /// `out`, and returns the reply's token counts and speed where the
+    /// backend reports them. Dropping the future stops generation.
+    pub async fn chat(
+        &self,
+        req: ChatCompletion,
+        out: mpsc::Sender<InferenceEvent>,
+    ) -> Result<Option<Usage>, InferenceError> {
         let settings = self.shared.settings();
         if req.model_id == echo::ECHO_MODEL && settings.echo_model_enabled {
-            return echo::chat(&req.messages, &out).await;
+            return echo::chat(&req.messages, &out).await.map(|()| None);
         }
         let Some(manifest) = self.shared.store.get(&req.model_id) else {
             if self
@@ -282,6 +306,8 @@ fn from_spec(spec: &protocol::ModelSpec, state: ModelState, error: Option<String
         context_length: spec.context_length,
         meta: spec.meta.clone(),
         error,
+        settings: ModelSettings::default(),
+        run: None,
     }
 }
 
@@ -297,14 +323,21 @@ mod tests {
     /// only fetch the model. Echo is on, as a server would turn it on.
     fn inference(dir: &TempDir) -> Inference {
         let store = store::Store::open_with(&dir.0, true, Arc::new(|_| None));
-        let asset = runtime::pinned_for_this_platform().or(runtime::PINNED.first());
-        let runtime = runtime::Runtime::with_asset(&dir.0, asset);
-        if let Some(asset) = asset {
-            let install = dir.0.join(format!("runtime/cpu-{}", runtime::LLAMA_CPP_VERSION));
-            std::fs::create_dir_all(&install).unwrap();
-            std::fs::write(install.join(runtime::SERVER_EXE), b"").unwrap();
-            std::fs::write(install.join(".installed"), asset.sha256).unwrap();
-        }
+        let sha = "ab".repeat(32);
+        let cpu = runtime::tests::variant(
+            "cpu",
+            vec![runtime::PinnedArchive {
+                url: "http://127.0.0.1:9/never.tar.gz".into(),
+                sha256: sha.clone(),
+                size_bytes: 1,
+                format: runtime::ArchiveFormat::TarGz,
+            }],
+        );
+        let install = dir.0.join("runtime/cpu-b12110");
+        std::fs::create_dir_all(&install).unwrap();
+        std::fs::write(install.join(runtime::SERVER_EXE), b"").unwrap();
+        std::fs::write(install.join(".installed"), sha).unwrap();
+        let runtime = runtime::tests::runtime_with(&dir.0, vec![cpu]);
         let inf = Inference::from_parts(store, runtime);
         inf.apply_settings(&InferenceSettings {
             echo_model_enabled: true,
@@ -516,6 +549,100 @@ mod tests {
         let last = statuses_until_final(&mut rx).await.pop().unwrap();
         assert_eq!(last.state, CommandState::Cancelled);
         assert!(dir.0.join("models/m1/model.gguf.partial").exists());
+    }
+
+    #[tokio::test]
+    async fn configure_persists_and_select_runtime_checks_the_variant() {
+        let dir = TempDir::new("inf-configure");
+        let inf = inference(&dir);
+        let body = blob(1_000);
+        let (url, _) = serve(body.clone(), Quirks::default());
+        let (tx, mut rx) = mpsc::channel(64);
+        inf.execute("c1".into(), pull(spec("m1", &url, &body)), tx.clone());
+        assert_eq!(
+            statuses_until_final(&mut rx).await.pop().unwrap().state,
+            CommandState::Done
+        );
+
+        let settings = ModelSettings {
+            gpu_layers: protocol::GpuLayers::Off,
+            context_length: Some(8192),
+        };
+        let configure = |id: &str, settings| ModelCommandKind::Configure {
+            model_id: id.into(),
+            settings,
+        };
+        inf.execute("c2".into(), configure("m1", settings), tx.clone());
+        assert_eq!(
+            statuses_until_final(&mut rx).await.pop().unwrap().state,
+            CommandState::Done
+        );
+        let m1 = inf.inventory().models.into_iter().find(|m| m.id == "m1").unwrap();
+        assert_eq!((m1.settings, m1.context_length), (settings, Some(8192)));
+        // A restart reads them back from the manifest.
+        drop(inf);
+        let inf = inference(&dir);
+        let m1 = inf.inventory().models.into_iter().find(|m| m.id == "m1").unwrap();
+        assert_eq!(m1.settings, settings);
+
+        inf.execute("c3".into(), configure("nope", settings), tx.clone());
+        let last = statuses_until_final(&mut rx).await.pop().unwrap();
+        assert_eq!(last.state, CommandState::Failed);
+        assert!(last.error.unwrap().contains("doesn't have the model"));
+        let bad = ModelSettings {
+            context_length: Some(1),
+            ..settings
+        };
+        inf.execute("c4".into(), configure("m1", bad), tx.clone());
+        assert_eq!(
+            statuses_until_final(&mut rx).await.pop().unwrap().state,
+            CommandState::Failed
+        );
+
+        inf.execute(
+            "c5".into(),
+            ModelCommandKind::SelectRuntime { variant: "rocm".into() },
+            tx.clone(),
+        );
+        let last = statuses_until_final(&mut rx).await.pop().unwrap();
+        assert_eq!(last.state, CommandState::Failed);
+        assert!(last
+            .error
+            .unwrap()
+            .contains("isn't a llama.cpp variant this client has pinned"));
+        inf.execute(
+            "c6".into(),
+            ModelCommandKind::SelectRuntime { variant: "cpu".into() },
+            tx,
+        );
+        assert_eq!(
+            statuses_until_final(&mut rx).await.pop().unwrap().state,
+            CommandState::Done
+        );
+        let cpu = &inf.inventory().runtimes[0];
+        assert!(cpu.selected && !cpu.automatic);
+    }
+
+    #[tokio::test]
+    async fn a_model_needing_a_newer_llama_cpp_is_refused() {
+        let dir = TempDir::new("inf-minver");
+        let inf = inference(&dir);
+        let body = blob(1_000);
+        let (url, requests) = serve(body.clone(), Quirks::default());
+        let mut newer = spec("m1", &url, &body);
+        newer.min_runtime_version = Some("b12111".into());
+        let (tx, mut rx) = mpsc::channel(64);
+        inf.execute("c1".into(), pull(newer.clone()), tx.clone());
+        let last = statuses_until_final(&mut rx).await.pop().unwrap();
+        assert_eq!(last.state, CommandState::Failed);
+        assert!(last.error.unwrap().contains("needs llama.cpp b12111 or newer"));
+        assert_eq!(requests.load(std::sync::atomic::Ordering::SeqCst), 0);
+        newer.min_runtime_version = Some("b12110".into());
+        inf.execute("c2".into(), pull(newer), tx);
+        assert_eq!(
+            statuses_until_final(&mut rx).await.pop().unwrap().state,
+            CommandState::Done
+        );
     }
 
     #[tokio::test]

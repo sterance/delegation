@@ -104,6 +104,7 @@ fn gpus() -> Vec<Gpu> {
             vram_bytes: (!shared).then_some(dedicated),
             vram_shared: shared,
             max_core_mhz: None,
+            ..Gpu::default()
         });
     }
     let mut all = nvidia;

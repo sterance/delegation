@@ -474,6 +474,8 @@ mod tests {
             context_length: None,
             meta: Default::default(),
             error: None,
+            settings: Default::default(),
+            run: None,
         }
     }
 

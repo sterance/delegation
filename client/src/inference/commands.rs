@@ -1,5 +1,6 @@
-//! Model commands from the server: pull, delete, cancel, and `unsupported`
-//! for anything newer than this build.
+//! Model commands from the server: pull, delete, cancel, choosing the
+//! runtime variant (`select_runtime`), per-model settings (`configure`),
+//! and `unsupported` for anything newer than this build.
 //!
 //! Commands outlive connections. A pull keeps going if the session drops
 //! (its statuses just have nowhere to go), and a pull of a model that's
@@ -11,7 +12,9 @@
 use super::store::{validate_spec, PullError, PullOutcome};
 use super::{llama_cpp, CommandStatus, Shared};
 use log::{info, warn};
-use protocol::{valid_model_id, CommandState, ModelCommandKind, ModelSpec, Progress, ProgressPhase};
+use protocol::{
+    valid_model_id, CommandState, LlamaCppVersion, ModelCommandKind, ModelSettings, ModelSpec, Progress, ProgressPhase,
+};
 use std::collections::{BTreeMap, HashMap};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -118,6 +121,10 @@ pub(crate) fn execute(
         match command {
             ModelCommandKind::Pull { model } => pull(shared, command_id, model, tx).await,
             ModelCommandKind::Delete { model_id } => delete(shared, command_id, model_id, tx).await,
+            ModelCommandKind::SelectRuntime { variant } => select_runtime(shared, command_id, variant, tx).await,
+            ModelCommandKind::Configure { model_id, settings } => {
+                configure(shared, command_id, model_id, settings, tx).await
+            }
             ModelCommandKind::Cancel { target_command_id } => {
                 if shared.pulls.cancel_command(&target_command_id) {
                     info!(target: "models", "cancelling {target_command_id}");
@@ -137,8 +144,25 @@ pub(crate) fn execute(
     });
 }
 
+/// Whether this client's llama.cpp can run `spec`.
+pub(crate) fn check_runtime_version(spec: &ModelSpec, have: &str) -> Result<(), String> {
+    let Some(min) = &spec.min_runtime_version else {
+        return Ok(());
+    };
+    let need = LlamaCppVersion::parse(min)
+        .ok_or_else(|| format!("{min:?} isn't a llama.cpp version (min_runtime_version)"))?;
+    match LlamaCppVersion::parse(have) {
+        Some(have_v) if have_v >= need => Ok(()),
+        _ => Err(format!(
+            "this model needs llama.cpp {need} or newer, and this client has {have}; update the client to install it"
+        )),
+    }
+}
+
 async fn pull(shared: Arc<Shared>, command_id: String, spec: ModelSpec, tx: mpsc::Sender<CommandStatus>) {
-    if let Err(why) = validate_spec(&spec, shared.store.allow_http()) {
+    let checked = validate_spec(&spec, shared.store.allow_http())
+        .and_then(|()| check_runtime_version(&spec, shared.runtime.version()));
+    if let Err(why) = checked {
         warn!(target: "models", "refusing pull {command_id}: {why}");
         let _ = tx
             .send(status(&command_id, CommandState::Failed, None, Some(why)))
@@ -237,9 +261,10 @@ async fn run_pull(shared: Arc<Shared>, spec: ModelSpec, cancel: Arc<AtomicBool>)
     let work = {
         let (shared, spec, cancel) = (shared.clone(), spec.clone(), cancel.clone());
         tokio::task::spawn_blocking(move || -> Result<PullOutcome, PullError> {
-            shared.runtime.ensure(
+            shared.runtime.resolve(
                 shared.store.agent(),
                 &cancel,
+                reserve,
                 &mut |done, total| reporter.report(ProgressPhase::Runtime, done, total),
                 &|| shared.changed(),
             )?;
@@ -341,4 +366,136 @@ async fn delete(shared: Arc<Shared>, command_id: String, model_id: String, tx: m
         ),
     };
     let _ = tx.send(last).await;
+}
+
+/// `select_runtime`: records the choice, unloads the model if the variant
+/// changes, and installs and checks the new one (with progress), so the
+/// next reply doesn't wait for it. If the chosen variant doesn't work here,
+/// the command fails with why, and models keep loading with the fallback.
+async fn select_runtime(shared: Arc<Shared>, command_id: String, variant: String, tx: mpsc::Sender<CommandStatus>) {
+    let before = shared.runtime.selected();
+    if let Err(why) = shared.runtime.select(&variant) {
+        let _ = tx
+            .send(status(&command_id, CommandState::Failed, None, Some(why)))
+            .await;
+        return;
+    }
+    info!(target: "models", "runtime selection is now {variant}");
+    let _ = tx.send(status(&command_id, CommandState::Accepted, None, None)).await;
+    shared.changed();
+
+    let settings = shared.settings();
+    let reserve = settings.disk_reserve_mb.saturating_mul(1024 * 1024);
+    let (progress_tx, mut progress_rx) = watch::channel(None);
+    let mut reporter = Reporter {
+        tx: progress_tx,
+        interval: Duration::from_millis(settings.progress_interval_ms),
+        last: None,
+    };
+    let work = {
+        let shared = shared.clone();
+        tokio::task::spawn_blocking(move || {
+            shared.runtime.resolve(
+                shared.store.agent(),
+                &AtomicBool::new(false),
+                reserve,
+                &mut |done, total| reporter.report(ProgressPhase::Runtime, done, total),
+                &|| shared.changed(),
+            )
+        })
+    };
+    tokio::pin!(work);
+    let result = loop {
+        tokio::select! {
+            result = &mut work => break result,
+            Ok(()) = progress_rx.changed() => {
+                let progress = *progress_rx.borrow_and_update();
+                let _ = tx.try_send(status(&command_id, CommandState::InProgress, progress, None));
+            }
+        }
+    };
+    let resolved = match result {
+        Ok(Ok(resolved)) => resolved,
+        Ok(Err(e)) => {
+            let _ = tx
+                .send(status(&command_id, CommandState::Failed, None, Some(e.to_string())))
+                .await;
+            return;
+        }
+        Err(e) => {
+            let _ = tx
+                .send(status(&command_id, CommandState::Failed, None, Some(e.to_string())))
+                .await;
+            return;
+        }
+    };
+    if before.as_deref() != Some(resolved.variant.as_str()) {
+        info!(target: "models", "switched to llama.cpp {}; unloading the current model", resolved.variant);
+        llama_cpp::stop(&shared).await;
+    }
+    shared.changed();
+    let (state, error) = if variant == "auto" || resolved.variant == variant {
+        (CommandState::Done, None)
+    } else {
+        let why = shared
+            .runtime
+            .info()
+            .into_iter()
+            .find(|r| r.variant == variant)
+            .and_then(|r| r.error)
+            .unwrap_or_else(|| "it didn't work here".into());
+        (
+            CommandState::Failed,
+            Some(format!(
+                "llama.cpp {variant} doesn't work on this client, so it uses {} instead: {why}",
+                resolved.variant
+            )),
+        )
+    };
+    let _ = tx.send(status(&command_id, state, None, error)).await;
+}
+
+/// `configure`: stores the settings in the model's manifest and unloads the
+/// model if it's loaded, so the next reply loads it with them.
+async fn configure(
+    shared: Arc<Shared>,
+    command_id: String,
+    model_id: String,
+    settings: ModelSettings,
+    tx: mpsc::Sender<CommandStatus>,
+) {
+    let fail = |why: String| status(&command_id, CommandState::Failed, None, Some(why));
+    if !valid_model_id(&model_id) {
+        let _ = tx.send(fail(format!("{model_id:?} isn't a valid model id"))).await;
+        return;
+    }
+    if let Some(why) = settings.problem() {
+        let _ = tx.send(fail(why)).await;
+        return;
+    }
+    let result = {
+        let (shared, id) = (shared.clone(), model_id.clone());
+        tokio::task::spawn_blocking(move || shared.store.configure(&id, settings)).await
+    };
+    match result {
+        Ok(Ok(true)) => {}
+        Ok(Ok(false)) => {
+            let _ = tx
+                .send(fail(format!("this client doesn't have the model {model_id:?}")))
+                .await;
+            return;
+        }
+        Ok(Err(e)) => {
+            let _ = tx.send(fail(format!("couldn't save the settings: {e}"))).await;
+            return;
+        }
+        Err(e) => {
+            let _ = tx.send(fail(format!("couldn't save the settings: {e}"))).await;
+            return;
+        }
+    }
+    info!(target: "models", "{model_id} settings: {settings:?}");
+    llama_cpp::unload(&shared, &model_id).await;
+    shared.changed();
+    let _ = tx.send(status(&command_id, CommandState::Done, None, None)).await;
 }

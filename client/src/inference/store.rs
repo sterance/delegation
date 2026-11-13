@@ -12,7 +12,7 @@
 //! continues it with a `Range` request.
 
 use log::{debug, info, warn};
-use protocol::{valid_model_id, Backend, ModelMeta, ModelSpec};
+use protocol::{valid_model_id, Backend, ModelMeta, ModelSettings, ModelSpec};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
@@ -72,6 +72,9 @@ pub struct Manifest {
     #[serde(default)]
     pub meta: ModelMeta,
     pub installed_at: String,
+    /// From the dashboard (`configure`); kept across restarts and re-pulls.
+    #[serde(default)]
+    pub settings: ModelSettings,
 }
 
 /// The result of a successful pull.
@@ -241,6 +244,7 @@ impl Store {
             progress,
         )?;
         std::fs::rename(&partial, &file).map_err(|e| failed(format!("couldn't move the model into place: {e}")))?;
+        let settings = self.get(&spec.id).map(|m| m.settings).unwrap_or_default();
         let manifest = Manifest {
             version: MANIFEST_VERSION,
             id: spec.id.clone(),
@@ -253,6 +257,7 @@ impl Store {
             context_length: spec.context_length,
             meta: spec.meta.clone(),
             installed_at: protocol::ts(),
+            settings,
         };
         let json = serde_json::to_vec_pretty(&manifest).map_err(|e| failed(e.to_string()))?;
         write_atomically(&dir.join(MANIFEST_FILE), &json)
@@ -260,6 +265,19 @@ impl Store {
         self.lock().insert(spec.id.clone(), manifest);
         info!(target: "models", "{} is ready", spec.id);
         Ok(PullOutcome::Downloaded)
+    }
+
+    /// Stores new settings in the model's manifest. Returns false if there's
+    /// no such model.
+    pub fn configure(&self, id: &str, settings: ModelSettings) -> std::io::Result<bool> {
+        let Some(mut manifest) = self.get(id) else {
+            return Ok(false);
+        };
+        manifest.settings = settings;
+        let json = serde_json::to_vec_pretty(&manifest).map_err(std::io::Error::other)?;
+        write_atomically(&self.models_dir.join(id).join(MANIFEST_FILE), &json)?;
+        self.lock().insert(id.to_string(), manifest);
+        Ok(true)
     }
 
     /// Removes the model's directory, partial download included. Returns
@@ -691,6 +709,7 @@ pub(crate) mod tests {
             },
             context_length: Some(2048),
             meta: ModelMeta::default(),
+            min_runtime_version: None,
         }
     }
 
@@ -944,6 +963,27 @@ pub(crate) mod tests {
         assert!(reopened.delete("good").unwrap());
         assert!(!reopened.delete("good").unwrap(), "deleting a missing model is fine");
         assert!(reopened.list().is_empty());
+    }
+
+    #[test]
+    fn settings_survive_a_restart_and_a_pull_again() {
+        let dir = TempDir::new("configure");
+        let body = blob(1000);
+        let (url, _) = serve(body.clone(), Quirks::default());
+        let store = store_in(&dir.0, None);
+        pull(&store, &spec("m1", &url, &body)).unwrap();
+        let settings = ModelSettings {
+            gpu_layers: protocol::GpuLayers::Count(7),
+            context_length: Some(8192),
+        };
+        assert!(store.configure("m1", settings).unwrap());
+        assert!(!store.configure("nope", settings).unwrap());
+        assert_eq!(store_in(&dir.0, None).get("m1").unwrap().settings, settings);
+        // A changed file is pulled again; its settings stay.
+        let other = blob(1001);
+        let (url2, _) = serve(other.clone(), Quirks::default());
+        pull(&store, &spec("m1", &url2, &other)).unwrap();
+        assert_eq!(store.get("m1").unwrap().settings, settings);
     }
 
     #[test]

@@ -17,8 +17,9 @@ pub mod telemetry;
 pub use chat::{ChatRole, ChatTurn};
 pub use hardware::HardwareSpecs;
 pub use models::{
-    valid_model_id, Backend, CommandState, InferenceSettings, Inventory, LocalModel, ModelCommandKind, ModelMeta,
-    ModelSource, ModelSpec, ModelState, Progress, ProgressPhase, RuntimeInfo, RuntimeState, Stage, Storage,
+    valid_model_id, Backend, CommandState, GpuLayers, GpuOffload, InferenceSettings, Inventory, LlamaCppVersion,
+    LocalModel, ModelCommandKind, ModelMeta, ModelSettings, ModelSource, ModelSpec, ModelState, Progress,
+    ProgressPhase, RunInfo, RuntimeInfo, RuntimeState, Stage, Storage, Usage,
 };
 pub use telemetry::{ClientSettings, GpuMetrics, Metrics, Tick};
 
@@ -87,9 +88,14 @@ pub enum ClientMessage {
     /// The next piece of the reply to `chat_request` `request_id`.
     #[serde(rename = "chat_chunk")]
     ChatChunk { request_id: String, delta: String },
-    /// The reply to `request_id` is complete.
+    /// The reply to `request_id` is complete. `usage` carries its token
+    /// counts and speed where the backend reports them.
     #[serde(rename = "chat_done")]
-    ChatDone { request_id: String },
+    ChatDone {
+        request_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        usage: Option<Usage>,
+    },
     /// The reply to `request_id` failed; no more chunks follow.
     #[serde(rename = "chat_error")]
     ChatError { request_id: String, error: String },
@@ -270,7 +276,7 @@ mod tests {
         .unwrap();
         assert_eq!(
             json,
-            r#"{"type":"welcome","settings":{"tick_interval_ms":1000,"sampler_interval_ms":500,"sample_max_age_ms":3000,"server_silence_timeout_ms":6000,"reconnect_backoff_initial_ms":1000,"reconnect_backoff_max_ms":30000,"inference":{"progress_interval_ms":1000,"idle_unload_secs":600,"model_load_timeout_ms":120000,"max_concurrent":1,"max_tokens":2048,"default_context":4096,"threads":0,"disk_reserve_mb":2048,"echo_model_enabled":false}}}"#
+            r#"{"type":"welcome","settings":{"tick_interval_ms":1000,"sampler_interval_ms":500,"sample_max_age_ms":3000,"server_silence_timeout_ms":6000,"reconnect_backoff_initial_ms":1000,"reconnect_backoff_max_ms":30000,"inference":{"progress_interval_ms":1000,"idle_unload_secs":600,"model_load_timeout_ms":120000,"max_concurrent":1,"max_tokens":2048,"default_context":4096,"threads":0,"disk_reserve_mb":2048,"echo_model_enabled":false,"gpu_fit_margin_mib":1024}}}"#
         );
         let ServerMessage::Welcome { settings } = serde_json::from_str(&json).unwrap() else {
             panic!("not welcome")
@@ -388,6 +394,7 @@ mod tests {
             (
                 ClientMessage::ChatDone {
                     request_id: "r1".into(),
+                    usage: None,
                 },
                 r#"{"type":"chat_done","request_id":"r1"}"#,
             ),
@@ -428,6 +435,7 @@ mod tests {
                 parameters: None,
                 quantization: Some("Q4_K_M".into()),
             },
+            min_runtime_version: None,
         }
     }
 
@@ -437,7 +445,7 @@ mod tests {
             (
                 ModelCommandKind::Pull { model: sample_spec() },
                 format!(
-                    r#"{{"type":"model_command","command_id":"c1","command":{{"kind":"pull","model":{{"id":"qwen","display_name":"Qwen","backend":"llama_cpp","source":{{"url":"https://example.com/q.gguf","sha256":"{}","size_bytes":10}},"context_length":4096,"meta":{{"family":"qwen2.5","parameters":null,"quantization":"Q4_K_M"}}}}}}}}"#,
+                    r#"{{"type":"model_command","command_id":"c1","command":{{"kind":"pull","model":{{"id":"qwen","display_name":"Qwen","backend":"llama_cpp","source":{{"url":"https://example.com/q.gguf","sha256":"{}","size_bytes":10}},"context_length":4096,"meta":{{"family":"qwen2.5","parameters":null,"quantization":"Q4_K_M"}},"min_runtime_version":null}}}}}}"#,
                     "ab".repeat(32)
                 ),
             ),
@@ -473,6 +481,45 @@ mod tests {
     }
 
     #[test]
+    fn runtime_and_configure_commands_have_their_wire_forms() {
+        let cases = [
+            (
+                ModelCommandKind::SelectRuntime { variant: "auto".into() },
+                r#"{"kind":"select_runtime","variant":"auto"}"#,
+            ),
+            (
+                ModelCommandKind::Configure {
+                    model_id: "qwen".into(),
+                    settings: ModelSettings {
+                        gpu_layers: GpuLayers::Count(12),
+                        context_length: Some(8192),
+                    },
+                },
+                r#"{"kind":"configure","model_id":"qwen","settings":{"gpu_layers":12,"context_length":8192}}"#,
+            ),
+        ];
+        for (command, wire) in cases {
+            assert_eq!(serde_json::to_string(&command).unwrap(), wire);
+            assert_eq!(serde_json::from_str::<ModelCommandKind>(wire).unwrap(), command);
+        }
+    }
+
+    #[test]
+    fn chat_done_carries_optional_usage() {
+        let msg: ClientMessage = serde_json::from_str(
+            r#"{"type":"chat_done","request_id":"r1","usage":{"prompt_tokens":12,"completion_tokens":40,"tokens_per_second":51.5,"run":{"variant":"cpu","gpu_layers":null,"device":null}}}"#,
+        )
+        .unwrap();
+        let ClientMessage::ChatDone { usage: Some(usage), .. } = msg else {
+            panic!("no usage")
+        };
+        assert_eq!((usage.prompt_tokens, usage.completion_tokens), (12, 40));
+        assert_eq!(usage.tokens_per_second, Some(51.5));
+        assert_eq!(usage.prompt_tokens_per_second, None);
+        assert_eq!(usage.run.unwrap().variant, "cpu");
+    }
+
+    #[test]
     fn unknown_command_kinds_parse_as_unknown() {
         // What a newer server's `load` command looks like to this build.
         let msg: ServerMessage = serde_json::from_str(
@@ -498,6 +545,15 @@ mod tests {
                 context_length: None,
                 meta: ModelMeta::default(),
                 error: None,
+                settings: ModelSettings::default(),
+                run: Some(RunInfo {
+                    variant: "cuda-13".into(),
+                    gpu_layers: Some(GpuOffload {
+                        offloaded: 29,
+                        total: 29,
+                    }),
+                    device: Some("NVIDIA GeForce RTX 3070".into()),
+                }),
             }],
             storage: Storage {
                 models_bytes: 10,
@@ -506,11 +562,15 @@ mod tests {
             runtimes: vec![RuntimeInfo {
                 backend: Backend::LlamaCpp,
                 version: "b1".into(),
-                variant: "cpu".into(),
+                variant: "cuda-13".into(),
                 state: RuntimeState::Ready,
+                selected: true,
+                automatic: true,
+                devices: vec!["NVIDIA GeForce RTX 3070".into()],
+                error: None,
             }],
         });
-        let wire = r#"{"type":"model_inventory","models":[{"id":"qwen","display_name":"Qwen","backend":"llama_cpp","state":"loaded","size_bytes":10,"context_length":null,"meta":{"family":null,"parameters":null,"quantization":null},"error":null}],"storage":{"models_bytes":10,"free_bytes":20},"runtimes":[{"backend":"llama_cpp","version":"b1","variant":"cpu","state":"ready"}]}"#;
+        let wire = r#"{"type":"model_inventory","models":[{"id":"qwen","display_name":"Qwen","backend":"llama_cpp","state":"loaded","size_bytes":10,"context_length":null,"meta":{"family":null,"parameters":null,"quantization":null},"error":null,"settings":{"gpu_layers":"auto","context_length":null},"run":{"variant":"cuda-13","gpu_layers":{"offloaded":29,"total":29},"device":"NVIDIA GeForce RTX 3070"}}],"storage":{"models_bytes":10,"free_bytes":20},"runtimes":[{"backend":"llama_cpp","version":"b1","variant":"cuda-13","state":"ready","selected":true,"automatic":true,"devices":["NVIDIA GeForce RTX 3070"],"error":null}]}"#;
         assert_eq!(serde_json::to_string(&inventory).unwrap(), wire);
         let back: ClientMessage = serde_json::from_str(wire).unwrap();
         assert_eq!(serde_json::to_string(&back).unwrap(), wire);

@@ -20,10 +20,13 @@ use uuid::Uuid;
 pub const KEEP_FINISHED: Duration = Duration::from_secs(3_600);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "lowercase")]
+#[serde(rename_all = "snake_case")]
 pub enum CommandKind {
     Pull,
     Delete,
+    /// `select_runtime`; `model_id` is empty and `model_name` names the variant.
+    SelectRuntime,
+    Configure,
 }
 
 /// The client's states, plus `sent` for before it has answered.
@@ -78,6 +81,9 @@ pub struct TrackedCommand {
     pub finished_at: Option<String>,
     #[serde(skip)]
     conn_id: Option<u64>,
+    /// Creation order, for sorting commands made in the same millisecond.
+    #[serde(skip)]
+    seq: u64,
     #[serde(skip)]
     finished: Option<Instant>,
 }
@@ -112,6 +118,7 @@ pub enum CancelError {
 #[derive(Default)]
 pub struct ModelCommands {
     inner: Mutex<HashMap<String, TrackedCommand>>,
+    next_seq: std::sync::atomic::AtomicU64,
 }
 
 fn now() -> String {
@@ -158,6 +165,7 @@ impl ModelCommands {
             started_at: now(),
             finished_at: None,
             conn_id: None,
+            seq: self.next_seq.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
             finished: None,
         };
         match live.sender(new.client_id) {
@@ -181,6 +189,8 @@ impl ModelCommands {
             match new.kind {
                 CommandKind::Pull => "pull",
                 CommandKind::Delete => "delete",
+                CommandKind::SelectRuntime => "select runtime",
+                CommandKind::Configure => "configure",
             },
             new.model_id,
             match &command.error {
@@ -242,7 +252,9 @@ impl ModelCommands {
                     CommandKind::Pull => {
                         "The client disconnected before the download finished. Install it again to resume."
                     }
-                    CommandKind::Delete => "The client disconnected before it finished.",
+                    CommandKind::Delete | CommandKind::SelectRuntime | CommandKind::Configure => {
+                        "The client disconnected before it finished."
+                    }
                 };
                 command.finish(TrackedState::Failed, Some(why.into()));
             }
@@ -257,7 +269,7 @@ impl ModelCommands {
             .filter(|c| c.client_id == client_id)
             .cloned()
             .collect();
-        list.sort_by(|a, b| b.started_at.cmp(&a.started_at).then(b.command_id.cmp(&a.command_id)));
+        list.sort_by_key(|c| std::cmp::Reverse(c.seq));
         list
     }
 

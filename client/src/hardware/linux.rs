@@ -154,6 +154,7 @@ fn gpus(root: &HostRoot, nvidia: Vec<NvidiaGpu>, name_for_slot: impl Fn(&str) ->
                 .ok()
                 .and_then(|t| max_dpm_mhz(&t))
                 .or_else(|| read_u64(&card.join("gt_max_freq_mhz")).map(|m| m as u32)),
+            ..Gpu::default()
         });
     }
     out
@@ -582,6 +583,7 @@ mod tests {
                 vram_bytes: None,
                 vram_shared: true,
                 max_core_mhz: Some(1400),
+                ..Gpu::default()
             }
         );
         assert_eq!(
@@ -592,6 +594,7 @@ mod tests {
                 vram_bytes: Some(25753026560),
                 vram_shared: false,
                 max_core_mhz: Some(2482),
+                ..Gpu::default()
             }
         );
     }

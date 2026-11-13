@@ -33,6 +33,31 @@ export interface ChatMessage {
   completed_at: string | null
   /** Live only, from the reply stream: never stored. */
   stage?: Stage | null
+  /** Extra facts about a reply: its usage (tokens, speed, what ran it) and history trimming. */
+  meta?: MessageMeta | null
+}
+
+/** Where a loaded model runs; mirrors `RunInfo` in protocol/src/models.rs. */
+export interface RunInfo {
+  /** "cpu", "cuda-12", "cuda-13" or "vulkan". */
+  variant: string
+  /** Null for a build without GPU support. */
+  gpu_layers: { offloaded: number; total: number } | null
+  /** The GPU(s) used; null for CPU only. */
+  device: string | null
+}
+
+export interface Usage {
+  prompt_tokens: number
+  completion_tokens: number
+  tokens_per_second: number | null
+  prompt_tokens_per_second: number | null
+  run: RunInfo | null
+}
+
+export interface MessageMeta {
+  usage?: Usage
+  history_turns_dropped?: number
 }
 
 export interface ConversationSummary {
@@ -99,7 +124,7 @@ export type ReplyEvent =
   | ({ type: 'status'; status: MessageStatus } & Answerer)
   | { type: 'progress'; stage: Stage }
   | { type: 'chunk'; delta: string }
-  | { type: 'end'; status: MessageStatus; error: string | null }
+  | { type: 'end'; status: MessageStatus; error: string | null; meta?: MessageMeta | null }
 
 export type Backend = 'llama_cpp' | 'echo'
 

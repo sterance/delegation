@@ -323,7 +323,7 @@ async fn chat_requests_are_echoed_back_and_can_be_cancelled() {
                 assert_eq!(request_id, "r1");
                 reply.push_str(&delta);
             }
-            ClientMessage::ChatDone { request_id } => {
+            ClientMessage::ChatDone { request_id, .. } => {
                 assert_eq!(request_id, "r1");
                 break;
             }

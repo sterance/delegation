@@ -24,6 +24,8 @@ pub fn local_model() -> LocalModel {
         context_length: None,
         meta: ModelMeta::default(),
         error: None,
+        settings: Default::default(),
+        run: None,
     }
 }
 

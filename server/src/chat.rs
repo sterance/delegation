@@ -508,8 +508,10 @@ async fn pump(state: AppState, owner: String, message_id: String, first: Option<
                         "model": s.model,
                     }),
                 ),
-                Ok(ReplyEvent::End { status, error }) => {
-                    let _ = tx.send(event("end", json!({ "status": status, "error": error }))).await;
+                Ok(ReplyEvent::End { status, error, meta }) => {
+                    let _ = tx
+                        .send(event("end", json!({ "status": status, "error": error, "meta": meta })))
+                        .await;
                     return;
                 }
                 // Too slow to keep up, or the hub went: start over from a

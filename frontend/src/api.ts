@@ -15,6 +15,7 @@ import type {
   MessageStatus,
   ModelState,
   ReplyEvent,
+  RunInfo,
   SendRequest,
   Target,
 } from './types/chat'
@@ -85,13 +86,35 @@ export interface LocalModel {
   meta: ModelMeta
   /** Why it's `failed`. */
   error: string | null
+  /** Missing from older clients. */
+  settings?: ModelSettings
+  /** Where it runs, while loaded. Missing from older clients. */
+  run?: RunInfo | null
+}
+
+/** How many layers go to the GPU: llama.cpp's automatic fit, none, all, or a number. */
+export type GpuLayers = 'auto' | 'off' | 'all' | number
+
+export interface ModelSettings {
+  gpu_layers: GpuLayers
+  /** Null: the model's own. */
+  context_length: number | null
 }
 
 export interface RuntimeInfo {
   backend: Backend
   version: string
+  /** "cpu", "cuda-12", "cuda-13" or "vulkan". */
   variant: string
-  state: 'absent' | 'downloading' | 'ready'
+  state: 'absent' | 'downloading' | 'ready' | 'failed'
+  // Missing from older clients (one CPU runtime, always the one used).
+  /** The one models load with. */
+  selected?: boolean
+  /** Chosen from the hardware rather than by the dashboard. */
+  automatic?: boolean
+  devices?: string[]
+  /** Why it failed. */
+  error?: string | null
 }
 
 export type CommandState = 'sent' | 'accepted' | 'in_progress' | 'done' | 'failed' | 'cancelled' | 'unsupported'
@@ -99,7 +122,7 @@ export type CommandState = 'sent' | 'accepted' | 'in_progress' | 'done' | 'faile
 export interface ModelCommand {
   command_id: string
   client_id: string
-  kind: 'pull' | 'delete'
+  kind: 'pull' | 'delete' | 'select_runtime' | 'configure'
   model_id: string
   model_name: string
   state: CommandState
@@ -130,6 +153,24 @@ export interface CatalogEntry {
   size_bytes: number
   context_length: number | null
   meta: ModelMeta
+  /** The oldest llama.cpp release (e.g. "b12110") that can run it. */
+  min_runtime_version: string | null
+}
+
+/** "b12110" -> 12110; null if it isn't a llama.cpp version. */
+export function llamaCppBuild(version: string | null | undefined): number | null {
+  const m = /^b(\d{1,9})$/.exec(version ?? '')
+  return m ? Number(m[1]) : null
+}
+
+/** Why `entry` can't be installed on a client with these runtimes, or null if it can. */
+export function runtimeTooOld(entry: CatalogEntry, runtimes: RuntimeInfo[]): string | null {
+  const need = llamaCppBuild(entry.min_runtime_version)
+  if (need === null) return null
+  const builds = runtimes.map((r) => llamaCppBuild(r.version)).filter((b): b is number => b !== null)
+  if (builds.length === 0) return null
+  const have = Math.max(...builds)
+  return have < need ? `Needs llama.cpp ${entry.min_runtime_version} or newer; this client has b${have}` : null
 }
 
 export function isCommandActive(state: CommandState): boolean {
@@ -333,7 +374,7 @@ async function failure(res: Response, method: string, path: string): Promise<Api
   return new ApiError(res.status, body?.error ?? `${method} ${path} failed: ${res.status} ${res.statusText}`)
 }
 
-type Method = 'GET' | 'POST' | 'PATCH' | 'DELETE'
+type Method = 'GET' | 'POST' | 'PUT' | 'PATCH' | 'DELETE'
 
 async function request<T>(method: Method, path: string, body?: unknown): Promise<T> {
   const res = await fetch(path, {
@@ -474,6 +515,20 @@ export function deleteModel(clientId: string, modelId: string): Promise<ModelCom
   return request<ModelCommand>(
     'DELETE',
     `/api/clients/${encodeURIComponent(clientId)}/models/${encodeURIComponent(modelId)}`,
+  )
+}
+
+/** Chooses the llama.cpp variant models load with; "auto" lets the client choose from its hardware. */
+export function selectRuntime(clientId: string, variant: string): Promise<ModelCommand> {
+  return request<ModelCommand>('POST', `/api/clients/${encodeURIComponent(clientId)}/runtime`, { variant })
+}
+
+/** A model's settings; the client applies them the next time it loads the model. */
+export function configureModel(clientId: string, modelId: string, settings: ModelSettings): Promise<ModelCommand> {
+  return request<ModelCommand>(
+    'PUT',
+    `/api/clients/${encodeURIComponent(clientId)}/models/${encodeURIComponent(modelId)}/settings`,
+    settings,
   )
 }
 

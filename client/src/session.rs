@@ -109,6 +109,18 @@ pub async fn controller(
 ) {
     let status: StatusFn = Arc::new(status);
     let mut current: Option<RunningSession> = None;
+    // The runtime choice waits for the hardware scan.
+    {
+        let mut machine = info.machine.clone();
+        let inference = info.inference.clone();
+        tokio::spawn(async move {
+            if let Ok(m) = machine.wait_for(Option::is_some).await {
+                if let Some(m) = m.as_ref() {
+                    inference.set_hardware(m.specs.gpus.clone());
+                }
+            }
+        });
+    }
     while let Some(cmd) = cmds.recv().await {
         let stopped = match current.take() {
             Some(session) => Some(session.stop().await),
@@ -488,6 +500,8 @@ fn command_summary(command: &protocol::ModelCommandKind) -> String {
         ModelCommandKind::Pull { model } => format!("pull {} ({} bytes)", model.id, model.source.size_bytes),
         ModelCommandKind::Delete { model_id } => format!("delete {model_id}"),
         ModelCommandKind::Cancel { target_command_id } => format!("cancel {target_command_id}"),
+        ModelCommandKind::SelectRuntime { variant } => format!("select runtime {variant}"),
+        ModelCommandKind::Configure { model_id, settings } => format!("configure {model_id}: {settings:?}"),
         ModelCommandKind::Unknown => "a kind this client doesn't know".into(),
     }
 }

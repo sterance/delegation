@@ -284,11 +284,11 @@ impl Session<'_> {
                     .replies
                     .on_client_event(self.conn.id, &request_id, ChatEvent::Chunk(delta));
             }
-            Ok(ClientMessage::ChatDone { request_id }) => {
-                debug(|| format!("[chat] {request_id} done"));
+            Ok(ClientMessage::ChatDone { request_id, usage }) => {
+                debug(|| format!("[chat] {request_id} done ({usage:?})"));
                 self.state
                     .replies
-                    .on_client_event(self.conn.id, &request_id, ChatEvent::Done);
+                    .on_client_event(self.conn.id, &request_id, ChatEvent::Done(usage));
             }
             Ok(ClientMessage::ChatError { request_id, error }) => {
                 log(format!("[chat] {request_id} failed on {client_id}: {error}"));

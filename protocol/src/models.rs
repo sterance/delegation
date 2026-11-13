@@ -84,6 +84,144 @@ pub struct LocalModel {
     /// Why it's `failed`.
     #[serde(default)]
     pub error: Option<String>,
+    /// Its settings from the dashboard (`configure`).
+    #[serde(default)]
+    pub settings: ModelSettings,
+    /// What it's running on, while `loaded`.
+    #[serde(default)]
+    pub run: Option<RunInfo>,
+}
+
+/// How many of a model's layers go to the GPU. On the wire: `"auto"`,
+/// `"off"`, `"all"` or a number.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum GpuLayers {
+    /// llama.cpp fits as many as the free VRAM allows (`--fit`).
+    #[default]
+    Auto,
+    /// CPU only.
+    Off,
+    All,
+    Count(u32),
+}
+
+impl Serialize for GpuLayers {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        match self {
+            GpuLayers::Auto => s.serialize_str("auto"),
+            GpuLayers::Off => s.serialize_str("off"),
+            GpuLayers::All => s.serialize_str("all"),
+            GpuLayers::Count(n) => s.serialize_u32(*n),
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for GpuLayers {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        #[serde(untagged)]
+        enum Repr {
+            Word(String),
+            Count(u32),
+        }
+        match Repr::deserialize(d)? {
+            Repr::Count(n) => Ok(GpuLayers::Count(n)),
+            Repr::Word(w) => match w.as_str() {
+                "auto" => Ok(GpuLayers::Auto),
+                "off" => Ok(GpuLayers::Off),
+                "all" => Ok(GpuLayers::All),
+                other => Err(serde::de::Error::custom(format!(
+                    "gpu_layers must be \"auto\", \"off\", \"all\" or a number, got {other:?}"
+                ))),
+            },
+        }
+    }
+}
+
+/// The most layers a `Count` may ask for; no model has nearly this many.
+pub const MAX_GPU_LAYERS: u32 = 10_000;
+/// The largest context `configure` may set.
+pub const MAX_CONTEXT: u32 = 1 << 22;
+
+/// Per-model settings, stored in the model's manifest on the client and
+/// applied the next time it loads.
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[serde(default)]
+pub struct ModelSettings {
+    pub gpu_layers: GpuLayers,
+    /// None: the model's own (or the client's default).
+    pub context_length: Option<u32>,
+}
+
+impl ModelSettings {
+    /// What's wrong with these settings, if anything.
+    pub fn problem(&self) -> Option<String> {
+        if let GpuLayers::Count(n) = self.gpu_layers {
+            if n > MAX_GPU_LAYERS {
+                return Some(format!("gpu_layers can be at most {MAX_GPU_LAYERS}"));
+            }
+        }
+        match self.context_length {
+            Some(c) if !(MIN_CONTEXT..=MAX_CONTEXT).contains(&c) => Some(format!(
+                "context_length must be between {MIN_CONTEXT} and {MAX_CONTEXT}"
+            )),
+            _ => None,
+        }
+    }
+}
+
+/// Layers on the GPU, from llama-server's log ("offloaded 29/29 layers to GPU").
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
+pub struct GpuOffload {
+    pub offloaded: u32,
+    pub total: u32,
+}
+
+/// Where a loaded model runs: the runtime variant and what reached the GPU.
+#[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq, Eq)]
+#[serde(default)]
+pub struct RunInfo {
+    /// e.g. "cuda-13".
+    pub variant: String,
+    /// None for a build without GPU support (it doesn't say).
+    pub gpu_layers: Option<GpuOffload>,
+    /// The GPU(s) it uses, e.g. "NVIDIA GeForce RTX 3070". None: CPU only.
+    pub device: Option<String>,
+}
+
+/// Token counts and speed of one reply, from llama-server's timings.
+#[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq)]
+#[serde(default)]
+pub struct Usage {
+    pub prompt_tokens: u32,
+    pub completion_tokens: u32,
+    /// Generation speed.
+    pub tokens_per_second: Option<f64>,
+    /// Prompt processing speed.
+    pub prompt_tokens_per_second: Option<f64>,
+    /// What generated it.
+    pub run: Option<RunInfo>,
+}
+
+/// A llama.cpp release: `b` plus a build number, e.g. "b12110". Compares by
+/// build number.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct LlamaCppVersion(pub u32);
+
+impl LlamaCppVersion {
+    pub fn parse(s: &str) -> Option<LlamaCppVersion> {
+        let digits = s.strip_prefix('b')?;
+        if digits.is_empty() || digits.len() > 9 || !digits.bytes().all(|b| b.is_ascii_digit()) {
+            return None;
+        }
+        digits.parse().ok().map(LlamaCppVersion)
+    }
+}
+
+impl std::fmt::Display for LlamaCppVersion {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "b{}", self.0)
+    }
 }
 
 /// The data volume models live on.
@@ -102,18 +240,35 @@ pub enum RuntimeState {
     Absent,
     Downloading,
     Ready,
+    /// It didn't work here (no GPU it can use, or it crashed);
+    /// `RuntimeInfo::error` says why. Not tried again until the client
+    /// restarts or the server selects it.
+    Failed,
 }
 
-/// A runtime (inference engine build) this client can use. Only pinned
-/// builds exist: executables never come from the server.
+/// A runtime (inference engine build) this client has pinned. Only pinned
+/// builds exist: executables never come from the server, which can only
+/// choose among them (`select_runtime`).
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 pub struct RuntimeInfo {
     pub backend: Backend,
     /// The pinned release, e.g. "b12110".
     pub version: String,
-    /// e.g. "cpu". GPU variants come later.
+    /// "cpu", "cuda-12", "cuda-13" or "vulkan".
     pub variant: String,
     pub state: RuntimeState,
+    /// The one models load with.
+    #[serde(default)]
+    pub selected: bool,
+    /// Chosen automatically from the hardware, not by the server.
+    #[serde(default)]
+    pub automatic: bool,
+    /// The GPUs it found (`--list-devices`), once it's been checked.
+    #[serde(default)]
+    pub devices: Vec<String>,
+    /// Why it `failed`.
+    #[serde(default)]
+    pub error: Option<String>,
 }
 
 /// Everything about models on one client: `model_inventory`. Sent after
@@ -147,6 +302,10 @@ pub struct ModelSpec {
     pub context_length: Option<u32>,
     #[serde(default)]
     pub meta: ModelMeta,
+    /// The oldest llama.cpp release that can run it (e.g. "b12110"). A
+    /// client with an older one refuses the pull.
+    #[serde(default)]
+    pub min_runtime_version: Option<String>,
 }
 
 /// What a `model_command` asks for.
@@ -161,6 +320,14 @@ pub enum ModelCommandKind {
     /// Stop another command (a pull). A cancelled pull keeps its partial
     /// file, so pulling again resumes.
     Cancel { target_command_id: String },
+    /// Use this llama.cpp variant from now on ("auto" restores the
+    /// automatic choice). Must be a variant this client has pinned;
+    /// anything else fails. Unloads the current model if the variant
+    /// changes, and installs the variant if it isn't yet.
+    SelectRuntime { variant: String },
+    /// Settings for one installed model, stored in its manifest and applied
+    /// the next time it loads (unloading it now if it's loaded).
+    Configure { model_id: String, settings: ModelSettings },
     /// Any kind this client doesn't know (a newer server). Answered
     /// `unsupported`.
     #[serde(other)]
@@ -234,6 +401,13 @@ pub struct InferenceSettings {
     pub disk_reserve_mb: u64,
     /// Offer the built-in `echo` test model. Off unless the server turns it on.
     pub echo_model_enabled: bool,
+    /// VRAM llama.cpp leaves free when it fits a model on the GPU.
+    #[serde(default = "default_gpu_fit_margin_mib")]
+    pub gpu_fit_margin_mib: u64,
+}
+
+fn default_gpu_fit_margin_mib() -> u64 {
+    1_024
 }
 
 /// Progress reports can't come faster than this.
@@ -255,6 +429,7 @@ impl Default for InferenceSettings {
             threads: 0,
             disk_reserve_mb: 2_048,
             echo_model_enabled: false,
+            gpu_fit_margin_mib: default_gpu_fit_margin_mib(),
         }
     }
 }
@@ -269,6 +444,7 @@ impl InferenceSettings {
             max_tokens: self.max_tokens.max(1),
             default_context: self.default_context.max(MIN_CONTEXT),
             threads: self.threads.min(1_024),
+            gpu_fit_margin_mib: self.gpu_fit_margin_mib.min(1 << 20),
             ..self
         }
     }
@@ -319,5 +495,46 @@ mod tests {
         assert_eq!(s.default_context, MIN_CONTEXT);
         assert_eq!(s.threads, 1_024);
         assert_eq!(InferenceSettings::default().sanitized(), InferenceSettings::default());
+    }
+
+    #[test]
+    fn llama_cpp_versions_parse_and_compare_by_build_number() {
+        let v = |s| LlamaCppVersion::parse(s);
+        assert_eq!(v("b12110"), Some(LlamaCppVersion(12110)));
+        assert!(v("b999").unwrap() < v("b12110").unwrap(), "numeric, not textual");
+        assert_eq!(v("b12110").unwrap().to_string(), "b12110");
+        for bad in ["", "b", "12110", "B12110", "b12x", "b-1", "b1234567890", "b 1"] {
+            assert_eq!(v(bad), None, "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn gpu_layers_and_settings_have_their_wire_forms() {
+        for (layers, wire) in [
+            (GpuLayers::Auto, "\"auto\""),
+            (GpuLayers::Off, "\"off\""),
+            (GpuLayers::All, "\"all\""),
+            (GpuLayers::Count(20), "20"),
+        ] {
+            assert_eq!(serde_json::to_string(&layers).unwrap(), wire);
+            assert_eq!(serde_json::from_str::<GpuLayers>(wire).unwrap(), layers);
+        }
+        assert!(serde_json::from_str::<GpuLayers>("\"most\"").is_err());
+        assert!(serde_json::from_str::<GpuLayers>("-1").is_err());
+        let s: ModelSettings = serde_json::from_str("{}").unwrap();
+        assert_eq!(s, ModelSettings::default());
+        assert!(ModelSettings {
+            context_length: Some(10),
+            ..ModelSettings::default()
+        }
+        .problem()
+        .is_some());
+        assert!(ModelSettings {
+            gpu_layers: GpuLayers::Count(MAX_GPU_LAYERS + 1),
+            ..ModelSettings::default()
+        }
+        .problem()
+        .is_some());
+        assert_eq!(ModelSettings::default().problem(), None);
     }
 }

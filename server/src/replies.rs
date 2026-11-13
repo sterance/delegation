@@ -53,7 +53,8 @@ pub enum ChatEvent {
     /// Alive without text yet (e.g. loading its model). Resets the idle timeout.
     Progress(Stage),
     Chunk(String),
-    Done,
+    /// With the client's token counts and speed, if it sent them.
+    Done(Option<protocol::Usage>),
     Error(String),
 }
 
@@ -68,6 +69,8 @@ pub enum ReplyEvent {
     End {
         status: MessageStatus,
         error: Option<String>,
+        /// What `meta_json` now holds (usage, history trimming).
+        meta: Option<serde_json::Value>,
     },
 }
 
@@ -140,6 +143,9 @@ struct Hub {
     client_id: Option<String>,
     client_label: Option<String>,
     model: Option<String>,
+    /// This attempt's `meta_json` so far (history trimming); the usage is
+    /// added when it's done.
+    meta: Option<serde_json::Value>,
     /// Always an active status: what listeners see until the ending commits.
     status: MessageStatus,
     stage: Option<Stage>,
@@ -211,6 +217,8 @@ enum Write {
         status: MessageStatus,
         content: String,
         error: Option<String>,
+        /// Replaces `meta_json` when set.
+        meta: Option<String>,
     },
 }
 
@@ -334,6 +342,7 @@ impl ReplyRunner {
                     client_id: None,
                     client_label: None,
                     model: None,
+                    meta: None,
                     status: MessageStatus::Queued,
                     stage: None,
                     ending: None,
@@ -373,7 +382,8 @@ impl ReplyRunner {
             }
             None => (history, 0),
         };
-        let meta = (dropped > 0).then(|| serde_json::json!({ "history_turns_dropped": dropped }).to_string());
+        let meta_value = (dropped > 0).then(|| serde_json::json!({ "history_turns_dropped": dropped }));
+        let meta = meta_value.as_ref().map(|v| v.to_string());
 
         let attempt_id = Uuid::new_v4().to_string();
         let turns = history.len();
@@ -394,6 +404,7 @@ impl ReplyRunner {
         hub.client_id = Some(client_id.clone());
         hub.client_label = Some(label.clone());
         hub.model = Some(model.clone());
+        hub.meta = meta_value;
         hub.last_activity = Instant::now();
         let _ = hub.events.send(ReplyEvent::Status(hub.snapshot(message_id)));
         by_attempt.insert(attempt_id.clone(), message_id.to_string());
@@ -679,7 +690,12 @@ impl ReplyRunner {
                     None
                 }
             }
-            ChatEvent::Done => Some((MessageStatus::Completed, None)),
+            ChatEvent::Done(usage) => {
+                if let Some(usage) = usage {
+                    record_usage(hub, &usage);
+                }
+                Some((MessageStatus::Completed, None))
+            }
             ChatEvent::Error(error) => Some((MessageStatus::Failed, Some(error))),
         };
         if let Some((status, error)) = ending {
@@ -737,6 +753,7 @@ impl ReplyRunner {
             status,
             content: hub.text.clone(),
             error,
+            meta: hub.meta.as_ref().map(|m| m.to_string()),
         });
         true
     }
@@ -748,7 +765,11 @@ impl ReplyRunner {
             if inner.hubs.get(id).is_some_and(|h| h.ending.is_some()) {
                 let hub = inner.hubs.remove(id).expect("checked above");
                 if let Some((status, error)) = hub.ending {
-                    let _ = hub.events.send(ReplyEvent::End { status, error });
+                    let _ = hub.events.send(ReplyEvent::End {
+                        status,
+                        error,
+                        meta: hub.meta,
+                    });
                 }
                 for ack in hub.acks {
                     let _ = ack.send(());
@@ -899,14 +920,16 @@ fn apply(conn: &mut Connection, batch: Vec<Write>) -> Result<()> {
                 status,
                 content,
                 error,
+                meta,
             } => {
                 let now = now_ts();
                 tx.execute(
                     &format!(
-                        "UPDATE messages SET status = ?2, content = ?3, error = ?4, completed_at = ?5
+                        "UPDATE messages SET status = ?2, content = ?3, error = ?4, completed_at = ?5,
+                           meta_json = COALESCE(?7, meta_json)
                          WHERE id = ?1 AND status IN ({active}) AND (?6 IS NULL OR attempt_id = ?6)"
                     ),
-                    (message_id, status, content, error, &now, attempt_id),
+                    (message_id, status, content, error, &now, attempt_id, meta),
                 )
                 .and_then(|n| {
                     tx.execute(
@@ -925,11 +948,22 @@ fn apply(conn: &mut Connection, batch: Vec<Write>) -> Result<()> {
     Ok(())
 }
 
+/// Adds a finished reply's usage to its `meta_json`:
+/// `"usage": { prompt_tokens, completion_tokens, tokens_per_second, … }`,
+/// with the runtime variant and GPU layers that produced it. The first
+/// piece of usage metering, and real CPU-versus-GPU numbers.
+fn record_usage(hub: &mut Hub, usage: &protocol::Usage) {
+    let meta = hub.meta.get_or_insert_with(|| serde_json::json!({}));
+    if let (Some(map), Ok(value)) = (meta.as_object_mut(), serde_json::to_value(usage)) {
+        map.insert("usage".into(), value);
+    }
+}
+
 fn kind(event: &ChatEvent) -> &'static str {
     match event {
         ChatEvent::Progress(_) => "progress",
         ChatEvent::Chunk(_) => "chunk",
-        ChatEvent::Done => "done",
+        ChatEvent::Done(_) => "done",
         ChatEvent::Error(_) => "error",
     }
 }
@@ -966,6 +1000,8 @@ mod tests {
             context_length,
             meta: Default::default(),
             error: None,
+            settings: Default::default(),
+            run: None,
         }
     }
 
@@ -1075,7 +1111,7 @@ mod tests {
     async fn wait_for_end(rx: &mut broadcast::Receiver<ReplyEvent>) -> (MessageStatus, Option<String>) {
         loop {
             match tokio::time::timeout(Duration::from_secs(2), rx.recv()).await {
-                Ok(Ok(ReplyEvent::End { status, error })) => return (status, error),
+                Ok(Ok(ReplyEvent::End { status, error, .. })) => return (status, error),
                 Ok(Ok(_)) => continue,
                 other => panic!("expected End, got {other:?}"),
             }
@@ -1141,13 +1177,51 @@ mod tests {
         assert_eq!(db_state(&f, &id).await, (MessageStatus::Running, "hello".into()));
 
         assert_eq!(f.runner.active_jobs().get("c1"), Some(&1));
-        f.runner.on_client_event(f.conn.id, &attempt, ChatEvent::Done);
+        f.runner.on_client_event(f.conn.id, &attempt, ChatEvent::Done(None));
         assert!(f.runner.active_jobs().is_empty(), "idle as soon as it ends");
         assert_eq!(wait_for_end(&mut rx).await, (MessageStatus::Completed, None));
         // Announced only after the commit.
         assert_eq!(db_state(&f, &id).await, (MessageStatus::Completed, "hello".into()));
         assert!(f.runner.attach(&id).is_none(), "the hub is gone");
         assert_eq!(f.runner.hub_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn usage_from_chat_done_is_stored_in_meta_json() {
+        let mut f = fixture();
+        let id = queued_reply(&f, "conv");
+        f.runner.start(&id, &target()).await.unwrap();
+        let attempt = sent_attempt(&mut f.conn).await;
+        let (_, mut rx) = f.runner.attach(&id).unwrap();
+        f.runner
+            .on_client_event(f.conn.id, &attempt, ChatEvent::Chunk("hi".into()));
+        let usage = protocol::Usage {
+            prompt_tokens: 12,
+            completion_tokens: 1,
+            tokens_per_second: Some(42.5),
+            prompt_tokens_per_second: None,
+            run: Some(protocol::RunInfo {
+                variant: "cuda-13".into(),
+                gpu_layers: Some(protocol::GpuOffload {
+                    offloaded: 29,
+                    total: 29,
+                }),
+                device: Some("NVIDIA GeForce RTX 3070".into()),
+            }),
+        };
+        f.runner
+            .on_client_event(f.conn.id, &attempt, ChatEvent::Done(Some(usage)));
+        assert_eq!(wait_for_end(&mut rx).await, (MessageStatus::Completed, None));
+        let rid = id.clone();
+        let meta: Option<String> =
+            f.db.call(move |c| Ok(c.query_row("SELECT meta_json FROM messages WHERE id = ?1", [&rid], |r| r.get(0))?))
+                .await
+                .unwrap();
+        let meta: serde_json::Value = serde_json::from_str(&meta.unwrap()).unwrap();
+        assert_eq!(meta["usage"]["tokens_per_second"], 42.5);
+        assert_eq!(meta["usage"]["completion_tokens"], 1);
+        assert_eq!(meta["usage"]["run"]["variant"], "cuda-13");
+        assert_eq!(meta["usage"]["run"]["gpu_layers"]["offloaded"], 29);
     }
 
     #[tokio::test]
@@ -1162,7 +1236,7 @@ mod tests {
             .on_client_event(f.conn.id + 1, &attempt, ChatEvent::Chunk("injected".into()));
         f.runner
             .on_client_event(f.conn.id, "some-old-attempt", ChatEvent::Chunk("stale".into()));
-        f.runner.on_client_event(f.conn.id + 1, &attempt, ChatEvent::Done);
+        f.runner.on_client_event(f.conn.id + 1, &attempt, ChatEvent::Done(None));
         assert!(rx.try_recv().is_err(), "nothing reached the hub");
 
         // The connection drops: orphaned with what it had.
@@ -1186,7 +1260,7 @@ mod tests {
             .on_client_event(f.conn.id, &attempt, ChatEvent::Chunk("late".into()));
         f.runner
             .on_client_event(f.conn.id, &second, ChatEvent::Chunk("fresh".into()));
-        f.runner.on_client_event(f.conn.id, &second, ChatEvent::Done);
+        f.runner.on_client_event(f.conn.id, &second, ChatEvent::Done(None));
         assert_eq!(wait_for_end(&mut rx).await.0, MessageStatus::Completed);
         assert_eq!(db_state(&f, &id).await, (MessageStatus::Completed, "fresh".into()));
         let id2 = id.clone();

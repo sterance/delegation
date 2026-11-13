@@ -157,6 +157,26 @@ function waitingText(message: ChatMessage): string {
   return `Waiting for ${message.client_label ?? 'the client'}…`
 }
 
+/** "51.2 tokens/s", and the details for a tooltip, where the client reported them. */
+function speedText(message: ChatMessage): { short: string; detail: string } | null {
+  const usage = message.meta?.usage
+  if (!usage || usage.tokens_per_second === null || usage.tokens_per_second === undefined) return null
+  const run = usage.run
+  const where = !run
+    ? null
+    : run.device && run.gpu_layers
+      ? `${run.gpu_layers.offloaded}/${run.gpu_layers.total} layers on ${run.device} (${run.variant})`
+      : `CPU only (${run.variant})`
+  const prompt =
+    usage.prompt_tokens_per_second !== null && usage.prompt_tokens_per_second !== undefined
+      ? `, prompt ${usage.prompt_tokens_per_second.toFixed(0)} tokens/s`
+      : ''
+  return {
+    short: `${usage.tokens_per_second.toFixed(1)} tokens/s`,
+    detail: `${usage.completion_tokens} tokens generated, ${usage.prompt_tokens} in the prompt${prompt}${where ? `. ${where}` : ''}`,
+  }
+}
+
 function AssistantMessage({ step, actions }: { step: BranchStep; actions: MessageActions }) {
   const { message } = step
   const [menu, setMenu] = useState<{ anchor: HTMLElement; kind: 'retry' | 'regenerate' } | null>(null)
@@ -167,6 +187,7 @@ function AssistantMessage({ step, actions }: { step: BranchStep; actions: Messag
     actions.models.find((o) => o.target.client_id === message.client_id && o.target.model === message.model)?.label ??
     message.model
   const answeredBy = [modelName, message.client_label].filter(Boolean).join(' · ')
+  const speed = speedText(message)
   const openMenu = (anchor: HTMLElement, kind: 'retry' | 'regenerate') => {
     actions.onOpenModels()
     setMenu({ anchor, kind })
@@ -233,6 +254,14 @@ function AssistantMessage({ step, actions }: { step: BranchStep; actions: Messag
             {answeredBy}
             {message.attempts > 1 ? ` · attempt ${message.attempts}` : ''}
           </Typography>
+        )}
+        {speed && (
+          <Tooltip title={speed.detail}>
+            <Typography variant="caption" color="text.secondary" sx={{ ml: 0.5 }}>
+              {answeredBy ? '· ' : ''}
+              {speed.short}
+            </Typography>
+          </Tooltip>
         )}
       </Stack>
 

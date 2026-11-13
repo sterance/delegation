@@ -115,7 +115,7 @@ pub async fn respond(
         }
     }
     let last = match result {
-        Ok(()) => ClientMessage::ChatDone { request_id },
+        Ok(usage) => ClientMessage::ChatDone { request_id, usage },
         Err(error) => {
             debug!(target: "chat", "{request_id} failed: {error}");
             ClientMessage::ChatError {
@@ -172,7 +172,7 @@ mod tests {
             ClientMessage::ChatProgress { request_id, stage: Stage::Generating } if request_id == "r"
         ));
         let (last, chunks) = got[1..].split_last().unwrap();
-        assert!(matches!(last, ClientMessage::ChatDone { request_id } if request_id == "r"));
+        assert!(matches!(last, ClientMessage::ChatDone { request_id, usage: None } if request_id == "r"));
         let text: String = chunks
             .iter()
             .map(|m| match m {

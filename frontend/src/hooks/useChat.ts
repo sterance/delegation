@@ -135,7 +135,14 @@ function applyEvent(m: ChatMessage, event: ReplyEvent): ChatMessage {
     case 'chunk':
       return { ...m, content: m.content + event.delta }
     case 'end':
-      return { ...m, status: event.status, error: event.error, stage: null, completed_at: new Date().toISOString() }
+      return {
+        ...m,
+        status: event.status,
+        error: event.error,
+        stage: null,
+        completed_at: new Date().toISOString(),
+        meta: event.meta ?? m.meta,
+      }
     case 'created':
       return m
   }

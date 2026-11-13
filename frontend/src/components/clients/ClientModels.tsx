@@ -9,27 +9,35 @@ import ListItemText from '@mui/material/ListItemText'
 import Menu from '@mui/material/Menu'
 import MenuItem from '@mui/material/MenuItem'
 import Stack from '@mui/material/Stack'
+import TextField from '@mui/material/TextField'
 import Tooltip from '@mui/material/Tooltip'
 import Typography from '@mui/material/Typography'
 import { useCallback, useEffect, useState } from 'react'
 import {
   cancelModelCommand,
+  configureModel,
   deleteModel,
   errorMessage,
   getClientModels,
   installModel,
   isCommandActive,
   listCatalog,
+  runtimeTooOld,
+  selectRuntime,
   type CatalogEntry,
   type ClientModels as Detail,
   type DashboardConfig,
+  type GpuLayers,
   type LocalModel,
   type ModelCommand,
+  type ModelSettings,
   type Progress,
+  type RuntimeInfo,
 } from '../../api'
-import type { ModelState } from '../../types/chat'
+import type { ModelState, RunInfo } from '../../types/chat'
 import { formatBytes } from '../../utils/format'
 import ConfirmationModal from '../common/ConfirmationModal'
+import TextPromptModal from '../common/TextPromptModal'
 
 const STATE_LABEL: Record<ModelState, string> = {
   loaded: 'Loaded',
@@ -43,7 +51,51 @@ const RUNTIME_LABEL = {
   ready: 'ready',
   downloading: 'downloading…',
   absent: 'downloaded with the first model',
+  failed: "doesn't work here",
 } as const
+
+const VARIANT_LABEL: Record<string, string> = {
+  cpu: 'CPU',
+  'cuda-12': 'CUDA 12',
+  'cuda-13': 'CUDA 13',
+  vulkan: 'Vulkan',
+}
+
+function variantLabel(variant: string): string {
+  return VARIANT_LABEL[variant] ?? variant
+}
+
+/** "29/29 layers on NVIDIA GeForce RTX 3070", or "CPU only". */
+function offloadText(run: RunInfo): string {
+  if (run.gpu_layers && run.device) {
+    return `${run.gpu_layers.offloaded}/${run.gpu_layers.total} layers on ${run.device}`
+  }
+  if (run.gpu_layers && run.gpu_layers.offloaded > 0) {
+    return `${run.gpu_layers.offloaded}/${run.gpu_layers.total} layers on the GPU`
+  }
+  return 'CPU only'
+}
+
+function gpuLayersLabel(layers: GpuLayers): string {
+  if (layers === 'auto') return 'GPU: auto'
+  if (layers === 'off') return 'GPU: off'
+  if (layers === 'all') return 'GPU: all layers'
+  return `GPU: ${layers} layers`
+}
+
+/** What a failed or unsupported command was trying to do, for its alert. */
+function failureText(c: ModelCommand): string {
+  const what =
+    c.kind === 'delete'
+      ? `Deleting ${c.model_name}`
+      : c.kind === 'select_runtime'
+        ? `Choosing ${c.model_name}`
+        : c.kind === 'configure'
+          ? `Changing ${c.model_name}'s settings`
+          : `Installing ${c.model_name}`
+  if (c.state === 'unsupported') return `${what}: this client is too old for that; update it first.`
+  return `${what}: ${c.error ?? 'failed'}`
+}
 
 /** A row: a model on the client, or one a pull is starting to fetch. */
 interface Row {
@@ -55,6 +107,9 @@ interface Row {
   builtIn: boolean
   /** The running pull for it, if any. */
   pull: ModelCommand | null
+  /** Missing from older clients. */
+  settings: ModelSettings | null
+  run: RunInfo | null
 }
 
 function rows(detail: Detail): Row[] {
@@ -68,6 +123,8 @@ function rows(detail: Detail): Row[] {
     error: m.error,
     builtIn: m.backend === 'echo',
     pull: pullFor(m.id),
+    settings: m.settings ?? null,
+    run: m.run ?? null,
   }))
   // Sent, but not in the client's inventory yet.
   for (const p of pulls) {
@@ -80,6 +137,8 @@ function rows(detail: Detail): Row[] {
         error: null,
         builtIn: false,
         pull: p,
+        settings: null,
+        run: null,
       })
     }
   }
@@ -112,6 +171,8 @@ export default function ClientModels({ clientId, clientName, config }: Props) {
   const [toDelete, setToDelete] = useState<Row | null>(null)
   const [deleteOpen, setDeleteOpen] = useState(false)
   const [dismissed, setDismissed] = useState<string | null>(null)
+  const [layersFor, setLayersFor] = useState<Row | null>(null)
+  const [settingsMenu, setSettingsMenu] = useState<{ anchor: HTMLElement; row: Row } | null>(null)
 
   const refresh = useCallback(async () => {
     try {
@@ -163,7 +224,15 @@ export default function ClientModels({ clientId, clientName, config }: Props) {
 
   const list = rows(detail)
   const installed = new Set(list.filter((r) => r.state !== 'failed').map((r) => r.id))
-  const runtime = detail.runtimes.find((r) => r.backend === 'llama_cpp')
+  const llama = detail.runtimes.filter((r) => r.backend === 'llama_cpp')
+  // Older clients report one runtime and no `selected`.
+  const runtime: RuntimeInfo | undefined = llama.find((r) => r.selected) ?? (llama.length === 1 ? llama[0] : undefined)
+  const multiVariant = llama.some((r) => r.selected !== undefined)
+  const failedRuntimes = llama.filter((r) => r.state === 'failed')
+  const runtimeCommand = detail.commands.find((c) => c.kind === 'select_runtime' && isCommandActive(c.state)) ?? null
+  const selectorValue = runtime?.automatic !== false ? 'auto' : runtime.variant
+  const configure = (row: Row, gpu_layers: GpuLayers) =>
+    act(() => configureModel(clientId, row.id, { context_length: row.settings?.context_length ?? null, gpu_layers }))
   // The newest command, if it failed: why an install didn't happen, e.g. "offline".
   const lastFailure = detail.commands.find((c) => !isCommandActive(c.state))
   const failedRowSaysWhy = (id: string) => list.some((r) => r.id === id && r.state === 'failed' && r.error)
@@ -191,21 +260,24 @@ export default function ClientModels({ clientId, clientName, config }: Props) {
               Install
             </Button>
             <Menu anchorEl={menu} open={menu !== null} onClose={() => setMenu(null)}>
-              {catalog.map((entry) => (
-                <MenuItem
-                  key={entry.id}
-                  disabled={installed.has(entry.id)}
-                  onClick={() => {
-                    setMenu(null)
-                    void act(() => installModel(clientId, entry.id))
-                  }}
-                >
-                  <ListItemText
-                    primary={entry.display_name}
-                    secondary={installed.has(entry.id) ? 'Installed' : formatBytes(entry.size_bytes)}
-                  />
-                </MenuItem>
-              ))}
+              {catalog.map((entry) => {
+                const tooOld = runtimeTooOld(entry, llama)
+                return (
+                  <MenuItem
+                    key={entry.id}
+                    disabled={installed.has(entry.id) || tooOld !== null}
+                    onClick={() => {
+                      setMenu(null)
+                      void act(() => installModel(clientId, entry.id))
+                    }}
+                  >
+                    <ListItemText
+                      primary={entry.display_name}
+                      secondary={installed.has(entry.id) ? 'Installed' : (tooOld ?? formatBytes(entry.size_bytes))}
+                    />
+                  </MenuItem>
+                )
+              })}
             </Menu>
           </>
         )}
@@ -284,6 +356,33 @@ export default function ClientModels({ clientId, clientName, config }: Props) {
               )}
             </Stack>
           )}
+          {!row.builtIn && row.state !== 'downloading' && row.state !== 'failed' && (row.settings || row.run) && (
+            <Stack direction="row" spacing={1} sx={{ alignItems: 'center', flexWrap: 'wrap' }}>
+              {row.state === 'loaded' && row.run && (
+                <Typography variant="caption" color="text.secondary">
+                  {offloadText(row.run)}
+                </Typography>
+              )}
+              {row.settings &&
+                (canManage ? (
+                  <Button
+                    size="small"
+                    color="inherit"
+                    sx={{ py: 0, minWidth: 0, textTransform: 'none', fontSize: '0.75rem', color: 'text.secondary' }}
+                    disabled={!detail.connected}
+                    aria-haspopup="menu"
+                    aria-label={`GPU offload for ${row.name}`}
+                    onClick={(e) => setSettingsMenu({ anchor: e.currentTarget, row })}
+                  >
+                    {gpuLayersLabel(row.settings.gpu_layers)}
+                  </Button>
+                ) : (
+                  <Typography variant="caption" color="text.secondary">
+                    {gpuLayersLabel(row.settings.gpu_layers)}
+                  </Typography>
+                ))}
+            </Stack>
+          )}
           {row.state === 'failed' && row.error && (
             <Typography variant="caption" color="error" component="div" sx={{ whiteSpace: 'pre-wrap' }}>
               {row.error}
@@ -300,8 +399,7 @@ export default function ClientModels({ clientId, clientName, config }: Props) {
             if (showFailure) setDismissed(showFailure.command_id)
           }}
         >
-          {actionError ??
-            `${showFailure?.kind === 'delete' ? 'Deleting' : 'Installing'} ${showFailure?.model_name}: ${showFailure?.error ?? 'failed'}`}
+          {actionError ?? (showFailure ? failureText(showFailure) : '')}
         </Alert>
       )}
 
@@ -311,10 +409,110 @@ export default function ClientModels({ clientId, clientName, config }: Props) {
         </Typography>
       )}
       {runtime && (
-        <Typography variant="caption" color="text.secondary">
-          llama.cpp {runtime.version} ({runtime.variant}): {RUNTIME_LABEL[runtime.state]}
-        </Typography>
+        <Stack direction="row" spacing={1} sx={{ alignItems: 'center', flexWrap: 'wrap' }}>
+          <Typography variant="caption" color="text.secondary" sx={{ flex: 1, minWidth: 0 }}>
+            llama.cpp {runtime.version} ({variantLabel(runtime.variant)}
+            {multiVariant && runtime.automatic ? ', automatic' : ''}): {RUNTIME_LABEL[runtime.state]}
+            {runtime.devices && runtime.devices.length > 0 ? ` · ${runtime.devices.join(', ')}` : ''}
+          </Typography>
+          {canManage && multiVariant && (
+            <TextField
+              select
+              size="small"
+              variant="standard"
+              value={selectorValue}
+              disabled={!detail.connected || runtimeCommand !== null}
+              onChange={(e) => void act(() => selectRuntime(clientId, e.target.value))}
+              slotProps={{ htmlInput: { 'aria-label': 'llama.cpp build' } }}
+              sx={{ minWidth: '7rem', '& .MuiInputBase-input': { fontSize: '0.75rem' } }}
+            >
+              <MenuItem value="auto">Auto</MenuItem>
+              {llama.map((r) => (
+                <MenuItem key={r.variant} value={r.variant}>
+                  {variantLabel(r.variant)}
+                  {r.state === 'failed' ? ' (failed)' : ''}
+                </MenuItem>
+              ))}
+            </TextField>
+          )}
+        </Stack>
       )}
+      {runtimeCommand && (
+        <Box>
+          <LinearProgress
+            variant={percent(runtimeCommand.progress) === undefined ? 'indeterminate' : 'determinate'}
+            value={percent(runtimeCommand.progress)}
+            aria-label={`Switching to ${runtimeCommand.model_name}`}
+          />
+          <Typography variant="caption" color="text.secondary">
+            {runtimeCommand.model_name}:{' '}
+            {runtimeCommand.progress
+              ? `${formatBytes(runtimeCommand.progress.done_bytes)} of ${formatBytes(runtimeCommand.progress.total_bytes)}`
+              : 'checking…'}
+          </Typography>
+        </Box>
+      )}
+      {failedRuntimes.map((r) => (
+        <Typography
+          key={r.variant}
+          variant="caption"
+          color="text.secondary"
+          component="div"
+          title={r.error ?? undefined}
+          sx={{ overflowWrap: 'anywhere' }}
+        >
+          {variantLabel(r.variant)} didn&apos;t work here: {(r.error ?? 'unknown reason').split('\n')[0]}
+        </Typography>
+      ))}
+
+      <Menu anchorEl={settingsMenu?.anchor ?? null} open={settingsMenu !== null} onClose={() => setSettingsMenu(null)}>
+        {(
+          [
+            ['auto', 'Auto (fit in free VRAM)'],
+            ['all', 'All layers on the GPU'],
+            ['off', 'CPU only'],
+          ] as const
+        ).map(([value, label]) => (
+          <MenuItem
+            key={value}
+            selected={settingsMenu?.row.settings?.gpu_layers === value}
+            onClick={() => {
+              const row = settingsMenu?.row
+              setSettingsMenu(null)
+              if (row) void configure(row, value)
+            }}
+          >
+            {label}
+          </MenuItem>
+        ))}
+        <MenuItem
+          selected={typeof settingsMenu?.row.settings?.gpu_layers === 'number'}
+          onClick={() => {
+            setLayersFor(settingsMenu?.row ?? null)
+            setSettingsMenu(null)
+          }}
+        >
+          A number of layers…
+        </MenuItem>
+      </Menu>
+      <TextPromptModal
+        open={layersFor !== null}
+        title={`GPU layers for ${layersFor?.name ?? 'the model'}`}
+        label="Layers on the GPU (0 to 10000)"
+        initialValue={typeof layersFor?.settings?.gpu_layers === 'number' ? String(layersFor.settings.gpu_layers) : ''}
+        maxLength={5}
+        onConfirm={async (value) => {
+          const n = Number(value.trim())
+          if (!Number.isInteger(n) || n < 0 || n > 10000) throw new Error('Enter a whole number from 0 to 10000.')
+          if (!layersFor) return
+          await configureModel(clientId, layersFor.id, {
+            context_length: layersFor.settings?.context_length ?? null,
+            gpu_layers: n,
+          })
+          await refresh()
+        }}
+        onClose={() => setLayersFor(null)}
+      />
 
       <ConfirmationModal
         open={deleteOpen}

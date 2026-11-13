@@ -186,6 +186,15 @@ impl TestApp {
         .await
     }
 
+    async fn put(&self, path: &str, cookie: &str, body: Value) -> Resp {
+        self.send(Call {
+            cookie: Some(cookie),
+            body: Some(body),
+            ..self.call(Method::PUT, path)
+        })
+        .await
+    }
+
     async fn delete(&self, path: &str, cookie: &str) -> Resp {
         self.send(Call {
             cookie: Some(cookie),
@@ -288,6 +297,8 @@ fn model(id: &str, backend: Backend, state: ModelState) -> LocalModel {
         context_length: None,
         meta: Default::default(),
         error: None,
+        settings: Default::default(),
+        run: None,
     }
 }
 
@@ -318,7 +329,9 @@ fn echo(app: &TestApp, conn: &ConnHandle, attempt: &str, messages: &[ChatTurn]) 
             .replies
             .on_client_event(conn.id, attempt, ChatEvent::Chunk(piece.to_string()));
     }
-    app.state.replies.on_client_event(conn.id, attempt, ChatEvent::Done);
+    app.state
+        .replies
+        .on_client_event(conn.id, attempt, ChatEvent::Done(None));
 }
 
 /// Parses a whole SSE body into (event, data) pairs.
@@ -2041,4 +2054,185 @@ async fn loading_progress_reaches_the_reply_stream() {
         .collect();
     assert_eq!(stages, vec![&json!("loading_model"), &json!("generating")]);
     assert_eq!(streamed_text(&events), "hello");
+}
+
+#[tokio::test]
+async fn the_runtime_and_model_settings_are_set_through_commands() {
+    let app = test_app(&[]).await;
+    app.setup_admin().await;
+    let alice = app.signup("alice").await;
+    let bob = app.signup("bob").await;
+    let a1 = app.enroll(&alice, "alice-pc").await;
+    let mut conn = app.connect_with(&a1, vec![model("qwen", Backend::LlamaCpp, ModelState::Loaded)]);
+
+    let r = app
+        .post(
+            &format!("/api/clients/{a1}/runtime"),
+            Some(&alice),
+            json!({ "variant": "cuda-13" }),
+        )
+        .await;
+    assert_eq!(r.status, StatusCode::ACCEPTED, "{:?}", r.json);
+    assert_eq!(r.json["kind"], "select_runtime");
+    let (_, command) = next_command(&mut conn).await;
+    assert_eq!(
+        command,
+        ModelCommandKind::SelectRuntime {
+            variant: "cuda-13".into()
+        }
+    );
+    for bad in [
+        json!({ "variant": "../x" }),
+        json!({ "variant": "" }),
+        json!({ "variant": "CUDA" }),
+    ] {
+        let r = app.post(&format!("/api/clients/{a1}/runtime"), Some(&alice), bad).await;
+        assert_eq!(r.status, StatusCode::BAD_REQUEST);
+    }
+
+    let r = app
+        .put(
+            &format!("/api/clients/{a1}/models/qwen/settings"),
+            &alice,
+            json!({ "gpu_layers": 20, "context_length": null }),
+        )
+        .await;
+    assert_eq!(r.status, StatusCode::ACCEPTED, "{:?}", r.json);
+    assert_eq!(
+        (&r.json["kind"], &r.json["model_name"]),
+        (&json!("configure"), &json!("qwen model"))
+    );
+    let (_, command) = next_command(&mut conn).await;
+    assert_eq!(
+        command,
+        ModelCommandKind::Configure {
+            model_id: "qwen".into(),
+            settings: protocol::ModelSettings {
+                gpu_layers: protocol::GpuLayers::Count(20),
+                context_length: None,
+            },
+        }
+    );
+    for bad in [
+        json!({ "gpu_layers": "lots" }),
+        json!({ "gpu_layers": "auto", "context_length": 5 }),
+        json!({ "gpu_layers": "auto", "url": "x" }),
+    ] {
+        let r = app
+            .put(&format!("/api/clients/{a1}/models/qwen/settings"), &alice, bad.clone())
+            .await;
+        assert!(r.status.is_client_error(), "{bad}: {:?}", r.status);
+    }
+    assert!(conn.outbound.try_recv().is_err());
+
+    // Only for those who can manage the client.
+    let r = app
+        .post(
+            &format!("/api/clients/{a1}/runtime"),
+            Some(&bob),
+            json!({ "variant": "auto" }),
+        )
+        .await;
+    assert_eq!(r.status, StatusCode::NOT_FOUND);
+    let r = app
+        .put(
+            &format!("/api/clients/{a1}/models/qwen/settings"),
+            &bob,
+            json!({ "gpu_layers": "off" }),
+        )
+        .await;
+    assert_eq!(r.status, StatusCode::NOT_FOUND);
+    assert!(conn.outbound.try_recv().is_err());
+
+    // An older client answers `unsupported`; the command shows that.
+    let r = app
+        .post(
+            &format!("/api/clients/{a1}/runtime"),
+            Some(&alice),
+            json!({ "variant": "auto" }),
+        )
+        .await;
+    let (command_id, _) = next_command(&mut conn).await;
+    assert_eq!(r.json["command_id"], command_id);
+    app.state.model_commands.on_status(
+        conn.id,
+        &command_id,
+        CommandState::Unsupported,
+        None,
+        Some("this client doesn't support that command".into()),
+    );
+    let detail = app.get(&format!("/api/clients/{a1}/models"), &alice).await.json;
+    assert_eq!(detail["commands"][0]["state"], "unsupported");
+}
+
+#[tokio::test]
+async fn models_needing_a_newer_runtime_are_not_installed_on_older_clients() {
+    let dir = std::env::temp_dir().join(format!("delegation-catalog-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("catalog.json");
+    std::fs::write(
+        &path,
+        json!([{
+            "id": "future-model",
+            "name": "Future model",
+            "url": "https://example.com/future.gguf",
+            "sha256": "ab".repeat(32),
+            "size_bytes": 10,
+            "context": 8192,
+            "min_runtime_version": "b99999"
+        }])
+        .to_string(),
+    )
+    .unwrap();
+    let app = test_app(&[("MODEL_CATALOG_PATH", path.to_str().unwrap())]).await;
+    let _ = std::fs::remove_dir_all(&dir);
+    app.setup_admin().await;
+    let alice = app.signup("alice").await;
+    let a1 = app.enroll(&alice, "alice-pc").await;
+    let mut conn = app.connect(&a1);
+    let catalog = app.get("/api/models/catalog", &alice).await.json;
+    assert_eq!(catalog[1]["id"], "future-model");
+    assert_eq!(catalog[1]["min_runtime_version"], "b99999");
+
+    app.state.live.set_inventory(
+        &a1,
+        conn.id,
+        Inventory {
+            models: vec![],
+            storage: Storage::default(),
+            runtimes: vec![protocol::RuntimeInfo {
+                backend: Backend::LlamaCpp,
+                version: "b12110".into(),
+                variant: "cpu".into(),
+                state: protocol::RuntimeState::Ready,
+                selected: true,
+                automatic: true,
+                devices: vec![],
+                error: None,
+            }],
+        },
+    );
+    let r = app
+        .post(
+            &format!("/api/clients/{a1}/models"),
+            Some(&alice),
+            json!({ "catalog_id": "future-model" }),
+        )
+        .await;
+    assert_eq!(r.status, StatusCode::CONFLICT);
+    assert!(
+        r.json["error"].as_str().unwrap().contains("needs llama.cpp b99999"),
+        "{:?}",
+        r.json
+    );
+    assert!(conn.outbound.try_recv().is_err(), "nothing was sent");
+    // The test model has no minimum.
+    let r = app
+        .post(
+            &format!("/api/clients/{a1}/models"),
+            Some(&alice),
+            json!({ "catalog_id": TEST_MODEL }),
+        )
+        .await;
+    assert_eq!(r.status, StatusCode::ACCEPTED);
 }

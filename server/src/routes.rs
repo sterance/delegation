@@ -65,6 +65,10 @@ impl ApiRoutes {
         self.add("POST", path, routing::post(handler))
     }
 
+    fn put<H: Handler<T, AppState>, T: 'static>(self, path: &'static str, handler: H) -> Self {
+        self.add("PUT", path, routing::put(handler))
+    }
+
     fn patch<H: Handler<T, AppState>, T: 'static>(self, path: &'static str, handler: H) -> Self {
         self.add("PATCH", path, routing::patch(handler))
     }
@@ -105,6 +109,8 @@ pub fn api_routes() -> ApiRoutes {
         .get("/clients/:client_id/models", models::client_models)
         .post("/clients/:client_id/models", models::install)
         .delete("/clients/:client_id/models/:model_id", models::delete_model)
+        .put("/clients/:client_id/models/:model_id/settings", models::configure_model)
+        .post("/clients/:client_id/runtime", models::select_runtime)
         .post(
             "/clients/:client_id/model-commands/:command_id/cancel",
             models::cancel_command,

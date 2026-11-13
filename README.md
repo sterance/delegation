@@ -31,15 +31,28 @@ the client, through the server, to the browser.
 **Models**
 - A client card's *Models* section installs, cancels and deletes models.
   It shows download progress, disk use and the llama.cpp runtime's state.
-- Models come from a server-side catalog. For now it has one test model,
-  Qwen2.5 0.5B Instruct (Q4_K_M), set in `config.env`. Browsers only ever
-  send a catalog id: the URL and SHA-256 never come from the browser.
+- Models come from a server-side catalog: one test model, Qwen2.5 0.5B
+  Instruct (Q4_K_M), set in `config.env`, plus any in the JSON file at
+  `MODEL_CATALOG_PATH`. Browsers only ever send a catalog id: the URL and
+  SHA-256 never come from the browser. An entry can name the oldest
+  llama.cpp that runs it; older clients aren't offered it.
 - Clients download over HTTPS only, resume interrupted downloads, and check
   each file's size and SHA-256. A download is refused if it would leave the
   disk without the reserve set in `config.env`.
 - The first install also fetches llama.cpp. The release (currently
-  `b12110`, CPU build) and its hash are pinned in the client's source, so
-  the server can't make a client run a different executable.
+  `b12110`) and the hashes of its CPU, CUDA 12, CUDA 13 and Vulkan builds
+  are pinned in the client (`client/runtime-pins.json`, compiled in), so
+  the server can't make a client run a different executable. It can only
+  choose among those builds.
+- Clients use their GPUs. A client picks a build from its hardware (CUDA
+  for NVIDIA, Vulkan for AMD and discrete Intel, CPU otherwise), checks it
+  actually sees a GPU, and falls back to the next one, ending with CPU, if
+  it doesn't or if it fails to load a model. The card shows which build is
+  in use, its GPUs and any that failed, and lets you choose another.
+- Models go to the GPU as far as the free VRAM allows (llama.cpp's
+  `--fit`), or as set per model on the card (auto, CPU only, all layers or
+  a number). The card shows how many layers ended up on which GPU, and
+  chat shows each reply's speed in tokens per second.
 - The client runs `llama-server` on `127.0.0.1` only, loads models on
   demand, and unloads them after an idle timeout to give the memory back.
 - A built-in *echo* model, off by default, answers with your own message
@@ -60,7 +73,8 @@ Not built yet:
 - lending a client to other users
 - a shared job queue ("any client with this model")
 - picking models automatically
-- GPU inference (the pinned llama.cpp build is CPU-only)
+- ROCm, SYCL and Metal builds (AMD and Intel GPUs use Vulkan)
+- choosing which GPUs a multi-GPU machine uses
 
 ## Layout
 
@@ -123,9 +137,11 @@ cd client
 DELEGATION_SERVER=https://your.server PAIRING_CODE=ABCD1234 docker compose up -d
 ```
 
-Add `-f docker-compose.gpu.yml` (NVIDIA) or `-f docker-compose.amd.yml`
-(AMD/Intel) to report GPUs. Its identity and models live in Docker volumes,
-so they survive `down` and `up`.
+Add `-f docker-compose.gpu.yml` (NVIDIA, needs the NVIDIA Container
+Toolkit) or `-f docker-compose.amd.yml` (AMD/Intel, builds the image with
+the Vulkan loader and Mesa's drivers) to report and use GPUs. Without
+either, models run on the CPU. Its identity and models live in Docker
+volumes, so they survive `down` and `up`.
 
 **Linux, natively:**
 
@@ -134,7 +150,18 @@ cargo run --release -p delegation-client -- --server https://your.server --pairi
 ```
 
 Later runs only need `--server`. Running models natively needs
-glibc 2.34 or newer, `libssl3` and `libgomp1`.
+glibc 2.34 or newer, `libssl3` and `libgomp1`. For GPUs:
+- **NVIDIA:** only the NVIDIA driver. The CUDA runtime and cuBLAS come
+  with the pinned build. Drivers for CUDA 13.4 get the CUDA 13 build
+  (Turing, compute capability 7.5, and newer); drivers for CUDA 12.8 the
+  CUDA 12 build.
+- **AMD and Intel:** the Vulkan loader and a driver, e.g.
+  `sudo apt install libvulkan1 mesa-vulkan-drivers`.
+
+Without them the client says the GPU build found no GPU and uses the CPU.
+
+**Windows:** the GPU driver provides Vulkan and the CUDA driver; the
+pinned build brings the CUDA runtime. Nothing else to install.
 
 Where a client keeps things:
 
@@ -215,8 +242,9 @@ What a client sends to its server:
 - the replies its models generate to the chat messages the server sends it
 
 What it downloads, when its server asks it to install a model:
-- **llama.cpp**, from the official release on github.com. The version and
-  SHA-256 are fixed in the client's source.
+- **llama.cpp**, from the official release on github.com: the build for
+  its hardware (for CUDA, about 0.6 to 0.8 GB with the CUDA runtime). The
+  version and SHA-256s are fixed in the client.
 - **model files**, from the URLs in the server's catalog. The default test
   model comes from huggingface.co.
 

@@ -1,7 +1,8 @@
 //! Models on clients, from the dashboard's side: the catalog of what can be
 //! installed, each client's inventory, and the commands that change it.
 //!
-//! Installing and deleting need **Manage** on the client; seeing what it
+//! Installing, deleting, configuring models and choosing the runtime
+//! variant need **Manage** on the client; seeing what it
 //! has needs **View** (so future borrowers will see models they can Use but
 //! not manage them). The browser names catalog entries by id only.
 //!
@@ -24,7 +25,10 @@ use axum::{
 };
 use catalog::CatalogEntry;
 use commands::{CancelError, CommandKind, NewCommand, TrackedCommand, TrackedState};
-use protocol::{valid_model_id, Backend, LocalModel, ModelCommandKind, RuntimeInfo, Storage};
+use protocol::{
+    valid_model_id, Backend, LlamaCppVersion, LocalModel, ModelCommandKind, ModelSettings, ModelSpec, RuntimeInfo,
+    Storage,
+};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 
@@ -112,6 +116,14 @@ pub async fn install(
         .get(&body.catalog_id)
         .ok_or_else(|| ApiError::bad_request(format!("There's no catalog entry {:?}.", body.catalog_id)))?
         .clone();
+    let runtimes = state
+        .live
+        .inventory(&client_id)
+        .map(|i| i.runtimes.clone())
+        .unwrap_or_default();
+    if let Some(why) = runtime_too_old(&spec, &runtimes) {
+        return Err(ApiError::conflict(why));
+    }
     let command = state.model_commands.send(
         &state.live,
         NewCommand {
@@ -181,4 +193,123 @@ pub async fn cancel_command(
         Err(CancelError::NotCancellable) => Err(ApiError::conflict("Only downloads in progress can be cancelled.")),
         Err(CancelError::Offline) => Err(ApiError::conflict("The client is offline.")),
     }
+}
+
+/// Why `spec` can't run on a client with these runtimes, if it can't: its
+/// `min_runtime_version` is newer than the client's llama.cpp. A client
+/// that hasn't reported yet gets the benefit of the doubt (it refuses the
+/// pull itself if it's too old).
+pub fn runtime_too_old(spec: &ModelSpec, runtimes: &[RuntimeInfo]) -> Option<String> {
+    let need = LlamaCppVersion::parse(spec.min_runtime_version.as_deref()?)?;
+    let have = runtimes
+        .iter()
+        .filter(|r| r.backend == Backend::LlamaCpp)
+        .filter_map(|r| LlamaCppVersion::parse(&r.version))
+        .max()?;
+    (have < need).then(|| {
+        format!(
+            "{} needs llama.cpp {need} or newer; this client has {have}. Update the client first.",
+            spec.display_name
+        )
+    })
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RuntimeBody {
+    variant: String,
+}
+
+/// A variant name as the protocol uses them ("auto", "cpu", "cuda-12", …).
+fn plausible_variant(v: &str) -> bool {
+    !v.is_empty()
+        && v.len() <= 32
+        && v.bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
+}
+
+/// `POST /api/clients/:id/runtime` (Manage): `{ "variant": "auto" | "cpu" | … }`
+/// sends `select_runtime`. The client checks it's a variant it has pinned.
+pub async fn select_runtime(
+    State(state): State<AppState>,
+    CurrentUser(user): CurrentUser,
+    Path(client_id): Path<String>,
+    ApiJson(body): ApiJson<RuntimeBody>,
+) -> ApiResult<Response> {
+    require(&state, &user, &client_id, ClientAction::Manage).await?;
+    if !plausible_variant(&body.variant) {
+        return Err(ApiError::bad_request("That isn't a runtime variant."));
+    }
+    let name = if body.variant == "auto" {
+        "llama.cpp: automatic".to_string()
+    } else {
+        format!("llama.cpp: {}", body.variant)
+    };
+    let command = state.model_commands.send(
+        &state.live,
+        NewCommand {
+            client_id: &client_id,
+            kind: CommandKind::SelectRuntime,
+            model_id: "",
+            model_name: &name,
+            requested_by: &user.username,
+            command: ModelCommandKind::SelectRuntime { variant: body.variant },
+        },
+    );
+    Ok(sent(command))
+}
+
+/// The settings body: like `ModelSettings`, but nothing else is accepted.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SettingsBody {
+    #[serde(default)]
+    gpu_layers: protocol::GpuLayers,
+    #[serde(default)]
+    context_length: Option<u32>,
+}
+
+/// `PUT /api/clients/:id/models/:model_id/settings` (Manage): the model's
+/// settings, `{ "gpu_layers": "auto" | "off" | "all" | n, "context_length": n | null }`,
+/// sent as `configure`. The client stores them and applies them on the next load.
+pub async fn configure_model(
+    State(state): State<AppState>,
+    CurrentUser(user): CurrentUser,
+    Path((client_id, model_id)): Path<(String, String)>,
+    ApiJson(body): ApiJson<SettingsBody>,
+) -> ApiResult<Response> {
+    let settings = ModelSettings {
+        gpu_layers: body.gpu_layers,
+        context_length: body.context_length,
+    };
+    require(&state, &user, &client_id, ClientAction::Manage).await?;
+    if !valid_model_id(&model_id) {
+        return Err(ApiError::bad_request("That isn't a valid model id."));
+    }
+    if let Some(why) = settings.problem() {
+        return Err(ApiError::bad_request(why));
+    }
+    let known = state
+        .live
+        .inventory(&client_id)
+        .and_then(|i| i.models.iter().find(|m| m.id == model_id).cloned());
+    if known.as_ref().is_some_and(|m| m.backend == Backend::Echo) {
+        return Err(ApiError::bad_request("The echo model has no settings."));
+    }
+    let name = known.map_or_else(|| model_id.clone(), |m| m.display_name);
+    let command = state.model_commands.send(
+        &state.live,
+        NewCommand {
+            client_id: &client_id,
+            kind: CommandKind::Configure,
+            model_id: &model_id,
+            model_name: &name,
+            requested_by: &user.username,
+            command: ModelCommandKind::Configure {
+                model_id: model_id.clone(),
+                settings,
+            },
+        },
+    );
+    Ok(sent(command))
 }

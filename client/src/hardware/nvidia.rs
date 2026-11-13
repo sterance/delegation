@@ -17,6 +17,8 @@ pub struct NvidiaGpu {
 pub fn gpus() -> Vec<NvidiaGpu> {
     let Ok(nvml) = Nvml::init() else { return Vec::new() };
     let count = nvml.device_count().unwrap_or(0);
+    let driver_version = nvml.sys_driver_version().ok();
+    let cuda_driver_version = nvml.sys_cuda_driver_version().ok().map(cuda_version);
     (0..count)
         .filter_map(|i| nvml.device_by_index(i).ok())
         .map(|device| NvidiaGpu {
@@ -26,10 +28,25 @@ pub fn gpus() -> Vec<NvidiaGpu> {
                 vram_bytes: device.memory_info().ok().map(|m| m.total),
                 vram_shared: false,
                 max_core_mhz: device.max_clock_info(Clock::Graphics).ok().filter(|&mhz| mhz > 0),
+                driver_version: driver_version.clone(),
+                cuda_driver_version: cuda_driver_version.clone(),
+                compute_capability: device
+                    .cuda_compute_capability()
+                    .ok()
+                    .map(|c| format!("{}.{}", c.major, c.minor)),
             },
             pci_slot: device.pci_info().ok().map(|p| normalize_bus_id(&p.bus_id)),
         })
         .collect()
+}
+
+/// NVML's CUDA driver version, e.g. 12080, as "12.8".
+fn cuda_version(v: i32) -> String {
+    format!(
+        "{}.{}",
+        nvml_wrapper::cuda_driver_version_major(v),
+        nvml_wrapper::cuda_driver_version_minor(v)
+    )
 }
 
 /// NVML reports "00000000:01:00.0" (8-digit domain); sysfs uses 4 digits.
@@ -48,5 +65,11 @@ mod tests {
     fn bus_ids_match_sysfs_form() {
         assert_eq!(super::normalize_bus_id("00000000:01:00.0"), "0000:01:00.0");
         assert_eq!(super::normalize_bus_id("0000:0A:00.0"), "0000:0a:00.0");
+    }
+
+    #[test]
+    fn cuda_versions_read_like_nvidia_smi() {
+        assert_eq!(super::cuda_version(12080), "12.8");
+        assert_eq!(super::cuda_version(13040), "13.4");
     }
 }
