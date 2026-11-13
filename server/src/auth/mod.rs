@@ -16,7 +16,6 @@ use crate::http::ApiError;
 use crate::ratelimit::RateLimiter;
 use anyhow::Result;
 use axum::{
-    async_trait,
     extract::FromRequestParts,
     http::{header, request::Parts, HeaderMap, HeaderValue},
 };
@@ -349,7 +348,6 @@ fn session_ctx(parts: &Parts) -> Result<SessionCtx, ApiError> {
         .ok_or_else(ApiError::unauthorized)
 }
 
-#[async_trait]
 impl<S: Send + Sync> FromRequestParts<S> for CurrentUser {
     type Rejection = ApiError;
 
@@ -358,7 +356,6 @@ impl<S: Send + Sync> FromRequestParts<S> for CurrentUser {
     }
 }
 
-#[async_trait]
 impl<S: Send + Sync> FromRequestParts<S> for CurrentSession {
     type Rejection = ApiError;
 
@@ -367,7 +364,6 @@ impl<S: Send + Sync> FromRequestParts<S> for CurrentSession {
     }
 }
 
-#[async_trait]
 impl<S: Send + Sync> FromRequestParts<S> for AdminUser {
     type Rejection = ApiError;
 
