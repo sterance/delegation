@@ -1,11 +1,17 @@
-# Tests every push and PR. The Windows build and the server deploy run as
-# the last jobs of this same workflow (they're reusable workflows called
-# below), so neither starts unless every check here passes, and a push to
-# main shows up as one run instead of three.
+# Tests every PR and every push to main. The Windows build and the server
+# deploy run as the last jobs of this same workflow (they're reusable
+# workflows called below), so neither starts unless every check here
+# passes, and a push to main shows up as one run instead of three.
+#
+# Pushes to other branches don't run CI on their own: open a PR. Otherwise
+# a PR from a branch in this repo would get two runs of the same commit,
+# and the push run's skipped Windows job could count as the required
+# `windows / tray` check before the PR run's real one finished.
 name: CI
 
 on:
   push:
+    branches: [main]
   pull_request:
 
 permissions:
@@ -66,11 +72,11 @@ jobs:
       - name: Build server image
         run: docker build -f server/Dockerfile -t delegation-server .
 
-  # Builds the tray app and installer for PRs and pushes to main (not other
-  # branch pushes); on pushes to main it also signs them (as the
-  # WINDOWS_SIGNING variable says, see installer/SIGNING.md) and publishes a
-  # GitHub Release, which needs contents: write. actions: read lets SignPath
-  # fetch the unsigned files from the run.
+  # Builds the tray app and installer for PRs and pushes to main; on pushes
+  # to main it also signs them (as the WINDOWS_SIGNING variable says, see
+  # installer/SIGNING.md) and publishes a GitHub Release, which needs
+  # contents: write. actions: read lets SignPath fetch the unsigned files
+  # from the run.
   windows:
     needs: [rust, frontend, docker]
     if: github.event_name == 'pull_request' || github.ref == 'refs/heads/main'
