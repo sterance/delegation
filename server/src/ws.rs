@@ -16,7 +16,7 @@ use axum::{
 use base64::{engine::general_purpose::STANDARD, Engine as _};
 use ed25519_dalek::{Signature, Verifier, VerifyingKey};
 use protocol::{valid_model_id, AuthFailedReason, ClientMessage, Inventory, ServerMessage, Tick};
-use rand::Rng;
+use rand::RngExt as _;
 use std::time::{Duration, Instant};
 use tokio::time::MissedTickBehavior;
 
@@ -67,7 +67,7 @@ async fn handle_socket(mut socket: WebSocket, state: AppState) {
     };
 
     let mut nonce = [0u8; 16];
-    rand::thread_rng().fill(&mut nonce);
+    rand::rng().fill(&mut nonce);
     if !send(
         &mut socket,
         &ServerMessage::Challenge {

@@ -9,7 +9,7 @@
 use crate::config::MetricsLimits;
 use crate::metrics;
 use protocol::{GpuMetrics, Inventory, LocalModel, Metrics, ModelState, ServerMessage};
-use rand::Rng;
+use rand::RngExt as _;
 use serde::Serialize;
 use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex};
@@ -119,7 +119,7 @@ struct LastSeen {
 
 impl Live {
     pub fn new(limits: MetricsLimits) -> Self {
-        let bytes: [u8; 8] = rand::thread_rng().gen();
+        let bytes: [u8; 8] = rand::rng().random();
         Live {
             epoch: bytes.iter().map(|b| format!("{b:02x}")).collect(),
             limits,
