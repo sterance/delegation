@@ -1,0 +1,96 @@
+# What this repository pins, for the weekly dependency check
+# (sterance/infra/.github/workflows/dependency-updates.yml; see
+# scripts/updates/README.md, and infra's updates/README.md for every option).
+#
+# The workflows read their versions from these files (CI's Rust from
+# rust-toolchain.toml, Node from frontend/.nvmrc, the Windows build's Inno
+# Setup from installer/inno-setup-version), so no update touches
+# .github/workflows/.
+version: 1
+
+dependabot:
+  npm:
+    - directory: /frontend
+      ignore:
+        # Its major follows Node's (frontend/.nvmrc), which the nodejs check
+        # moves; that PR says to bump this with it.
+        - dependency-name: "@types/node"
+          update-types: [version-update:semver-major]
+
+checks:
+  - name: llama-cpp
+    type: custom
+    run: python3 scripts/updates/llama_cpp.py
+
+  # The minimum supported Rust (rust-version) stays equal to the toolchain,
+  # and the Docker images build with the same version.
+  - name: rust
+    type: rust-toolchain
+    edits:
+      - { file: rust-toolchain.toml, pattern: '^channel = "(?P<version>[\d.]+)"$' }
+      - { file: client/Cargo.toml, pattern: '^rust-version = "(?P<version>[\d.]+)"$' }
+      - { file: server/Cargo.toml, pattern: '^rust-version = "(?P<version>[\d.]+)"$' }
+      - { file: protocol/Cargo.toml, pattern: '^rust-version = "(?P<version>[\d.]+)"$' }
+      - { file: client/Dockerfile, pattern: '\brust:(?P<version>[\d.]+)-slim-\w+', docker_image: library/rust }
+      - { file: server/Dockerfile, pattern: '\brust:(?P<version>[\d.]+)-slim-\w+', docker_image: library/rust }
+      - { file: README.md, pattern: 'pinned in `rust-toolchain\.toml` \((?P<version>[\d.]+)\)' }
+    notes: |
+      CI and the Windows build read `rust-toolchain.toml`.
+
+      **New Clippy lints can fail CI on this PR.** That's expected: fix them on
+      this branch (`cargo clippy --workspace --all-targets -- -D warnings`), in
+      this PR.
+
+  # Node only builds the frontend; minor and patch releases float within the major.
+  - name: nodejs
+    type: node-lts
+    edits:
+      - { file: frontend/.nvmrc, pattern: '\A(?P<version>\d+)$' }
+      - { file: server/Dockerfile, pattern: '\bnode:(?P<version>\d+)-alpine\b', docker_image: library/node }
+    notes: |
+      CI's frontend job reads `frontend/.nvmrc`; the server image builds the
+      frontend with `node:<major>-alpine`.
+
+      Also, on this branch: `@types/node` to the same major in
+      `frontend/package.json` (`npm install -D @types/node@<major>` in
+      `frontend/`). Dependabot leaves its major alone so it moves with Node.
+
+  - name: inno-setup
+    type: chocolatey
+    package: innosetup
+    edits:
+      - { file: installer/inno-setup-version, pattern: '\A(?P<version>[\d.]+)$' }
+    notes: |
+      The Windows build installs exactly this version with Chocolatey.
+      **Test:** this PR's Windows build in CI. Check that it produced the
+      installer (the `DelegationTray-Setup-…` artifact) and, ideally, that it
+      runs. For a new **major** version, windows.yml's `ISCC.exe` path
+      (`Inno Setup <major>`) and `installer/delegation.iss` need updating on
+      this branch.
+
+  # An issue, not a PR: moving the base changes glibc and the system libraries
+  # the downloaded llama.cpp builds load.
+  - name: debian
+    type: debian-stable
+    mode: issue
+    edits:
+      - { file: client/Dockerfile, pattern: '\bdebian:(?P<version>[a-z]+)-slim\b' }
+      - { file: server/Dockerfile, pattern: '\bdebian:(?P<version>[a-z]+)-slim\b' }
+      - { file: client/Dockerfile, pattern: '\brust:[\d.]+-slim-(?P<version>[a-z]+)\b', docker_image: library/rust }
+      - { file: server/Dockerfile, pattern: '\brust:[\d.]+-slim-(?P<version>[a-z]+)\b', docker_image: library/rust }
+    notes: |
+      llama-server needs:
+
+      - glibc 2.34 or newer, and GCC 12's libstdc++ or newer;
+      - `libssl3` and `libgomp1` (check the package names: Debian renames
+        libraries across releases, e.g. for the 64-bit time transition);
+      - the Vulkan loader and Mesa drivers (`libvulkan1`, `mesa-vulkan-drivers`)
+        for the Vulkan image.
+
+      To move: change the codename in the `debian:<codename>-slim` images and
+      the Rust images' suffix; check every apt package in `client/Dockerfile`
+      and `server/Dockerfile` still exists under that name; build both images
+      and run a model on the CPU build, on CUDA
+      (`client/docker-compose.gpu.yml`) and on Vulkan
+      (`client/docker-compose.amd.yml`); run the server image; update the
+      comments and docs that name the old codename. Close this issue when done.

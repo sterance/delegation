@@ -1,13 +1,11 @@
-# Weekly update PRs for the ecosystems Dependabot handles well (see
-# scripts/updates/README.md). Minor and patch updates are grouped into one
-# PR per ecosystem; majors get their own. Nothing merges automatically.
+# Managed by infra: generated from .github/updates.yml by the weekly dependency
+# check. Edit .github/updates.yml (its `dependabot:` section) instead: changes
+# made here are replaced by the next sync PR (branch updates/dependabot-config).
 #
-# Not here: llama.cpp, the Rust toolchain, Node.js, Inno Setup and the
-# Debian base image (.github/workflows/dependency-updates.yml), and the
-# `docker` ecosystem: the Rust and Node images must move together with
-# other files, and Debian codenames aren't versions it can compare.
+# Ecosystems are detected from the repository's files. The schedule and the
+# grouping (minor and patch updates in one PR per ecosystem) are infra's
+# updates/defaults.yml. The docker ecosystem is never added automatically.
 version: 2
-
 updates:
   - package-ecosystem: cargo
     directory: /
@@ -18,8 +16,9 @@ updates:
       timezone: Australia/Melbourne
     groups:
       cargo-minor-and-patch:
-        update-types: [minor, patch]
-
+        update-types:
+          - minor
+          - patch
   - package-ecosystem: npm
     directory: /frontend
     schedule:
@@ -29,13 +28,13 @@ updates:
       timezone: Australia/Melbourne
     groups:
       npm-minor-and-patch:
-        update-types: [minor, patch]
+        update-types:
+          - minor
+          - patch
     ignore:
-      # Its major follows Node's (frontend/.nvmrc), which the Node.js
-      # update PR moves; it says to bump this with it.
       - dependency-name: "@types/node"
-        update-types: [version-update:semver-major]
-
+        update-types:
+          - "version-update:semver-major"
   - package-ecosystem: github-actions
     directory: /
     schedule:
@@ -44,5 +43,7 @@ updates:
       time: "09:00"
       timezone: Australia/Melbourne
     groups:
-      actions-minor-and-patch:
-        update-types: [minor, patch]
+      github-actions-minor-and-patch:
+        update-types:
+          - minor
+          - patch

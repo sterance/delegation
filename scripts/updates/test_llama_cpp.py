@@ -1,38 +1,25 @@
-"""Offline tests of the dependency checks, against copies of this
+"""Offline tests of the llama.cpp custom check, against copies of this
 repository's real files (so a pin that moves breaks a test, not the weekly
 run). Run: python3 -m unittest discover -s scripts/updates
+
+The other pins (Rust, Node.js, Inno Setup, Debian) are built-in checks of
+infra's dependency updates, tested there.
 """
 
 from __future__ import annotations
 
 import argparse
 import json
+import os
 import shutil
 import tempfile
 import unittest
 from pathlib import Path
 
-import common
-import debian
-import innosetup
 import llama_cpp
-import nodejs
-import rust_toolchain
 
-ROOT = common.REPO_ROOT
-FILES = [
-    "rust-toolchain.toml",
-    "client/Cargo.toml",
-    "server/Cargo.toml",
-    "protocol/Cargo.toml",
-    "client/Dockerfile",
-    "server/Dockerfile",
-    "README.md",
-    "frontend/.nvmrc",
-    "dev/docker-compose.yml",
-    "installer/inno-setup-version",
-    "client/runtime-pins.json",
-]
+ROOT = llama_cpp.REPO_ROOT
+FILES = ["README.md", "client/runtime-pins.json"]
 
 
 class Repo:
@@ -60,116 +47,6 @@ class RepoTest(unittest.TestCase):
 
     def tearDown(self):
         self.repo.close()
-
-
-class CommonTest(RepoTest):
-    def test_an_edit_that_doesnt_match_fails(self):
-        c = common.Changes(self.repo.dir)
-        with self.assertRaises(common.UpdateError):
-            c.apply(common.Edit("rust-toolchain.toml", r"^nope$", "x"))
-        with self.assertRaises(common.UpdateError):
-            c.apply(common.Edit("missing.txt", r"x", "y"))
-
-    def test_versions_compare_numerically(self):
-        self.assertLess(common.version_tuple("1.99.1"), common.version_tuple("1.100.0"))
-        with self.assertRaises(common.UpdateError):
-            common.version_tuple("1.x")
-
-
-class RustTest(RepoTest):
-    def current(self):
-        return common.find_one(self.repo.read("rust-toolchain.toml"), r'^channel = "(.+)"$', "toolchain")
-
-    def test_up_to_date_is_no_proposal(self):
-        cur = self.current()
-        self.assertIsNone(rust_toolchain.check(self.repo.args(), latest=lambda: cur, image_exists=lambda *_: True))
-
-    def test_every_place_moves_together(self):
-        p = rust_toolchain.check(self.repo.args(), latest=lambda: "9.0.0", image_exists=lambda *_: True)
-        p.changes.write()
-        self.assertIn('channel = "9.0.0"', self.repo.read("rust-toolchain.toml"))
-        for crate in ("client", "server", "protocol"):
-            self.assertIn('rust-version = "9.0.0"', self.repo.read(f"{crate}/Cargo.toml"))
-        for d in ("client", "server"):
-            self.assertIn("rust:9.0.0-slim-", self.repo.read(f"{d}/Dockerfile"))
-        self.assertIn("(9.0.0)", self.repo.read("README.md"))
-        self.assertEqual(len(p.changes.changed()), 0, "all written")
-
-    def test_no_image_yet_is_no_proposal(self):
-        self.assertIsNone(rust_toolchain.check(self.repo.args(), latest=lambda: "9.0.0", image_exists=lambda *_: False))
-
-
-class NodeTest(RepoTest):
-    def index(self, *releases):
-        return [{"version": v, "lts": lts} for v, lts in releases]
-
-    def test_only_a_newer_lts_major_counts(self):
-        cur = int(self.repo.read("frontend/.nvmrc"))
-        same = self.index((f"v{cur}.99.0", "X"), (f"v{cur + 1}.0.0", False))
-        self.assertIsNone(nodejs.check(self.repo.args(), index=same, image_exists=lambda *_: True))
-        newer = self.index((f"v{cur + 2}.0.0", False), (f"v{cur + 1}.3.0", "Y"), (f"v{cur}.99.0", "X"))
-        p = nodejs.check(self.repo.args(), index=newer, image_exists=lambda *_: True)
-        self.assertEqual(p.version, str(cur + 1))
-        p.changes.write()
-        self.assertEqual(self.repo.read("frontend/.nvmrc"), f"{cur + 1}\n")
-        self.assertIn(f"node:{cur + 1}-alpine", self.repo.read("server/Dockerfile"))
-        self.assertIn(f"node:{cur + 1}-slim", self.repo.read("dev/docker-compose.yml"))
-
-
-FEED = """<?xml version="1.0" encoding="utf-8"?>
-<feed xmlns="http://www.w3.org/2005/Atom"
-      xmlns:d="http://schemas.microsoft.com/ado/2007/08/dataservices"
-      xmlns:m="http://schemas.microsoft.com/ado/2007/08/dataservices/metadata">
-  {entries}
-  {next}
-</feed>"""
-
-
-def feed(versions, next_url=None):
-    entries = "".join(
-        f"<entry><m:properties><d:Version>{v}</d:Version>"
-        f"<d:IsPrerelease>{'true' if pre else 'false'}</d:IsPrerelease></m:properties></entry>"
-        for v, pre in versions
-    )
-    nxt = f'<link rel="next" href="{next_url}" />' if next_url else ""
-    return FEED.format(entries=entries, next=nxt).encode()
-
-
-class InnoTest(RepoTest):
-    def test_the_highest_stable_version_across_pages(self):
-        pages = {
-            innosetup.FEED: feed([("5.5.9.20160928", False), ("6.2.0", False)], "page2"),
-            "page2": feed([("99.0.0-beta", True), ("6.10.0", False), ("7.0.0", True)]),
-        }
-        self.assertEqual(innosetup.latest(lambda url, accept=None: pages[url]), "6.10.0")
-
-    def test_a_newer_version_rewrites_the_pin(self):
-        get = lambda url, accept=None: feed([("99.1.0", False)])
-        p = innosetup.check(self.repo.args(), get=get)
-        p.changes.write()
-        self.assertEqual(self.repo.read(innosetup.PIN), "99.1.0\n")
-        self.assertIn("New major version", p.body)
-        cur = self.repo.read(innosetup.PIN).strip()
-        self.assertIsNone(innosetup.check(self.repo.args(), get=lambda u, a=None: feed([(cur, False)])))
-
-
-class DebianTest(RepoTest):
-    def release(self, codename, version):
-        return f"Origin: Debian\nCodename: {codename}\nVersion: {version}\n"
-
-    def test_a_newer_stable_is_an_issue(self):
-        cur = common.find_one(self.repo.read("client/Dockerfile"), r"debian:(\w+)-slim", "debian")
-        suites = {"stable": self.release("zzz", 99), cur: self.release(cur, 12)}
-        get = lambda url: suites[url.split("/")[-2]]
-        p = debian.check(self.repo.args(), get=get, image_exists=lambda *_: True)
-        self.assertIsNone(p.changes, "an issue, not a PR")
-        self.assertIn(f"from Debian {cur} to zzz", p.title)
-        self.assertIn("libgomp1", p.body)
-
-    def test_the_same_release_is_nothing(self):
-        cur = common.find_one(self.repo.read("client/Dockerfile"), r"debian:(\w+)-slim", "debian")
-        get = lambda url: self.release(cur, 12)
-        self.assertIsNone(debian.check(self.repo.args(), get=get, image_exists=lambda *_: True))
 
 
 class LlamaTest(RepoTest):
@@ -260,12 +137,12 @@ class LlamaTest(RepoTest):
     def test_a_missing_cpu_build_fails(self):
         rel = self.release_for(self.new_tag(), rename={"bin-ubuntu-x64": "bin-ubuntu-22.04-x64"})
         verify, _ = self.verify_from(rel)
-        with self.assertRaisesRegex(common.UpdateError, "CPU build"):
+        with self.assertRaisesRegex(llama_cpp.UpdateError, "CPU build"):
             self.run_check(rel, verify)
 
     def test_a_download_that_doesnt_match_the_api_fails(self):
         rel = self.release_for(self.new_tag())
-        with self.assertRaisesRegex(common.UpdateError, "doesn't match"):
+        with self.assertRaisesRegex(llama_cpp.UpdateError, "doesn't match"):
             self.run_check(rel, lambda url: ("0" * 64, 1000))
 
     def test_a_missing_digest_is_a_problem_not_a_guess(self):
@@ -284,6 +161,33 @@ class LlamaTest(RepoTest):
         f = self.repo.dir / "catalog.json"
         f.write_text(json.dumps([{"id": "a", "min_runtime_version": "b15"}, {"id": "b", "min_runtime_version": "b30"}]))
         self.assertEqual(len(llama_cpp.catalog_notes(f, "b10", "b20")), 1)
+
+
+
+
+class ContractTest(RepoTest):
+    """Infra's custom-check contract: UPDATE_OUT/result.json and body.md."""
+
+    pins = LlamaTest.pins
+    release_for = LlamaTest.release_for
+
+    def test_a_proposal_is_written_for_infra(self):
+        new = "b" + str(llama_cpp.tag_number(json.loads(self.repo.read(llama_cpp.PINS))["version"]) + 7)
+        rel = self.release_for(new)
+        out = Path(tempfile.mkdtemp())
+        os.environ["UPDATE_OUT"] = str(out)
+        os.environ["UPDATE_DRY_RUN"] = "1"
+        orig = llama_cpp.check
+        try:
+            llama_cpp.check = lambda args: orig(args, get_json=lambda url: [rel], verify=None)
+            self.assertEqual(llama_cpp.main(["--root", str(self.repo.dir)]), 0)
+        finally:
+            llama_cpp.check = orig
+            del os.environ["UPDATE_OUT"], os.environ["UPDATE_DRY_RUN"]
+        result = json.loads((out / "result.json").read_text())
+        self.assertEqual((result["result"], result["version"]), ("pr", new))
+        self.assertIn("dry run", (out / "body.md").read_text())
+        self.assertIn(f"/download/{new}/", self.repo.read(llama_cpp.PINS), "edited in the tree")
 
 
 if __name__ == "__main__":

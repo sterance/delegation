@@ -49,7 +49,8 @@ jobs:
       - run: npm run lint
       - run: npm run build
 
-  # The weekly dependency checks' scripts (offline tests).
+  # The llama.cpp dependency check (offline tests). The other checks are
+  # built into infra's dependency updates, and tested there.
   update-scripts:
     runs-on: ubuntu-latest
     steps:
