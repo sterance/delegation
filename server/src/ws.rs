@@ -28,7 +28,7 @@ async fn send(socket: &mut WebSocket, msg: &ServerMessage) -> bool {
     let Ok(text) = serde_json::to_string(msg) else {
         return false;
     };
-    socket.send(Message::Text(text)).await.is_ok()
+    socket.send(Message::Text(text.into())).await.is_ok()
 }
 
 /// Waits for the next text message and parses it, with a timeout. Only
@@ -182,7 +182,7 @@ impl Session<'_> {
                 _ = ping.tick() => {
                     // Bounded, so a peer that stopped reading can't wedge
                     // this loop (and with it the watchdog).
-                    match tokio::time::timeout(liveness_timeout, socket.send(Message::Ping(Vec::new()))).await {
+                    match tokio::time::timeout(liveness_timeout, socket.send(Message::Ping(Default::default()))).await {
                         Ok(Ok(())) => {}
                         Ok(Err(e)) => return format!("ping failed: {e}"),
                         Err(_) => return "ping send timed out".into(),
@@ -191,7 +191,7 @@ impl Session<'_> {
                 // Chat requests and cancels queued by the reply runner.
                 Some(out) = self.conn.outbound.recv() => {
                     let Ok(text) = serde_json::to_string(&out) else { continue };
-                    match tokio::time::timeout(liveness_timeout, socket.send(Message::Text(text))).await {
+                    match tokio::time::timeout(liveness_timeout, socket.send(Message::Text(text.into()))).await {
                         Ok(Ok(())) => {}
                         Ok(Err(e)) => return format!("send failed: {e}"),
                         Err(_) => return "send timed out".into(),

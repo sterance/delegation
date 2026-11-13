@@ -5,7 +5,6 @@
 
 use crate::{log, AppState};
 use axum::{
-    async_trait,
     extract::{rejection::JsonRejection, ConnectInfo, FromRequest, FromRequestParts, Request, State},
     http::{header, request::Parts, HeaderMap, HeaderValue, Method, StatusCode},
     middleware::Next,
@@ -104,7 +103,6 @@ impl IntoResponse for ApiError {
 /// not axum's default 415/422.
 pub struct ApiJson<T>(pub T);
 
-#[async_trait]
 impl<S, T> FromRequest<S> for ApiJson<T>
 where
     S: Send + Sync,
@@ -130,7 +128,6 @@ fn json_rejection(rejection: JsonRejection) -> ApiError {
 #[derive(Debug, Clone)]
 pub struct ClientIp(pub String);
 
-#[async_trait]
 impl FromRequestParts<AppState> for ClientIp {
     type Rejection = std::convert::Infallible;
 
