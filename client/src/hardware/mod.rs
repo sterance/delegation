@@ -74,23 +74,26 @@ pub fn spawn_collect() -> watch::Receiver<Option<Arc<MachineInfo>>> {
 pub fn collect() -> MachineInfo {
     let mut specs = HardwareSpecs::default();
 
-    let mut sys = sysinfo::System::new();
-    sys.refresh_cpu_all();
-    sys.refresh_memory();
-    specs.cpu = Some(Cpu {
-        model: sys
-            .cpus()
-            .first()
-            .map(|c| c.brand().trim().to_string())
-            .filter(|s| !s.is_empty()),
-        max_mhz: None,
-        physical_cores: sysinfo::System::physical_core_count().map(|n| n as u32),
-        logical_cores: Some(sys.cpus().len() as u32).filter(|&n| n > 0),
-    });
-    specs.memory = Some(Memory {
-        total_bytes: Some(sys.total_memory()).filter(|&b| b > 0),
-        ..Memory::default()
-    });
+    // sysinfo 0.40 returns an error on an OS it doesn't support; the
+    // platform collectors below still run.
+    if let Ok(mut sys) = sysinfo::System::new() {
+        sys.refresh_cpu_all();
+        sys.refresh_memory();
+        specs.cpu = Some(Cpu {
+            model: sys
+                .cpus()
+                .first()
+                .map(|c| c.brand().trim().to_string())
+                .filter(|s| !s.is_empty()),
+            max_mhz: None,
+            physical_cores: sysinfo::System::physical_core_count().ok().map(|n| n as u32),
+            logical_cores: Some(sys.cpus().len() as u32).filter(|&n| n > 0),
+        });
+        specs.memory = Some(Memory {
+            total_bytes: Some(sys.total_memory()).filter(|&b| b > 0),
+            ..Memory::default()
+        });
+    }
 
     #[cfg(target_os = "linux")]
     linux::fill(&mut specs);
@@ -117,7 +120,7 @@ fn os_name() -> String {
     if let Some(name) = linux::os_name() {
         return name;
     }
-    sysinfo::System::long_os_version().unwrap_or_else(|| std::env::consts::OS.to_string())
+    sysinfo::System::long_os_version().unwrap_or_else(|_| std::env::consts::OS.to_string())
 }
 
 /// One log line, e.g. "Linux Debian 13: 16 logical CPUs, 2 GPU(s), 1 disk(s)".

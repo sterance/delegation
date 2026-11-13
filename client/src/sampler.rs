@@ -173,7 +173,9 @@ struct SystemSource {
     /// Created with a first CPU reading, so CPU % (the difference between
     /// two readings) is valid from the first `read`, which the sampler only
     /// makes at least one interval (200 ms or more) later.
-    system: System,
+    /// None on an OS sysinfo doesn't support (since 0.40 that's an error
+    /// rather than empty numbers): no CPU/RAM readings, GPUs still reported.
+    system: Option<System>,
     nvml: Option<Nvml>,
     /// (GPU index, query) pairs whose failure has been logged, so a broken
     /// query logs once rather than every reading.
@@ -182,11 +184,17 @@ struct SystemSource {
 
 impl SystemSource {
     fn new() -> Self {
-        let system = System::new_with_specifics(
+        let system = match System::new_with_specifics(
             RefreshKind::nothing()
-                .with_cpu(CpuRefreshKind::nothing().with_cpu_usage())
+                .with_cpu(CpuRefreshKind::nothing().with_usage())
                 .with_memory(MemoryRefreshKind::everything()),
-        );
+        ) {
+            Ok(system) => Some(system),
+            Err(e) => {
+                info!(target: "metrics", "sysinfo not available ({e}); no CPU or RAM metrics");
+                None
+            }
+        };
         // Loaded at runtime (libnvidia-ml.so.1 / nvml.dll). Machines without
         // an NVIDIA driver, and containers without the GPU override, end up
         // here: say so once and report no GPUs.
@@ -242,8 +250,9 @@ impl SystemSource {
 
 impl Source for SystemSource {
     fn read(&mut self) -> Option<Reading> {
-        self.system.refresh_cpu_usage();
-        // In sysinfo 0.38, available_memory() is MemAvailable on Linux (what
+        let system = self.system.as_mut()?;
+        system.refresh_cpu_usage();
+        // In sysinfo 0.40, available_memory() is MemAvailable on Linux (what
         // can be allocated without swapping, including reclaimable cache)
         // and ullAvailPhys on Windows; used_memory() is total - available.
         //
@@ -251,17 +260,17 @@ impl Source for SystemSource {
         // namespaced, so a container memory limit (`mem_limit`) doesn't show
         // up here. That's what we want for a host-wide view; the limit would
         // be in the cgroup files, which we deliberately don't read.
-        self.system.refresh_memory();
-        let cpu = self.system.global_cpu_usage();
+        system.refresh_memory();
+        let cpu = system.global_cpu_usage();
         if !cpu.is_finite() {
             return None;
         }
         Some(Reading {
             cpu_percent: cpu.clamp(0.0, 100.0),
-            ram_total_bytes: self.system.total_memory(),
-            ram_available_bytes: self.system.available_memory().min(self.system.total_memory()),
-            swap_total_bytes: Some(self.system.total_swap()),
-            swap_used_bytes: Some(self.system.used_swap().min(self.system.total_swap())),
+            ram_total_bytes: system.total_memory(),
+            ram_available_bytes: system.available_memory().min(system.total_memory()),
+            swap_total_bytes: Some(system.total_swap()),
+            swap_used_bytes: Some(system.used_swap().min(system.total_swap())),
             gpus: self.gpus(),
         })
     }

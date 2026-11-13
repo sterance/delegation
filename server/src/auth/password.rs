@@ -7,7 +7,7 @@ use crate::config::Argon2Settings;
 use anyhow::{anyhow, Context, Result};
 use argon2::password_hash::{rand_core::OsRng, SaltString};
 use argon2::{Algorithm, Argon2, Params, PasswordHash, PasswordHasher, PasswordVerifier, Version};
-use rand::Rng;
+use rand::RngExt as _;
 use std::sync::Arc;
 use tokio::sync::Semaphore;
 
@@ -35,7 +35,7 @@ impl Hasher {
         let params = Params::new(settings.memory_kib, settings.iterations, settings.parallelism, None)
             .map_err(|e| anyhow!("invalid Argon2 parameters: {e}"))?;
         let argon = Argon2::new(Algorithm::Argon2id, Version::V0x13, params);
-        let random: [u8; 16] = rand::thread_rng().gen();
+        let random: [u8; 16] = rand::rng().random();
         let dummy = hash_with(&argon, &format!("{random:?}"))?;
         Ok(Arc::new(Hasher {
             argon,

@@ -31,8 +31,8 @@ pub const PUBLIC_API_ROUTES: &[(&str, &str)] = &[
     ("POST", "/auth/login"),
     ("POST", "/auth/signup"),
     ("POST", "/auth/setup"),
-    ("GET", "/password-reset/:token"),
-    ("POST", "/password-reset/:token"),
+    ("GET", "/password-reset/{token}"),
+    ("POST", "/password-reset/{token}"),
 ];
 
 /// The `/api` router under construction, remembering every route added so
@@ -90,41 +90,44 @@ pub fn api_routes() -> ApiRoutes {
         .post("/auth/logout", auth_api::logout)
         .get("/me", auth_api::me)
         .post("/me/password", auth_api::change_password)
-        .get("/password-reset/:token", auth_api::reset_info)
-        .post("/password-reset/:token", auth_api::reset_password)
+        .get("/password-reset/{token}", auth_api::reset_info)
+        .post("/password-reset/{token}", auth_api::reset_password)
         // the admin
         .get("/admin/users", auth_api::list_users)
-        .post("/admin/users/:id/reset-link", auth_api::create_reset_link)
-        .patch("/admin/users/:id", auth_api::patch_user)
-        .delete("/admin/users/:id", auth_api::delete_user)
+        .post("/admin/users/{id}/reset-link", auth_api::create_reset_link)
+        .patch("/admin/users/{id}", auth_api::patch_user)
+        .delete("/admin/users/{id}", auth_api::delete_user)
         // clients
         .get("/clients", clients::list_clients)
-        .patch("/clients/:client_id", clients::update_client)
-        .delete("/clients/:client_id", clients::delete_client)
+        .patch("/clients/{client_id}", clients::update_client)
+        .delete("/clients/{client_id}", clients::delete_client)
         .post("/pairing-codes", clients::create_pairing_code)
-        .get("/pairing-codes/:code/status", clients::pairing_code_status)
+        .get("/pairing-codes/{code}/status", clients::pairing_code_status)
         .get("/dashboard-config", clients::dashboard_config)
         // models on clients
         .get("/models/catalog", models::list_catalog)
-        .get("/clients/:client_id/models", models::client_models)
-        .post("/clients/:client_id/models", models::install)
-        .delete("/clients/:client_id/models/:model_id", models::delete_model)
-        .put("/clients/:client_id/models/:model_id/settings", models::configure_model)
-        .post("/clients/:client_id/runtime", models::select_runtime)
+        .get("/clients/{client_id}/models", models::client_models)
+        .post("/clients/{client_id}/models", models::install)
+        .delete("/clients/{client_id}/models/{model_id}", models::delete_model)
+        .put(
+            "/clients/{client_id}/models/{model_id}/settings",
+            models::configure_model,
+        )
+        .post("/clients/{client_id}/runtime", models::select_runtime)
         .post(
-            "/clients/:client_id/model-commands/:command_id/cancel",
+            "/clients/{client_id}/model-commands/{command_id}/cancel",
             models::cancel_command,
         )
         // chat
         .get("/chat/models", chat::list_models)
         .get("/conversations", chat::list_conversations)
-        .get("/conversations/:id", chat::get_conversation)
-        .patch("/conversations/:id", chat::patch_conversation)
-        .delete("/conversations/:id", chat::delete_conversation)
-        .post("/conversations/:id/messages", chat::send_message)
-        .get("/messages/:id/stream", chat::stream_message)
-        .post("/messages/:id/cancel", chat::cancel_message)
-        .post("/messages/:id/retry", chat::retry_message)
+        .get("/conversations/{id}", chat::get_conversation)
+        .patch("/conversations/{id}", chat::patch_conversation)
+        .delete("/conversations/{id}", chat::delete_conversation)
+        .post("/conversations/{id}/messages", chat::send_message)
+        .get("/messages/{id}/stream", chat::stream_message)
+        .post("/messages/{id}/cancel", chat::cancel_message)
+        .post("/messages/{id}/retry", chat::retry_message)
 }
 
 pub fn is_public(method: &Method, path: &str) -> bool {
