@@ -3,7 +3,7 @@ use base64::{engine::general_purpose::STANDARD, Engine as _};
 use ed25519_dalek::{SigningKey, VerifyingKey};
 use log::{info, warn};
 use protocol::{EnrollError, EnrollRequest, EnrollResponse};
-use rand::rngs::OsRng;
+use rand::{rngs::SysRng, TryRng as _};
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::io::Write;
@@ -216,8 +216,13 @@ pub fn identity_path() -> PathBuf {
 /// Generates a fresh keypair and enrolls it with `server_http_base` using a
 /// one-time pairing code. Blocking (plain HTTP via ureq). Nothing is saved.
 pub fn enroll(server_http_base: &str, pairing_code: &str) -> Result<Identity> {
-    let mut csprng = OsRng;
-    let signing_key = SigningKey::generate(&mut csprng);
+    // Straight from the OS RNG; built from bytes so ed25519-dalek and rand
+    // don't have to agree on a rand_core version.
+    let mut secret = [0u8; 32];
+    SysRng
+        .try_fill_bytes(&mut secret)
+        .map_err(|e| anyhow::anyhow!("the OS random number generator failed: {e}"))?;
+    let signing_key = SigningKey::from_bytes(&secret);
     let verifying_key: VerifyingKey = signing_key.verifying_key();
     let public_key_b64 = STANDARD.encode(verifying_key.to_bytes());
 

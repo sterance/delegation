@@ -15,7 +15,7 @@ use axum::{
     Json,
 };
 use protocol::{Backend, EnrollError, EnrollRequest, EnrollResponse, HardwareSpecs, ModelState, Progress};
-use rand::Rng;
+use rand::RngExt as _;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
@@ -370,6 +370,8 @@ pub async fn enroll(State(state): State<AppState>, ClientIp(ip): ClientIp, Json(
 
 fn random_code() -> String {
     const CHARS: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
-    let mut rng = rand::thread_rng();
-    (0..8).map(|_| CHARS[rng.gen_range(0..CHARS.len())] as char).collect()
+    let mut rng = rand::rng();
+    (0..8)
+        .map(|_| CHARS[rng.random_range(0..CHARS.len())] as char)
+        .collect()
 }
