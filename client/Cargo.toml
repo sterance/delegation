@@ -35,7 +35,7 @@ ureq = { version = "2", default-features = false, features = ["json"] }
 anyhow = "1"
 log = { version = "0.4", features = ["std"] }
 gethostname = "1"
-sysinfo = { version = "0.38", default-features = false, features = ["system"] }
+sysinfo = { version = "0.40", default-features = false, features = ["system"] }
 # Loads libnvidia-ml.so.1 / nvml.dll at runtime; does nothing without NVIDIA.
 nvml-wrapper = "0.13"
 # Model and runtime downloads: verified with SHA-256, then the llama.cpp
