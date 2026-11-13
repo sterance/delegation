@@ -16,11 +16,16 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@master
+      # The version in rust-toolchain.toml, which the weekly dependency
+      # update changes (so this file never needs to).
+      - id: toolchain
+        run: echo "version=$(sed -n 's/^channel = "\(.*\)"\r\?$/\1/p' rust-toolchain.toml)" >> "$GITHUB_OUTPUT"
+      # Third-party actions are pinned to commits (Dependabot updates them).
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # v1
         with:
-          toolchain: 1.99.1
+          toolchain: ${{ steps.toolchain.outputs.version }}
           components: rustfmt, clippy
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
       - run: cargo fmt --all --check
       - run: cargo clippy --workspace --all-targets -- -D warnings
       - run: cargo test --workspace
@@ -33,15 +38,23 @@ jobs:
     steps:
       - uses: actions/checkout@v7
       # Node only builds the frontend (dev and CI): the server serves the
-      # built files and the client never needs it.
+      # built files and the client never needs it. The major version is in
+      # frontend/.nvmrc (the same as server/Dockerfile's image).
       - uses: actions/setup-node@v7
         with:
-          node-version: 24
+          node-version-file: frontend/.nvmrc
           cache: npm
           cache-dependency-path: frontend/package-lock.json
       - run: npm ci
       - run: npm run lint
       - run: npm run build
+
+  # The weekly dependency checks' scripts (offline tests).
+  update-scripts:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - run: python3 -m unittest discover -s scripts/updates -v
 
   docker:
     runs-on: ubuntu-latest

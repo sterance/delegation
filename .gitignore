@@ -39,3 +39,5 @@ dev/.native-home/
 # dev/dev.sh's session cookie for the dev admin
 dev/.cookies
 /docs
+# Python bytecode (scripts/updates)
+__pycache__/

@@ -1,0 +1,48 @@
+# Weekly update PRs for the ecosystems Dependabot handles well (see
+# scripts/updates/README.md). Minor and patch updates are grouped into one
+# PR per ecosystem; majors get their own. Nothing merges automatically.
+#
+# Not here: llama.cpp, the Rust toolchain, Node.js, Inno Setup and the
+# Debian base image (.github/workflows/dependency-updates.yml), and the
+# `docker` ecosystem: the Rust and Node images must move together with
+# other files, and Debian codenames aren't versions it can compare.
+version: 2
+
+updates:
+  - package-ecosystem: cargo
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+      time: "09:00"
+      timezone: Australia/Melbourne
+    groups:
+      cargo-minor-and-patch:
+        update-types: [minor, patch]
+
+  - package-ecosystem: npm
+    directory: /frontend
+    schedule:
+      interval: weekly
+      day: monday
+      time: "09:00"
+      timezone: Australia/Melbourne
+    groups:
+      npm-minor-and-patch:
+        update-types: [minor, patch]
+    ignore:
+      # Its major follows Node's (frontend/.nvmrc), which the Node.js
+      # update PR moves; it says to bump this with it.
+      - dependency-name: "@types/node"
+        update-types: [version-update:semver-major]
+
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+      time: "09:00"
+      timezone: Australia/Melbourne
+    groups:
+      actions-minor-and-patch:
+        update-types: [minor, patch]

@@ -930,8 +930,8 @@ pub(crate) mod tests {
 
     #[test]
     fn the_embedded_pins_are_valid() {
+        // Not checking the version: the weekly update workflow moves it.
         let pins = parse_pins(EMBEDDED_PINS).unwrap();
-        assert_eq!(pins.version, "b12110");
         for (os, arch) in [("linux", "x86_64"), ("linux", "aarch64"), ("windows", "x86_64")] {
             let cpu: Vec<_> = pins
                 .variants

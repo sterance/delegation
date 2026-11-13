@@ -1,0 +1,52 @@
+# The test of a llama.cpp bump (see scripts/updates/README.md): the pinned
+# CPU build, downloaded and hash-checked by the client's own runtime code,
+# still takes every flag the client passes, still logs what the client
+# parses, and generates text through the client's streaming code
+# (client/src/inference/smoke.rs). GPU builds can't run here; the update
+# PR has a checklist for checking them by hand.
+name: Runtime smoke
+
+on:
+  pull_request:
+    paths:
+      - client/runtime-pins.json
+      - client/src/inference/smoke.rs
+      - .github/workflows/runtime-smoke.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  runtime-smoke:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - id: toolchain
+        run: echo "version=$(sed -n 's/^channel = "\(.*\)"\r\?$/\1/p' rust-toolchain.toml)" >> "$GITHUB_OUTPUT"
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # v1
+        with:
+          toolchain: ${{ steps.toolchain.outputs.version }}
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+
+      # The pins validation test, on its own so a bad edit is named plainly.
+      - name: Pins are valid
+        run: cargo test -p delegation-client --lib runtime::tests::the_embedded_pins_are_valid
+
+      # The 0.5B test model from config.env.example.
+      - name: Test model
+        id: model
+        run: |
+          grep -E '^TEST_MODEL_(ID|URL|SHA256|SIZE_BYTES)=' config.env.example | tee -a "$GITHUB_ENV"
+          echo "DELEGATION_SMOKE_DIR=$RUNNER_TEMP/smoke" >> "$GITHUB_ENV"
+          echo "sha256=$(sed -n 's/^TEST_MODEL_SHA256=//p' config.env.example)" >> "$GITHUB_OUTPUT"
+
+      # Only the model is cached; the runtime is downloaded fresh every time,
+      # so the pinned hash is really checked.
+      - uses: actions/cache@v6
+        with:
+          path: ${{ env.DELEGATION_SMOKE_DIR }}/models
+          key: smoke-model-${{ steps.model.outputs.sha256 }}
+
+      - name: Smoke test
+        run: cargo test -p delegation-client --lib smoke -- --ignored --nocapture

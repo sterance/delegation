@@ -1,0 +1,196 @@
+# Weekly checks of the pins Dependabot can't update (see
+# scripts/updates/README.md): llama.cpp, the Rust toolchain, Node.js and
+# Inno Setup each get a pull request on a fixed branch (updates/<name>)
+# when there's something newer, updated in place on later runs; the Debian
+# base image gets an issue. Nothing is merged automatically.
+#
+# The logic is in scripts/updates/ (each has --dry-run, for running
+# locally); this file only calls it.
+name: Dependency updates
+
+on:
+  schedule:
+    # Sunday 22:00 UTC: Monday 9:00 in Melbourne during daylight saving
+    # (8:00 in winter), the same morning as Dependabot.
+    - cron: "0 22 * * 0"
+  workflow_dispatch:
+    inputs:
+      fail:
+        description: "Make one check fail on purpose (to test the failure issue)"
+        type: choice
+        default: none
+        options: [none, llama-cpp, rust, nodejs, inno-setup, debian]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: dependency-updates
+  cancel-in-progress: false
+
+jobs:
+  update:
+    name: ${{ matrix.name }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    strategy:
+      # Independent: one failing check doesn't stop the others.
+      fail-fast: false
+      matrix:
+        include:
+          - name: llama-cpp
+            script: llama_cpp.py
+          - name: rust
+            script: rust_toolchain.py
+          - name: nodejs
+            script: nodejs.py
+          - name: inno-setup
+            script: innosetup.py
+    env:
+      # Only to know whether the app is set up; the token comes from the
+      # create-github-app-token step.
+      APP_CLIENT_ID: ${{ secrets.UPDATES_APP_CLIENT_ID }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Fail on purpose
+        if: inputs.fail == matrix.name
+        run: |
+          echo "::error::failing on purpose (workflow_dispatch input)"
+          exit 1
+
+      - name: Check
+        id: check
+        env:
+          # Read-only GitHub API calls (llama.cpp's releases), for the rate limit.
+          GITHUB_TOKEN: ${{ github.token }}
+        run: python3 scripts/updates/${{ matrix.script }} --out "$RUNNER_TEMP/update"
+
+      # PRs opened with the workflow's own GITHUB_TOKEN don't trigger other
+      # workflows, so CI wouldn't run on them: they're opened as the app.
+      - name: App token
+        id: app
+        if: steps.check.outputs.changed == 'true' && env.APP_CLIENT_ID != ''
+        uses: actions/create-github-app-token@v3
+        with:
+          client-id: ${{ secrets.UPDATES_APP_CLIENT_ID }}
+          private-key: ${{ secrets.UPDATES_APP_PRIVATE_KEY }}
+          permission-contents: write
+          permission-pull-requests: write
+
+      - name: Check for a token
+        if: steps.check.outputs.changed == 'true'
+        env:
+          TOKEN: ${{ steps.app.outputs.token || secrets.UPDATES_TOKEN }}
+        run: |
+          if [ -z "$TOKEN" ]; then
+            echo "::error::An update is available but there's no token to open the PR with: set up the GitHub App (UPDATES_APP_CLIENT_ID, UPDATES_APP_PRIVATE_KEY) or UPDATES_TOKEN, see scripts/updates/README.md"
+            exit 1
+          fi
+
+      - name: Pull request
+        if: steps.check.outputs.changed == 'true'
+        uses: peter-evans/create-pull-request@3ffccacd46053766916f087ce41d627c0b8cf2d1 # v8.1.3
+        with:
+          # The app's token, or a fine-grained personal access token.
+          token: ${{ steps.app.outputs.token || secrets.UPDATES_TOKEN }}
+          # One branch per dependency: a later run updates the same PR.
+          branch: updates/${{ matrix.name }}
+          delete-branch: true
+          title: ${{ steps.check.outputs.title }}
+          body-path: ${{ runner.temp }}/update/body.md
+          commit-message: ${{ steps.check.outputs.title }}
+          # Verified commits, as the app (not available with a personal token).
+          sign-commits: ${{ steps.app.outputs.token != '' }}
+
+  debian:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      issues: write
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Fail on purpose
+        if: inputs.fail == 'debian'
+        run: |
+          echo "::error::failing on purpose (workflow_dispatch input)"
+          exit 1
+
+      - name: Check
+        id: check
+        run: python3 scripts/updates/debian.py --out "$RUNNER_TEMP/update"
+
+      # One issue, kept up to date (an issue doesn't need to trigger CI, so
+      # the workflow's own token does).
+      - name: Issue
+        if: steps.check.outputs.changed == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TITLE: ${{ steps.check.outputs.title }}
+          BODY: ${{ runner.temp }}/update/body.md
+        run: |
+          prefix="Move the Docker images from Debian"
+          number=$(gh issue list --repo "$GITHUB_REPOSITORY" --state open --limit 200 --json number,title \
+            --jq "[.[] | select(.title | startswith(\"$prefix\"))][0].number // empty")
+          if [ -n "$number" ]; then
+            gh issue edit "$number" --repo "$GITHUB_REPOSITORY" --title "$TITLE" --body-file "$BODY"
+            echo "Updated issue #$number"
+          else
+            gh issue create --repo "$GITHUB_REPOSITORY" --title "$TITLE" --body-file "$BODY"
+          fi
+
+  # One "check failed" issue: opened or updated when any check fails,
+  # closed by the next run where they all succeed.
+  report:
+    needs: [update, debian]
+    if: always()
+    runs-on: ubuntu-latest
+    permissions:
+      issues: write
+      actions: read
+    env:
+      GH_TOKEN: ${{ github.token }}
+      RESULTS: ${{ join(needs.*.result, ' ') }}
+      RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+    steps:
+      - name: Open, update or close the failure issue
+        run: |
+          title="Dependency update check failed"
+          number=$(gh issue list --repo "$GITHUB_REPOSITORY" --state open --limit 200 --json number,title \
+            --jq "[.[] | select(.title == \"$title\")][0].number // empty")
+          echo "Results: $RESULTS"
+          case " $RESULTS " in
+            *" failure "*)
+              failed=$(gh api "repos/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID/attempts/$GITHUB_RUN_ATTEMPT/jobs" \
+                --paginate --jq '.jobs[] | select(.conclusion == "failure") | "- " + .name')
+              body=$(printf '%s\n' \
+                "The weekly dependency check failed in [run $GITHUB_RUN_ID]($RUN_URL) ($(date -u +%Y-%m-%d))." \
+                "" \
+                "Failed checks:" \
+                "" \
+                "$failed" \
+                "" \
+                "Each failed check's log says why (an API that didn't answer, a pin that moved, a hash that didn't match). Fix it, then re-run the workflow (Actions → Dependency updates → Run workflow); this issue closes when every check succeeds." \
+                "" \
+                "See scripts/updates/README.md.")
+              if [ -n "$number" ]; then
+                gh issue edit "$number" --repo "$GITHUB_REPOSITORY" --body "$body"
+                gh issue comment "$number" --repo "$GITHUB_REPOSITORY" --body "Failed again: $RUN_URL"
+              else
+                gh issue create --repo "$GITHUB_REPOSITORY" --title "$title" --body "$body"
+              fi
+              ;;
+            *" cancelled "*|*" skipped "*)
+              echo "Some checks didn't run; leaving the issue as it is."
+              ;;
+            *)
+              if [ -n "$number" ]; then
+                gh issue close "$number" --repo "$GITHUB_REPOSITORY" --comment "Every check succeeded in $RUN_URL."
+              fi
+              ;;
+          esac

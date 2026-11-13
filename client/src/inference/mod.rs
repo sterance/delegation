@@ -22,6 +22,8 @@ pub mod llama_cpp;
 pub mod process;
 pub mod runtime;
 pub mod select;
+#[cfg(test)]
+mod smoke;
 pub mod store;
 
 use log::info;

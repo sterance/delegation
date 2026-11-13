@@ -42,11 +42,15 @@ jobs:
       SIGNING: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' && vars.WINDOWS_SIGNING || 'none' }}
     steps:
       - uses: actions/checkout@v7
-      # Same version as rust-toolchain.toml.
-      - uses: dtolnay/rust-toolchain@master
+      # The version in rust-toolchain.toml (as in ci.yml).
+      - id: toolchain
+        shell: bash
+        run: echo "version=$(sed -n 's/^channel = "\(.*\)"\r\?$/\1/p' rust-toolchain.toml)" >> "$GITHUB_OUTPUT"
+      # Third-party actions are pinned to commits (Dependabot updates them).
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # v1
         with:
-          toolchain: 1.99.1
-      - uses: Swatinem/rust-cache@v2
+          toolchain: ${{ steps.toolchain.outputs.version }}
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
 
       - name: Test
         run: cargo test -p delegation-client
@@ -88,7 +92,7 @@ jobs:
 
       - name: Sign tray exe (SignPath)
         if: env.SIGNING == 'signpath'
-        uses: signpath/github-action-submit-signing-request@v3
+        uses: signpath/github-action-submit-signing-request@f6d04783b4569d051e0c80105fe66e82819d0092 # v3.0
         with:
           api-token: ${{ secrets.SIGNPATH_API_TOKEN }}
           organization-id: ${{ vars.SIGNPATH_ORGANIZATION_ID }}
@@ -125,18 +129,37 @@ jobs:
           Write-Output "$($sig.Status): $($sig.SignerCertificate.Subject)"
           if ($sig.Status -ne 'Valid') { exit 1 }
 
+      # Exactly the version in installer/inno-setup-version, so a release
+      # is reproducible (the weekly dependency update changes that file).
+      # The runner's preinstalled copy is used only if it's that version.
       - name: Install Inno Setup
         shell: pwsh
         run: |
-          if (-not (Test-Path "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe")) {
-            choco install innosetup --no-progress -y
+          $want = (Get-Content installer\inno-setup-version -Raw).Trim()
+          $iscc = "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe"
+          function Get-InnoVersion {
+            if (-not (Test-Path $iscc)) { return 'none' }
+            $v = (Get-Item $iscc).VersionInfo
+            "$($v.FileMajorPart).$($v.FileMinorPart).$($v.FileBuildPart)"
+          }
+          $have = Get-InnoVersion
+          Write-Output "Inno Setup: pinned $want, runner has $have"
+          if ($have -ne $want) {
+            choco install innosetup --version $want --allow-downgrade --force --no-progress -y
+            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+            Write-Output "Installed Inno Setup $(Get-InnoVersion)"
           }
 
       - name: Build installer
         shell: pwsh
         run: |
-          & "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe" /DAppVersion=$env:APP_VERSION installer\delegation.iss
+          $want = (Get-Content installer\inno-setup-version -Raw).Trim()
+          & "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe" /DAppVersion=$env:APP_VERSION installer\delegation.iss | Tee-Object -Variable log
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          # The compiler says which version it is; it must be the pinned one.
+          if (-not (($log -join "`n") -match "Compiler engine version: Inno Setup $([regex]::Escape($want))\b")) {
+            throw "the installer wasn't built with Inno Setup $want (installer/inno-setup-version)"
+          }
 
       # ---- Then the installer itself ----
 
@@ -153,7 +176,7 @@ jobs:
 
       - name: Sign installer (SignPath)
         if: env.SIGNING == 'signpath'
-        uses: signpath/github-action-submit-signing-request@v3
+        uses: signpath/github-action-submit-signing-request@f6d04783b4569d051e0c80105fe66e82819d0092 # v3.0
         with:
           api-token: ${{ secrets.SIGNPATH_API_TOKEN }}
           organization-id: ${{ vars.SIGNPATH_ORGANIZATION_ID }}

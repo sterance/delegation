@@ -174,8 +174,16 @@ impl OffloadLog {
     }
 }
 
+/// The llama.cpp log formats `parse_offloaded` and `parse_using_device`
+/// read, as they appear in `libllama`. The runtime-smoke CI job checks a
+/// new release still has them (`smoke.rs`).
+#[cfg(test)]
+pub(super) const OFFLOADED_FORMAT: &str = "offloaded %d/%d layers to GPU";
+#[cfg(test)]
+pub(super) const USING_DEVICE_FORMAT: &str = "using device %s (%s) (%s) - %zu MiB free";
+
 /// "…: offloaded 29/29 layers to GPU"
-fn parse_offloaded(line: &str) -> Option<GpuOffload> {
+pub(super) fn parse_offloaded(line: &str) -> Option<GpuOffload> {
     let rest = &line[line.find("offloaded ")? + "offloaded ".len()..];
     let (counts, tail) = rest.split_once(' ')?;
     if !tail.starts_with("layers to GPU") {
@@ -190,7 +198,7 @@ fn parse_offloaded(line: &str) -> Option<GpuOffload> {
 
 /// "…: using device CUDA0 (NVIDIA GeForce RTX 3070) (0000:01:00.0) - 7347 MiB free"
 /// -> "NVIDIA GeForce RTX 3070"
-fn parse_using_device(line: &str) -> Option<String> {
+pub(super) fn parse_using_device(line: &str) -> Option<String> {
     let rest = &line[line.find("using device ")? + "using device ".len()..];
     let rest = &rest[rest.find(" (")? + 2..];
     let rest = &rest[..rest.rfind(" - ")?];
@@ -618,17 +626,18 @@ async fn start_on(
 }
 
 /// What reaches the GPU.
-struct GpuArgs {
-    variant: String,
-    layers: GpuLayers,
-    fit_margin_mib: u64,
+pub(super) struct GpuArgs {
+    pub(super) variant: String,
+    pub(super) layers: GpuLayers,
+    pub(super) fit_margin_mib: u64,
 }
 
 /// Checked against `llama-server --help` of the pinned release (b12110:
-/// `-ngl N|auto|all`, `--fit on|off`, `--fit-target MiB`). The context is
-/// per slot: llama-server splits `-c` across its `-np` slots. `--fit` only
-/// adjusts what isn't set, so with `-c` given it chooses the GPU layers.
-fn server_args(
+/// `-ngl N|auto|all`, `--fit on|off`, `--fit-target MiB`), and again for
+/// every new release by the runtime-smoke CI job (`smoke.rs`). The context
+/// is per slot: llama-server splits `-c` across its `-np` slots. `--fit`
+/// only adjusts what isn't set, so with `-c` given it chooses the GPU layers.
+pub(super) fn server_args(
     model: &std::path::Path,
     port: u16,
     context: u64,
