@@ -427,7 +427,7 @@ async fn every_api_route_needs_a_session_except_the_public_ones() {
     for &(method, path) in &routes {
         let concrete: String = path
             .split('/')
-            .map(|seg| if seg.starts_with(':') { "x" } else { seg })
+            .map(|seg| if seg.starts_with('{') { "x" } else { seg })
             .collect::<Vec<_>>()
             .join("/");
         let uri = format!("/api{concrete}");

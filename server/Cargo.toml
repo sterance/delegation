@@ -7,14 +7,14 @@ rust-version = "1.99.1"
 [dependencies]
 protocol = { path = "../protocol" }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "time", "sync", "signal"] }
-axum = { version = "0.7", features = ["ws"] }
+axum = { version = "0.8", features = ["ws"] }
 tower-http = { version = "0.7.1", features = ["fs"] }
 rusqlite = { version = "0.31", features = ["bundled"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 base64 = "0.21"
-ed25519-dalek = "2"
-rand = "0.8"
+ed25519-dalek = "3"
+rand = "0.10"
 anyhow = "1"
 futures-util = "0.3"
 uuid = { version = "1", features = ["v4"] }

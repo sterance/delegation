@@ -31,7 +31,7 @@ use super::{ChatCompletion, InferenceError, InferenceEvent, Shared};
 use log::{debug, info, warn};
 use protocol::models::MIN_CONTEXT;
 use protocol::{GpuLayers, GpuOffload, InferenceSettings, RunInfo, Stage, Usage};
-use rand::Rng;
+use rand::RngExt as _;
 use serde_json::{json, Value};
 use std::collections::VecDeque;
 use std::net::SocketAddr;
@@ -526,7 +526,7 @@ async fn start_on(
     let parallel = settings.max_concurrent.max(1);
     let port = free_port().map_err(|e| format!("couldn't find a free port: {e}"))?;
     let addr = SocketAddr::from(([127, 0, 0, 1], port));
-    let api_key = hex::encode(rand::thread_rng().gen::<[u8; 32]>());
+    let api_key = hex::encode(rand::rng().random::<[u8; 32]>());
     let gpu = GpuArgs {
         variant: variant.to_string(),
         layers: model.settings.gpu_layers,

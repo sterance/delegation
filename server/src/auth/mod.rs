@@ -16,13 +16,12 @@ use crate::http::ApiError;
 use crate::ratelimit::RateLimiter;
 use anyhow::Result;
 use axum::{
-    async_trait,
     extract::FromRequestParts,
     http::{header, request::Parts, HeaderMap, HeaderValue},
 };
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use password::Hasher;
-use rand::RngCore;
+use rand::Rng as _;
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
@@ -236,7 +235,7 @@ pub fn new_session_token() -> (String, String) {
 /// `n` random bytes, base64url without padding.
 pub fn random_token(n: usize) -> String {
     let mut bytes = vec![0u8; n];
-    rand::thread_rng().fill_bytes(&mut bytes);
+    rand::rng().fill_bytes(&mut bytes);
     URL_SAFE_NO_PAD.encode(bytes)
 }
 
@@ -349,7 +348,6 @@ fn session_ctx(parts: &Parts) -> Result<SessionCtx, ApiError> {
         .ok_or_else(ApiError::unauthorized)
 }
 
-#[async_trait]
 impl<S: Send + Sync> FromRequestParts<S> for CurrentUser {
     type Rejection = ApiError;
 
@@ -358,7 +356,6 @@ impl<S: Send + Sync> FromRequestParts<S> for CurrentUser {
     }
 }
 
-#[async_trait]
 impl<S: Send + Sync> FromRequestParts<S> for CurrentSession {
     type Rejection = ApiError;
 
@@ -367,7 +364,6 @@ impl<S: Send + Sync> FromRequestParts<S> for CurrentSession {
     }
 }
 
-#[async_trait]
 impl<S: Send + Sync> FromRequestParts<S> for AdminUser {
     type Rejection = ApiError;
 
