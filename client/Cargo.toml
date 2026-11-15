@@ -40,7 +40,7 @@ sysinfo = { version = "0.40", default-features = false, features = ["system"] }
 nvml-wrapper = "0.13"
 # Model and runtime downloads: verified with SHA-256, then the llama.cpp
 # release archive (a .tar.gz on Linux, a .zip on Windows) is unpacked.
-sha2 = "0.10"
+sha2 = "0.11"
 hex = "0.4"
 tar = { version = "0.4", default-features = false }
 flate2 = "1"
