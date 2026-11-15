@@ -8,36 +8,13 @@ import MenuItem from '@mui/material/MenuItem'
 import Stack from '@mui/material/Stack'
 import TextField from '@mui/material/TextField'
 import Typography from '@mui/material/Typography'
-import { useEffect, useMemo, useState } from 'react'
-import { DEFAULT_DASHBOARD_CONFIG, errorMessage, getDashboardConfig, type Client, type DashboardConfig } from '../api'
+import { useMemo, useState } from 'react'
+import { DEFAULT_DASHBOARD_CONFIG, type Client } from '../api'
 import { useAuth } from '../auth/context'
 import AddClientModal from '../components/clients/AddClientModal'
 import ClientList from '../components/clients/ClientList'
 import { useClients } from '../hooks/useClients'
-
-/**
- * The server's DASHBOARD_* settings, fetched once. Null until loaded; if
- * that fails, the built-in defaults (the same values the server defaults to).
- */
-function useDashboardConfig(): DashboardConfig | null {
-  const [config, setConfig] = useState<DashboardConfig | null>(null)
-  useEffect(() => {
-    let cancelled = false
-    getDashboardConfig().then(
-      (loaded) => {
-        if (!cancelled) setConfig(loaded)
-      },
-      (err: unknown) => {
-        console.error(`Couldn't load /api/dashboard-config, using defaults: ${errorMessage(err)}`)
-        if (!cancelled) setConfig(DEFAULT_DASHBOARD_CONFIG)
-      },
-    )
-    return () => {
-      cancelled = true
-    }
-  }, [])
-  return config
-}
+import { useDashboardConfig } from '../hooks/useDashboardConfig'
 
 /** The admin's filter: everyone's clients, their own, or one user's (`user:<id>`). */
 type OwnerFilter = 'all' | 'mine' | `user:${string}`

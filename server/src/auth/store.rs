@@ -354,15 +354,17 @@ pub fn set_disabled(conn: &mut Connection, user_id: &str, disabled: bool) -> Res
 /// Deletes the user and, by cascade, their sessions, reset links,
 /// conversations, pairing codes and clients. Returns the deleted clients'
 /// ids (to disconnect them), or None if there's no such user.
+pub fn client_ids_of(conn: &Connection, user_id: &str) -> Result<Vec<String>> {
+    let mut stmt = conn.prepare("SELECT client_id FROM clients WHERE owner_user_id = ?1")?;
+    let ids = stmt
+        .query_map([user_id], |r| r.get(0))?
+        .collect::<rusqlite::Result<_>>()?;
+    Ok(ids)
+}
+
 pub fn delete_user(conn: &mut Connection, user_id: &str) -> Result<Option<Vec<String>>> {
     let tx = conn.transaction()?;
-    let clients: Vec<String> = {
-        let mut stmt = tx.prepare("SELECT client_id FROM clients WHERE owner_user_id = ?1")?;
-        let ids = stmt
-            .query_map([user_id], |r| r.get(0))?
-            .collect::<rusqlite::Result<_>>()?;
-        ids
-    };
+    let clients = client_ids_of(&tx, user_id)?;
     if tx.execute("DELETE FROM users WHERE id = ?1", [user_id])? == 0 {
         return Ok(None);
     }

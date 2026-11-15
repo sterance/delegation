@@ -24,6 +24,7 @@ import ChangePasswordModal from "./components/auth/ChangePasswordModal";
 import ThemeToggle from "./components/common/ThemeToggle";
 import Chat from "./pages/Chat";
 import Clients from "./pages/Clients";
+import Jobs from "./pages/Jobs";
 import Login from "./pages/Login";
 import ResetPassword from "./pages/ResetPassword";
 import Setup from "./pages/Setup";
@@ -35,6 +36,7 @@ import { ThemeModeContext } from "./themeMode";
 const NAV = [
   { label: "Clients", path: "/clients", admin: false },
   { label: "Chat", path: "/chat", admin: false },
+  { label: "Jobs", path: "/jobs", admin: false },
   { label: "Users", path: "/users", admin: true },
 ] as const;
 
@@ -250,6 +252,10 @@ export default function App() {
                 <Route
                   path="/chat"
                   element={<Chat />}
+                />
+                <Route
+                  path="/jobs"
+                  element={<Jobs />}
                 />
                 <Route
                   path="/users"

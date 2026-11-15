@@ -10,7 +10,8 @@ import { useTheme } from '@mui/material/styles'
 import Tooltip from '@mui/material/Tooltip'
 import Typography from '@mui/material/Typography'
 import useMediaQuery from '@mui/material/useMediaQuery'
-import { useState } from 'react'
+import { useEffect, useState } from 'react'
+import { useSearchParams } from 'react-router'
 import { useChat } from '../hooks/useChat'
 import ChatSidebar, { SIDEBAR_WIDTH } from '../components/chat/ChatSidebar'
 import Composer from '../components/chat/Composer'
@@ -18,6 +19,12 @@ import MessageList, { CHAT_COLUMN_MAX_WIDTH } from '../components/chat/MessageLi
 
 export default function Chat() {
   const chat = useChat()
+  // `/chat?c=<conversation id>` opens that conversation: the Jobs page links here.
+  const wanted = useSearchParams()[0].get('c')
+  const { selectChat } = chat
+  useEffect(() => {
+    if (wanted) selectChat(wanted)
+  }, [wanted, selectChat])
   const theme = useTheme()
   // Wide screens dock the sidebar beside the chat; narrow ones overlay it.
   const docked = useMediaQuery(theme.breakpoints.up('md'), { noSsr: true })

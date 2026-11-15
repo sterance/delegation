@@ -96,9 +96,32 @@ pub enum ClientMessage {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         usage: Option<Usage>,
     },
-    /// The reply to `request_id` failed; no more chunks follow.
+    /// The reply to `request_id` failed; no more chunks follow. `code` says
+    /// why where the server can act on it (a busy client's request goes
+    /// back to the queue); older clients don't send one.
     #[serde(rename = "chat_error")]
-    ChatError { request_id: String, error: String },
+    ChatError {
+        request_id: String,
+        error: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        code: Option<ChatErrorCode>,
+    },
+}
+
+/// Why a chat request failed, for the errors the server's job queue treats
+/// differently from a plain failure.
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ChatErrorCode {
+    /// Already generating max_concurrent replies.
+    Busy,
+    /// Mid-reply with a different model.
+    BusyWithAnotherModel,
+    /// The model isn't installed or can't be used right now.
+    ModelUnavailable,
+    /// Anything else, including codes newer than this build.
+    #[serde(other)]
+    Other,
 }
 
 // ---- WebSocket messages, server -> client ----
@@ -232,6 +255,27 @@ mod tests {
         assert_eq!(json, r#"{"type":"tick","seq":7,"metrics":null}"#);
         let back: ClientMessage = serde_json::from_str(&json).unwrap();
         assert!(matches!(back, ClientMessage::Tick(Tick { seq: 7, metrics: None })));
+    }
+
+    #[test]
+    fn chat_error_codes_are_optional_and_unknown_ones_parse_as_other() {
+        let parse = |wire: &str| match serde_json::from_str::<ClientMessage>(wire).unwrap() {
+            ClientMessage::ChatError { code, .. } => code,
+            other => panic!("expected chat_error, got {other:?}"),
+        };
+        // An older client: no code at all.
+        assert_eq!(parse(r#"{"type":"chat_error","request_id":"r","error":"e"}"#), None);
+        for (wire, code) in [
+            ("busy", ChatErrorCode::Busy),
+            ("busy_with_another_model", ChatErrorCode::BusyWithAnotherModel),
+            ("model_unavailable", ChatErrorCode::ModelUnavailable),
+            ("other", ChatErrorCode::Other),
+            // A newer client's code this build doesn't know.
+            ("out_of_memory", ChatErrorCode::Other),
+        ] {
+            let msg = format!(r#"{{"type":"chat_error","request_id":"r","error":"e","code":"{wire}"}}"#);
+            assert_eq!(parse(&msg), Some(code), "{wire}");
+        }
     }
 
     #[test]
@@ -402,8 +446,17 @@ mod tests {
                 ClientMessage::ChatError {
                     request_id: "r1".into(),
                     error: "nope".into(),
+                    code: None,
                 },
                 r#"{"type":"chat_error","request_id":"r1","error":"nope"}"#,
+            ),
+            (
+                ClientMessage::ChatError {
+                    request_id: "r1".into(),
+                    error: "busy".into(),
+                    code: Some(ChatErrorCode::BusyWithAnotherModel),
+                },
+                r#"{"type":"chat_error","request_id":"r1","error":"busy","code":"busy_with_another_model"}"#,
             ),
         ];
         for (msg, wire) in cases {

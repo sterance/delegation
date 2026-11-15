@@ -13,7 +13,7 @@ import Tooltip from '@mui/material/Tooltip'
 import Typography from '@mui/material/Typography'
 import { useLayoutEffect, useRef, useState, type KeyboardEvent } from 'react'
 import { isActive } from '../../api'
-import type { ChatMessage, ModelOption, Target } from '../../types/chat'
+import type { ChatMessage, ModelOption, RequeueNotice, Target } from '../../types/chat'
 import type { BranchStep } from '../../utils/tree'
 import BranchSwitcher from './BranchSwitcher'
 import ModelMenu from './ModelMenu'
@@ -38,9 +38,12 @@ export interface MessageActions {
   onOpenModels: () => void
 }
 
-/** The id of the option that answered this reply, if it's still available. */
-function optionFor(models: ModelOption[], m: ChatMessage): string | null {
-  return models.find((o) => o.target.client_id === m.client_id && o.target.model === m.model)?.id ?? null
+/** The option for the client and model that answered this reply, if it's still available. */
+function optionFor(models: ModelOption[], m: ChatMessage): ModelOption | null {
+  return (
+    models.find((o) => o.target.kind === 'client' && o.target.client_id === m.client_id && o.target.model === m.model) ??
+    null
+  )
 }
 
 function UserMessage({ step, actions }: { step: BranchStep; actions: MessageActions }) {
@@ -150,11 +153,38 @@ function StatusNote({ message }: { message: ChatMessage }) {
   }
 }
 
+/** What a queued reply is waiting for, from the scheduler's view of the queue. */
+function queueText(message: ChatMessage): string {
+  const queue = message.queue
+  // Not looked at yet: with a free client it's assigned in a moment.
+  if (!queue) return 'Starting…'
+  const label = queue.client_label
+  if (queue.waiting_for === 'a_client') {
+    return label ? `Waiting for ${label} to reconnect…` : 'Waiting for a client to connect…'
+  }
+  const ahead = queue.position > 1 ? ` (${queue.position - 1} ahead)` : ''
+  return label ? `Waiting for ${label} to be free${ahead}…` : `Waiting for a free client${ahead}…`
+}
+
 /** What a reply without text yet is doing. */
 function waitingText(message: ChatMessage): string {
-  if (message.status === 'queued') return 'Starting…'
+  if (message.status === 'queued') return queueText(message)
   if (message.stage === 'loading_model') return 'Loading model…'
   return `Waiting for ${message.client_label ?? 'the client'}…`
+}
+
+/** "{client} disconnected. Retrying on another client (attempt 2 of 3)…" */
+function requeueText(notice: RequeueNotice, message: ChatMessage): string {
+  const who = notice.previous_client_label ?? 'The client'
+  const what = {
+    lost: `${who} disconnected.`,
+    timed_out: `${who} went quiet.`,
+    refused: `${who} was busy.`,
+    interrupted: 'The server restarted.',
+  }[notice.reason]
+  // A directed reply waits for the same client; a pooled one goes elsewhere.
+  const where = !message.queue ? '' : message.queue.client_label ? ' when it\'s free' : ' on another client'
+  return `${what} Retrying${where} (attempt ${notice.attempt} of ${notice.max_attempts})…`
 }
 
 /** "51.2 tokens/s", and the details for a tooltip, where the client reported them. */
@@ -184,7 +214,8 @@ function AssistantMessage({ step, actions }: { step: BranchStep; actions: Messag
   const retryable = message.status === 'failed' || message.status === 'orphaned'
   // The display name while that model is still offered; the stored id otherwise.
   const modelName =
-    actions.models.find((o) => o.target.client_id === message.client_id && o.target.model === message.model)?.label ??
+    optionFor(actions.models, message)?.label ??
+    actions.models.find((o) => o.target.model === message.model)?.label ??
     message.model
   const answeredBy = [modelName, message.client_label].filter(Boolean).join(' · ')
   const speed = speedText(message)
@@ -196,6 +227,11 @@ function AssistantMessage({ step, actions }: { step: BranchStep; actions: Messag
   return (
     <Stack sx={{ alignItems: 'flex-start', '&:hover .message-actions': { opacity: 1 } }}>
       <Box sx={{ maxWidth: '100%', whiteSpace: 'pre-wrap', overflowWrap: 'anywhere' }}>
+        {active && message.requeue && (
+          <Typography variant="body2" color="warning.main" sx={{ mb: 0.5 }}>
+            {requeueText(message.requeue, message)}
+          </Typography>
+        )}
         {message.content && <Typography component="div">{message.content}</Typography>}
         {active && !message.content && (
           <Stack direction="row" spacing={1} sx={{ alignItems: 'center' }}>
@@ -252,7 +288,7 @@ function AssistantMessage({ step, actions }: { step: BranchStep; actions: Messag
         {answeredBy && (
           <Typography variant="caption" color="text.secondary" sx={{ ml: 0.5 }}>
             {answeredBy}
-            {message.attempts > 1 ? ` · attempt ${message.attempts}` : ''}
+            {message.attempts > 1 ? ` · ${active ? 'attempt' : 'answered on attempt'} ${message.attempts}` : ''}
           </Typography>
         )}
         {speed && (
@@ -270,7 +306,7 @@ function AssistantMessage({ step, actions }: { step: BranchStep; actions: Messag
         onClose={() => setMenu(null)}
         models={actions.models}
         heading={menu?.kind === 'retry' ? 'Retry with' : 'Regenerate with'}
-        selectedId={menu?.kind === 'retry' ? optionFor(actions.models, message) : (actions.model?.id ?? null)}
+        selectedId={menu?.kind === 'retry' ? (optionFor(actions.models, message)?.id ?? null) : (actions.model?.id ?? null)}
         onPick={(m) => {
           if (menu?.kind === 'retry') actions.onRetry(message, m.target)
           else actions.onRegenerate(message, m.target)

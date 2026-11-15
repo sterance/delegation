@@ -1,6 +1,7 @@
 //! `/ws`: a client's WebSocket. Challenge-response with its Ed25519 key,
 //! then ticks (metrics and liveness) in, chat requests out, and chat
-//! replies in, handed to the reply runner. Outside session auth: clients
+//! replies in, handed to the reply runner. Connecting, disconnecting and a
+//! new inventory each wake the job scheduler (through `Live`). Outside session auth: clients
 //! authenticate with their keys.
 
 use crate::live::{ConnHandle, SampleOutcome};
@@ -290,11 +291,15 @@ impl Session<'_> {
                     .replies
                     .on_client_event(self.conn.id, &request_id, ChatEvent::Done(usage));
             }
-            Ok(ClientMessage::ChatError { request_id, error }) => {
+            Ok(ClientMessage::ChatError {
+                request_id,
+                error,
+                code,
+            }) => {
                 log(format!("[chat] {request_id} failed on {client_id}: {error}"));
                 self.state
                     .replies
-                    .on_client_event(self.conn.id, &request_id, ChatEvent::Error(error));
+                    .on_client_event(self.conn.id, &request_id, ChatEvent::Error { error, code });
             }
             Ok(ClientMessage::Hello { .. } | ClientMessage::ChallengeResponse { .. }) => {
                 log(format!("[ws] unexpected handshake message from {client_id}"))

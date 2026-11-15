@@ -68,12 +68,35 @@ struct TestApp {
 }
 
 async fn test_app(extra: &[(&str, &str)]) -> TestApp {
-    let settings = settings(extra);
-    let db = db::open(":memory:", 3).unwrap();
+    test_app_tuned(extra, |_| {}).await
+}
+
+/// `tune` adjusts the parsed settings, for values below what `config.env`
+/// allows (a queue timeout of milliseconds, say).
+async fn test_app_tuned(extra: &[(&str, &str)], tune: impl FnOnce(&mut Settings)) -> TestApp {
+    let mut settings = settings(extra);
+    tune(&mut settings);
+    start(db::open(":memory:", 3).unwrap(), settings)
+}
+
+/// What `serve` does with a database: recovers interrupted jobs, then
+/// starts everything. Called again on the same database, it's a restart.
+fn start(db: db::Db, settings: Settings) -> TestApp {
+    let queue_timeout = settings.jobs.queue_timeout;
+    let recovered = db.blocking(|c| crate::jobs::store::recover(c, queue_timeout)).unwrap();
     let live = Arc::new(Live::new(settings.metrics));
     let auth = Arc::new(Auth::new(&settings).unwrap());
     let settings = Arc::new(settings);
-    let replies = ReplyRunner::new(db.clone(), live.clone(), settings.chat, settings.client.inference);
+    let replies = ReplyRunner::new(
+        db.clone(),
+        live.clone(),
+        settings.chat,
+        settings.client.inference,
+        settings.jobs,
+    );
+    for job in recovered.queued {
+        replies.submit(job);
+    }
     let state = AppState {
         db,
         live,
@@ -268,6 +291,12 @@ impl TestApp {
         self.connect_with(client_id, vec![model("echo", Backend::Echo, ModelState::Loaded)])
     }
 
+    /// The client's connection closes, as the WebSocket loop does it.
+    fn disconnect(&self, client_id: &str, conn: &ConnHandle) {
+        self.state.live.unregister(client_id, conn.id);
+        self.state.replies.on_connection_closed(conn.id);
+    }
+
     /// Connects a fake client reporting these models.
     fn connect_with(&self, client_id: &str, models: Vec<LocalModel>) -> ConnHandle {
         let conn = self.state.live.register(client_id);
@@ -391,12 +420,14 @@ async fn send_and_echo(
     (reader.await.unwrap(), messages)
 }
 
-/// The latest snapshot's text plus every chunk after it.
+/// The latest snapshot's text plus every chunk after it, starting again
+/// when the reply is re-queued, as the dashboard does.
 fn streamed_text(events: &[(String, Value)]) -> String {
     let mut text = String::new();
     for (name, data) in events {
         match name.as_str() {
             "snapshot" => text = data["content"].as_str().unwrap_or("").to_string(),
+            "requeued" => text.clear(),
             "chunk" => text.push_str(data["delta"].as_str().unwrap_or("")),
             _ => {}
         }
@@ -1145,13 +1176,16 @@ async fn clients_belong_to_whoever_minted_the_code() {
     );
 
     // Chat: the model list and sending follow the same rule.
-    let models = app.get("/api/chat/models", &alice).await.json;
+    let models = app.get("/api/chat/models", &alice).await.json["clients"].clone();
     assert_eq!(models.as_array().unwrap().len(), 1);
     assert_eq!(models[0]["client_id"], a1);
     assert_eq!(models[0]["client_name"], "Alice's PC");
+    let admins = app.get("/api/chat/models", &admin).await.json;
+    assert_eq!(admins["clients"].as_array().unwrap().len(), 2);
     assert_eq!(
-        app.get("/api/chat/models", &admin).await.json.as_array().unwrap().len(),
-        2
+        admins["pools"],
+        json!([]),
+        "the admin may use them directly, but neither is in the admin's pool"
     );
     let r = app
         .post(
@@ -1442,7 +1476,7 @@ async fn the_history_sent_follows_the_selected_branch() {
 
 #[tokio::test]
 async fn stop_retry_and_orphaning_through_the_api() {
-    let app = test_app(&[]).await;
+    let app = test_app(&[("JOB_MAX_ATTEMPTS", "1")]).await;
     app.setup_admin().await;
     let alice = app.signup("alice").await;
     let client = app.enroll(&alice, "alice-pc").await;
@@ -1491,7 +1525,7 @@ async fn stop_retry_and_orphaning_through_the_api() {
         .await;
     assert_eq!(r.status, StatusCode::CONFLICT, "cancelled replies aren't retried");
 
-    // The client dies mid-reply.
+    // The client dies mid-reply, on the reply's only attempt.
     let send = app
         .raw(Call {
             cookie: Some(&alice),
@@ -1504,11 +1538,14 @@ async fn stop_retry_and_orphaning_through_the_api() {
     app.state
         .replies
         .on_client_event(conn.id, &attempt, ChatEvent::Chunk("half".into()));
-    app.state.live.unregister(&client, conn.id);
-    app.state.replies.on_connection_closed(conn.id);
+    app.disconnect(&client, &conn);
     let events = reader.await.unwrap();
     let orphan = reply_id(&events);
     assert_eq!(ending(&events).1["status"], "orphaned");
+    assert_eq!(
+        ending(&events).1["error"],
+        "The client disconnected before the reply finished (1 attempt)."
+    );
 
     // Retry once it's back: same client and model by default.
     let mut conn = app.connect(&client);
@@ -1555,8 +1592,13 @@ async fn sends_are_validated() {
     let path = format!("/api/conversations/{}/messages", new_id());
     let send = |body: Value| app.post(&path, Some(&alice), body);
 
-    let pool = send(json!({ "content": "hi", "parent_id": null, "target": { "kind": "pool", "model": "echo" } })).await;
-    assert_eq!(pool.status, StatusCode::BAD_REQUEST);
+    let other =
+        send(json!({ "content": "hi", "parent_id": null, "target": { "kind": "anyone", "model": "echo" } })).await;
+    assert_eq!(
+        other.status,
+        StatusCode::BAD_REQUEST,
+        "only client and pool targets exist"
+    );
     let none = send(json!({ "content": "hi", "parent_id": null })).await;
     assert_eq!(none.status, StatusCode::BAD_REQUEST);
     assert_eq!(
@@ -1724,6 +1766,932 @@ async fn deleting_a_client_keeps_its_replies_readable() {
         .blocking(move |c| Ok(crate::conversations::message_state(c, &reply)?.unwrap().0))
         .unwrap();
     assert_eq!(status, MessageStatus::Completed);
+}
+
+// ---------------- the job queue ----------------
+
+fn pool() -> Value {
+    json!({ "kind": "pool", "model": "echo" })
+}
+
+/// Sends `content` as a new conversation to `target`; returns the
+/// conversation id and the task reading the reply's stream to its end.
+async fn start_send(
+    app: &TestApp,
+    cookie: &str,
+    content: &str,
+    target: Value,
+) -> (String, tokio::task::JoinHandle<Vec<(String, Value)>>) {
+    let conversation = new_id();
+    let response = app
+        .raw(Call {
+            cookie: Some(cookie),
+            body: Some(json!({ "content": content, "parent_id": null, "target": target })),
+            ..app.call(Method::POST, &format!("/api/conversations/{conversation}/messages"))
+        })
+        .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    (conversation, tokio::spawn(sse_events(response)))
+}
+
+/// The reply a conversation currently ends in.
+async fn leaf(app: &TestApp, cookie: &str, conversation: &str) -> String {
+    app.get(&format!("/api/conversations/{conversation}"), cookie)
+        .await
+        .json["active_leaf_id"]
+        .as_str()
+        .unwrap()
+        .to_string()
+}
+
+async fn message(app: &TestApp, cookie: &str, conversation: &str, id: &str) -> Value {
+    app.get(&format!("/api/conversations/{conversation}"), cookie)
+        .await
+        .json["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|m| m["id"] == id)
+        .unwrap()
+        .clone()
+}
+
+/// Waits for the writer to bring a reply's job to `status` (its message
+/// must agree), and returns its attempts' outcomes.
+async fn job_reaches(app: &TestApp, reply: &str, status: MessageStatus) -> Vec<String> {
+    for _ in 0..300 {
+        let id = reply.to_string();
+        let (job, message, outcomes) = app
+            .state
+            .db
+            .call(move |c| crate::jobs::store::job_state(c, &id))
+            .await
+            .unwrap();
+        assert_eq!(job, message, "the job and its message disagree");
+        if job == status {
+            return outcomes;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    panic!("the job never became {}", status.as_str());
+}
+
+/// Waits until the scheduler has told a queued reply where it stands.
+async fn queue_of(app: &TestApp, reply: &str) -> Value {
+    for _ in 0..300 {
+        if let Some((snapshot, _)) = app.state.replies.attach(reply) {
+            if let Some(queue) = &snapshot.queue {
+                assert_eq!(snapshot.status, MessageStatus::Queued);
+                return serde_json::to_value(queue).unwrap();
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    panic!("the reply never got a place in the queue");
+}
+
+fn events_named<'a>(events: &'a [(String, Value)], name: &str) -> Vec<&'a Value> {
+    events.iter().filter(|(n, _)| n == name).map(|(_, data)| data).collect()
+}
+
+/// Nothing is waiting to be written to this client's socket.
+async fn nothing_sent(conn: &mut ConnHandle) {
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert!(conn.outbound.try_recv().is_err(), "the client was sent something");
+}
+
+fn chunk(app: &TestApp, conn: &ConnHandle, attempt: &str, text: &str) {
+    app.state
+        .replies
+        .on_client_event(conn.id, attempt, ChatEvent::Chunk(text.into()));
+}
+
+fn done(app: &TestApp, conn: &ConnHandle, attempt: &str) {
+    app.state
+        .replies
+        .on_client_event(conn.id, attempt, ChatEvent::Done(None));
+}
+
+fn fail(app: &TestApp, conn: &ConnHandle, attempt: &str, error: &str, code: Option<protocol::ChatErrorCode>) {
+    app.state.replies.on_client_event(
+        conn.id,
+        attempt,
+        ChatEvent::Error {
+            error: error.into(),
+            code,
+        },
+    );
+}
+
+/// An app with Alice and one connected client of hers.
+async fn alice_with_a_client(extra: &[(&str, &str)]) -> (TestApp, String, String, ConnHandle) {
+    let app = test_app(extra).await;
+    app.setup_admin().await;
+    let alice = app.signup("alice").await;
+    let client = app.enroll(&alice, "alice-pc").await;
+    let conn = app.connect(&client);
+    (app, alice, client, conn)
+}
+
+/// An app with Alice and two connected clients of hers. The first has echo
+/// loaded and the second only available, so a pooled job goes to the first
+/// while it's free.
+async fn alice_with_two_clients(extra: &[(&str, &str)]) -> (TestApp, String, [String; 2], [ConnHandle; 2]) {
+    let app = test_app(extra).await;
+    app.setup_admin().await;
+    let alice = app.signup("alice").await;
+    let warm = app.enroll(&alice, "warm-pc").await;
+    let cold = app.enroll(&alice, "cold-pc").await;
+    let warm_conn = app.connect(&warm);
+    let cold_conn = app.connect_with(&cold, vec![model("echo", Backend::Echo, ModelState::Available)]);
+    (app, alice, [warm, cold], [warm_conn, cold_conn])
+}
+
+#[tokio::test]
+async fn a_directed_reply_waits_for_a_busy_client_then_runs() {
+    let (app, alice, client, mut conn) = alice_with_a_client(&[]).await;
+
+    // An idle client is assigned at once.
+    let started = std::time::Instant::now();
+    let (_, first) = start_send(&app, &alice, "first", target(&client)).await;
+    let (first_attempt, first_messages) = next_request(&mut conn).await;
+    assert!(
+        started.elapsed() < Duration::from_millis(500),
+        "the queue added {:?}",
+        started.elapsed()
+    );
+
+    // The client generates one reply at a time: the second waits for it.
+    let (conv, second) = start_send(&app, &alice, "second", target(&client)).await;
+    let reply = leaf(&app, &alice, &conv).await;
+    assert_eq!(
+        queue_of(&app, &reply).await,
+        json!({ "position": 1, "waiting_for": "a_free_client", "client_label": "alice-pc" })
+    );
+    assert_eq!(
+        job_reaches(&app, &reply, MessageStatus::Queued).await,
+        Vec::<String>::new()
+    );
+    assert_eq!(message(&app, &alice, &conv, &reply).await["status"], "queued");
+    nothing_sent(&mut conn).await;
+    // The card's dot follows the reply being generated, not the one waiting.
+    let card = app.get("/api/clients", &alice).await.json["clients"][0].clone();
+    assert_eq!((&card["active_jobs"], &card["queued_for"]), (&json!(1), &json!(1)));
+
+    // The first finishes: the second runs.
+    echo(&app, &conn, &first_attempt, &first_messages);
+    assert_eq!(ending(&first.await.unwrap()).1["status"], "completed");
+    let (second_attempt, second_messages) = next_request(&mut conn).await;
+    echo(&app, &conn, &second_attempt, &second_messages);
+    let events = second.await.unwrap();
+    assert_eq!(ending(&events).1["status"], "completed");
+    assert_eq!(streamed_text(&events), "second");
+    assert!(
+        events_named(&events, "status")
+            .iter()
+            .any(|s| s["status"] == "queued" && s["queue"]["position"] == 1),
+        "the stream heard where it stood: {events:?}"
+    );
+    let card = app.get("/api/clients", &alice).await.json["clients"][0].clone();
+    assert_eq!((&card["active_jobs"], &card["queued_for"]), (&json!(0), &json!(0)));
+}
+
+#[tokio::test]
+async fn pooled_replies_spread_across_clients_and_wait_when_all_are_busy() {
+    let (app, alice, _, [mut warm, mut cold]) = alice_with_two_clients(&[]).await;
+
+    // The first goes where the model is loaded; with that client busy, the
+    // second goes to the other.
+    let (_, first) = start_send(&app, &alice, "one", pool()).await;
+    let (a1, m1) = next_request(&mut warm).await;
+    let (_, second) = start_send(&app, &alice, "two", pool()).await;
+    let (a2, m2) = next_request(&mut cold).await;
+
+    // Both busy: the third waits for either.
+    let (conv, third) = start_send(&app, &alice, "three", pool()).await;
+    let reply = leaf(&app, &alice, &conv).await;
+    assert_eq!(
+        queue_of(&app, &reply).await,
+        json!({ "position": 1, "waiting_for": "a_free_client", "client_label": null })
+    );
+    nothing_sent(&mut warm).await;
+    nothing_sent(&mut cold).await;
+
+    // The cold client frees up first, so that's where it goes.
+    echo(&app, &cold, &a2, &m2);
+    let (a3, m3) = next_request(&mut cold).await;
+    echo(&app, &cold, &a3, &m3);
+    echo(&app, &warm, &a1, &m1);
+    for (reader, text) in [(first, "one"), (second, "two"), (third, "three")] {
+        let events = reader.await.unwrap();
+        assert_eq!(ending(&events).1["status"], "completed");
+        assert_eq!(streamed_text(&events), text);
+    }
+    let answered = message(&app, &alice, &conv, &reply).await;
+    assert_eq!(answered["client_label"], "cold-pc");
+}
+
+#[tokio::test]
+async fn a_pooled_reply_moves_to_another_client_when_its_client_disconnects() {
+    let (app, alice, [warm_id, _], [mut warm, mut cold]) = alice_with_two_clients(&[]).await;
+    let (conv, reader) = start_send(&app, &alice, "tell me", pool()).await;
+    let reply = leaf(&app, &alice, &conv).await;
+    let (first, _) = next_request(&mut warm).await;
+    chunk(&app, &warm, &first, "the first attempt's half");
+    job_reaches(&app, &reply, MessageStatus::Running).await;
+
+    // The answering client goes away mid-reply.
+    app.disconnect(&warm_id, &warm);
+    let (second, _) = next_request(&mut cold).await;
+    assert_ne!(second, first);
+    assert_eq!(
+        job_reaches(&app, &reply, MessageStatus::Assigned).await,
+        vec!["lost", "open"]
+    );
+
+    // It comes back and keeps talking about the attempt it lost: dropped.
+    let warm_again = app.connect(&warm_id);
+    for conn in [&warm, &warm_again] {
+        chunk(&app, conn, &first, " stale");
+        done(&app, conn, &first);
+    }
+    assert_eq!(message(&app, &alice, &conv, &reply).await["status"], "assigned");
+
+    chunk(&app, &cold, &second, "the second attempt");
+    done(&app, &cold, &second);
+    let events = reader.await.unwrap();
+    assert_eq!(ending(&events).1["status"], "completed");
+    let requeued = events_named(&events, "requeued");
+    assert_eq!(
+        requeued,
+        vec![&json!({
+            "attempt": 2,
+            "max_attempts": 3,
+            "reason": "lost",
+            "previous_client_label": "warm-pc",
+        })]
+    );
+    // A queued status follows the requeue, then the fresh reply.
+    let after: Vec<&str> = events
+        .iter()
+        .skip_while(|(name, _)| name != "requeued")
+        .map(|(name, _)| name.as_str())
+        .collect();
+    assert_eq!(after[1], "status", "{after:?}");
+    assert_eq!(
+        events
+            .iter()
+            .skip_while(|(name, _)| name != "requeued")
+            .nth(1)
+            .unwrap()
+            .1["status"],
+        "queued"
+    );
+
+    // Only the second attempt's output is stored.
+    let stored = message(&app, &alice, &conv, &reply).await;
+    assert_eq!(
+        (&stored["content"], &stored["client_label"], &stored["attempts"]),
+        (&json!("the second attempt"), &json!("cold-pc"), &json!(2))
+    );
+    assert_eq!(
+        job_reaches(&app, &reply, MessageStatus::Completed).await,
+        vec!["lost", "completed"]
+    );
+    // Still nothing from the stale attempt, even now.
+    chunk(&app, &warm_again, &first, " more");
+    assert_eq!(
+        message(&app, &alice, &conv, &reply).await["content"],
+        "the second attempt"
+    );
+}
+
+#[tokio::test]
+async fn a_pinned_reply_waits_for_its_client_to_reconnect() {
+    let (app, alice, client, mut conn) = alice_with_a_client(&[]).await;
+    let (conv, reader) = start_send(&app, &alice, "hold on", target(&client)).await;
+    let reply = leaf(&app, &alice, &conv).await;
+    let (first, _) = next_request(&mut conn).await;
+    chunk(&app, &conn, &first, "half");
+
+    app.disconnect(&client, &conn);
+    assert_eq!(
+        queue_of(&app, &reply).await,
+        json!({ "position": 1, "waiting_for": "a_client", "client_label": "alice-pc" })
+    );
+    let waiting = message(&app, &alice, &conv, &reply).await;
+    assert_eq!(
+        (&waiting["status"], &waiting["content"], &waiting["client_label"]),
+        (&json!("queued"), &json!(""), &Value::Null)
+    );
+
+    // Back after a blip: the same client gets the next attempt.
+    let mut conn = app.connect(&client);
+    let (second, messages) = next_request(&mut conn).await;
+    assert_ne!(second, first);
+    echo(&app, &conn, &second, &messages);
+    let events = reader.await.unwrap();
+    assert_eq!(ending(&events).1["status"], "completed");
+    assert_eq!(events_named(&events, "requeued")[0]["reason"], "lost");
+    assert_eq!(streamed_text(&events), "hold on", "the lost half is gone");
+    assert_eq!(
+        job_reaches(&app, &reply, MessageStatus::Completed).await,
+        vec!["lost", "completed"]
+    );
+}
+
+#[tokio::test]
+async fn a_reply_whose_client_never_returns_fails_at_the_deadline() {
+    let app = test_app_tuned(&[], |s| s.jobs.queue_timeout = Duration::from_millis(300)).await;
+    app.setup_admin().await;
+    let alice = app.signup("alice").await;
+    let client = app.enroll(&alice, "alice-pc").await;
+    let mut conn = app.connect(&client);
+    let (conv, reader) = start_send(&app, &alice, "anyone there?", target(&client)).await;
+    let reply = leaf(&app, &alice, &conv).await;
+    let (attempt, _) = next_request(&mut conn).await;
+    chunk(&app, &conn, &attempt, "half");
+    app.disconnect(&client, &conn);
+
+    let events = reader.await.unwrap();
+    let (_, end) = ending(&events);
+    assert_eq!(end["status"], "failed");
+    assert_eq!(end["error"], "alice-pc wasn't free (or connected) within 0 s.");
+    assert_eq!(job_reaches(&app, &reply, MessageStatus::Failed).await, vec!["lost"]);
+
+    // A pooled one says it differently.
+    let mut conn = app.connect(&client);
+    let (_, reader) = start_send(&app, &alice, "anyone at all?", pool()).await;
+    let (attempt, _) = next_request(&mut conn).await;
+    chunk(&app, &conn, &attempt, "half");
+    app.disconnect(&client, &conn);
+    assert_eq!(
+        ending(&reader.await.unwrap()).1["error"],
+        "No client offering echo was free within 0 s."
+    );
+}
+
+#[tokio::test]
+async fn an_idle_timeout_requeues_the_reply_instead_of_failing_it() {
+    let (app, alice, client, mut conn) = alice_with_a_client(&[("CHAT_IDLE_TIMEOUT_MS", "150")]).await;
+    let (conv, reader) = start_send(&app, &alice, "slow", target(&client)).await;
+    let reply = leaf(&app, &alice, &conv).await;
+    let (first, _) = next_request(&mut conn).await;
+
+    // Silence: the client is told to stop, and the reply is sent again.
+    assert!(matches!(
+        tokio::time::timeout(Duration::from_secs(2), conn.outbound.recv()).await,
+        Ok(Some(ServerMessage::ChatCancel { request_id })) if request_id == first
+    ));
+    let (second, messages) = next_request(&mut conn).await;
+    assert_ne!(second, first);
+    echo(&app, &conn, &second, &messages);
+    let events = reader.await.unwrap();
+    assert_eq!(ending(&events).1["status"], "completed");
+    assert_eq!(events_named(&events, "requeued")[0]["reason"], "timed_out");
+    assert_eq!(
+        job_reaches(&app, &reply, MessageStatus::Completed).await,
+        vec!["timed_out", "completed"]
+    );
+}
+
+#[tokio::test]
+async fn a_reply_is_orphaned_when_its_attempts_run_out_and_retry_gives_a_fresh_budget() {
+    let (app, alice, client, mut conn) = alice_with_a_client(&[("JOB_MAX_ATTEMPTS", "2")]).await;
+    let (conv, reader) = start_send(&app, &alice, "unlucky", target(&client)).await;
+    let reply = leaf(&app, &alice, &conv).await;
+    for _ in 0..2 {
+        let (attempt, _) = next_request(&mut conn).await;
+        chunk(&app, &conn, &attempt, "half");
+        app.disconnect(&client, &conn);
+        conn = app.connect(&client);
+    }
+    let events = reader.await.unwrap();
+    let (_, end) = ending(&events);
+    assert_eq!(end["status"], "orphaned");
+    assert_eq!(
+        end["error"],
+        "The client disconnected before the reply finished (2 attempts)."
+    );
+    assert_eq!(
+        events_named(&events, "requeued").len(),
+        1,
+        "only the first loss re-queued it"
+    );
+    nothing_sent(&mut conn).await;
+    assert_eq!(
+        job_reaches(&app, &reply, MessageStatus::Orphaned).await,
+        vec!["lost", "lost"]
+    );
+
+    // Manual Retry: two more attempts, so it survives another loss.
+    let response = app
+        .raw(Call {
+            cookie: Some(&alice),
+            ..app.call(Method::POST, &format!("/api/messages/{reply}/retry"))
+        })
+        .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let reader = tokio::spawn(sse_events(response));
+    let (attempt, _) = next_request(&mut conn).await;
+    chunk(&app, &conn, &attempt, "half");
+    app.disconnect(&client, &conn);
+    let mut conn = app.connect(&client);
+    let (attempt, messages) = next_request(&mut conn).await;
+    echo(&app, &conn, &attempt, &messages);
+    let events = reader.await.unwrap();
+    assert_eq!(ending(&events).1["status"], "completed");
+    assert_eq!(
+        events_named(&events, "requeued"),
+        vec![&json!({ "attempt": 4, "max_attempts": 4, "reason": "lost", "previous_client_label": "alice-pc" })]
+    );
+    let stored = message(&app, &alice, &conv, &reply).await;
+    assert_eq!(
+        (&stored["content"], &stored["attempts"]),
+        (&json!("unlucky"), &json!(4))
+    );
+    assert_eq!(
+        job_reaches(&app, &reply, MessageStatus::Completed).await,
+        vec!["lost", "lost", "lost", "completed"]
+    );
+}
+
+#[tokio::test]
+async fn a_busy_client_refuses_without_using_an_attempt_until_it_refuses_too_often() {
+    let (app, alice, client, mut conn) =
+        alice_with_a_client(&[("JOB_REFUSED_BACKOFF_MS", "150"), ("JOB_MAX_REFUSALS", "3")]).await;
+    let busy = Some(protocol::ChatErrorCode::Busy);
+
+    // Refused once, then accepted after the backoff.
+    let (conv, reader) = start_send(&app, &alice, "busy?", target(&client)).await;
+    let reply = leaf(&app, &alice, &conv).await;
+    let (first, _) = next_request(&mut conn).await;
+    let refused_at = std::time::Instant::now();
+    fail(&app, &conn, &first, "client busy", busy);
+    let (second, messages) = next_request(&mut conn).await;
+    assert!(
+        refused_at.elapsed() >= Duration::from_millis(150),
+        "placed again after {:?}",
+        refused_at.elapsed()
+    );
+    echo(&app, &conn, &second, &messages);
+    let events = reader.await.unwrap();
+    assert_eq!(ending(&events).1["status"], "completed");
+    assert_eq!(
+        events_named(&events, "requeued"),
+        vec![&json!({ "attempt": 1, "max_attempts": 3, "reason": "refused", "previous_client_label": "alice-pc" })],
+        "still on its first attempt"
+    );
+    assert_eq!(message(&app, &alice, &conv, &reply).await["attempts"], 1);
+    assert_eq!(
+        job_reaches(&app, &reply, MessageStatus::Completed).await,
+        vec!["refused", "completed"]
+    );
+
+    // Refused three times in a row: it fails, so a confused client can't
+    // loop forever.
+    let (conv, reader) = start_send(&app, &alice, "still busy?", target(&client)).await;
+    let reply = leaf(&app, &alice, &conv).await;
+    for _ in 0..3 {
+        let (attempt, _) = next_request(&mut conn).await;
+        fail(
+            &app,
+            &conn,
+            &attempt,
+            "busy with another model",
+            Some(protocol::ChatErrorCode::BusyWithAnotherModel),
+        );
+    }
+    let (_, end) = ending(&reader.await.unwrap());
+    assert_eq!(end["status"], "failed");
+    assert_eq!(
+        end["error"],
+        "Refused 3 times in a row; the last time: busy with another model"
+    );
+    assert_eq!(
+        job_reaches(&app, &reply, MessageStatus::Failed).await,
+        vec!["refused", "refused", "refused"]
+    );
+    assert_eq!(message(&app, &alice, &conv, &reply).await["attempts"], 0);
+    nothing_sent(&mut conn).await;
+}
+
+#[tokio::test]
+async fn errors_without_a_code_fail_the_reply_and_retry_keeps_its_target() {
+    let (app, alice, [warm_id, _], [mut warm, mut cold]) =
+        alice_with_two_clients(&[("JOB_REFUSED_BACKOFF_MS", "100")]).await;
+
+    // An older client sends no code: a failure, as it always was.
+    let (conv, reader) = start_send(&app, &alice, "break", pool()).await;
+    let reply = leaf(&app, &alice, &conv).await;
+    let (attempt, _) = next_request(&mut warm).await;
+    fail(&app, &warm, &attempt, "llama-server crashed", None);
+    let events = reader.await.unwrap();
+    let (_, end) = ending(&events);
+    assert_eq!(
+        (&end["status"], &end["error"]),
+        (&json!("failed"), &json!("llama-server crashed"))
+    );
+    assert!(events_named(&events, "requeued").is_empty());
+    assert_eq!(job_reaches(&app, &reply, MessageStatus::Failed).await, vec!["failed"]);
+    nothing_sent(&mut cold).await;
+
+    // Retry with no body: the job's original target, so a pooled reply
+    // retries pooled, wherever there's a client.
+    app.disconnect(&warm_id, &warm);
+    let response = app
+        .raw(Call {
+            cookie: Some(&alice),
+            ..app.call(Method::POST, &format!("/api/messages/{reply}/retry"))
+        })
+        .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let reader = tokio::spawn(sse_events(response));
+    let (attempt, messages) = next_request(&mut cold).await;
+    echo(&app, &cold, &attempt, &messages);
+    assert_eq!(ending(&reader.await.unwrap()).1["status"], "completed");
+    assert_eq!(message(&app, &alice, &conv, &reply).await["client_label"], "cold-pc");
+
+    // "The model isn't here" from one client of a pool: another may have
+    // it, so that's a refusal. For a pinned reply it's a failure.
+    let mut warm = app.connect(&warm_id);
+    let unavailable = Some(protocol::ChatErrorCode::ModelUnavailable);
+    let (_, reader) = start_send(&app, &alice, "pooled", pool()).await;
+    let (attempt, _) = next_request(&mut warm).await;
+    fail(&app, &warm, &attempt, "no such model", unavailable);
+    let (attempt, messages) = next_request(&mut cold).await;
+    echo(&app, &cold, &attempt, &messages);
+    let events = reader.await.unwrap();
+    assert_eq!(ending(&events).1["status"], "completed");
+    assert_eq!(events_named(&events, "requeued")[0]["reason"], "refused");
+
+    let (_, reader) = start_send(&app, &alice, "pinned", target(&warm_id)).await;
+    let (attempt, _) = next_request(&mut warm).await;
+    fail(&app, &warm, &attempt, "no such model", unavailable);
+    let (_, end) = ending(&reader.await.unwrap());
+    assert_eq!(
+        (&end["status"], &end["error"]),
+        (&json!("failed"), &json!("no such model"))
+    );
+}
+
+#[tokio::test]
+async fn stopping_or_deleting_a_queued_reply_sends_the_client_nothing() {
+    let (app, alice, client, mut conn) = alice_with_a_client(&[]).await;
+    let (_, _first) = start_send(&app, &alice, "busy with this", target(&client)).await;
+    let _ = next_request(&mut conn).await;
+
+    // Stop while queued.
+    let (conv, reader) = start_send(&app, &alice, "never mind", target(&client)).await;
+    let reply = leaf(&app, &alice, &conv).await;
+    queue_of(&app, &reply).await;
+    let stopped = app
+        .post(&format!("/api/messages/{reply}/cancel"), Some(&alice), json!({}))
+        .await;
+    assert_eq!(stopped.status, StatusCode::OK);
+    assert_eq!(stopped.json["status"], "cancelled");
+    assert_eq!(ending(&reader.await.unwrap()).1["status"], "cancelled");
+    assert!(job_reaches(&app, &reply, MessageStatus::Cancelled).await.is_empty());
+    nothing_sent(&mut conn).await;
+
+    // Deleting the conversation while its reply is queued does the same.
+    let (conv, reader) = start_send(&app, &alice, "or this", pool()).await;
+    let reply = leaf(&app, &alice, &conv).await;
+    queue_of(&app, &reply).await;
+    assert_eq!(
+        app.delete(&format!("/api/conversations/{conv}"), &alice).await.status,
+        StatusCode::NO_CONTENT
+    );
+    assert_eq!(ending(&reader.await.unwrap()).1["status"], "cancelled");
+    nothing_sent(&mut conn).await;
+    let jobs: i64 = app
+        .state
+        .db
+        .call(|c| Ok(c.query_row("SELECT COUNT(*) FROM jobs", [], |r| r.get(0))?))
+        .await
+        .unwrap();
+    assert_eq!(jobs, 2, "the deleted conversation took its job with it");
+    assert_eq!(app.state.replies.scheduler().queued_len(), 0);
+}
+
+#[tokio::test]
+async fn deleting_a_client_fails_the_replies_waiting_for_it() {
+    let (app, alice, client, mut conn) = alice_with_a_client(&[]).await;
+    let (_, running) = start_send(&app, &alice, "running", target(&client)).await;
+    let _ = next_request(&mut conn).await;
+    let (conv, waiting) = start_send(&app, &alice, "waiting", target(&client)).await;
+    let reply = leaf(&app, &alice, &conv).await;
+    queue_of(&app, &reply).await;
+
+    assert_eq!(
+        app.delete(&format!("/api/clients/{client}"), &alice).await.status,
+        StatusCode::NO_CONTENT
+    );
+    for reader in [running, waiting] {
+        let (_, end) = ending(&reader.await.unwrap());
+        assert_eq!(
+            (&end["status"], &end["error"]),
+            (&json!("failed"), &json!("That client was deleted."))
+        );
+    }
+    // With its client gone there's nothing to default a Retry to.
+    let retry = app
+        .post(&format!("/api/messages/{reply}/retry"), Some(&alice), json!({}))
+        .await;
+    assert_eq!(retry.status, StatusCode::BAD_REQUEST);
+    assert!(retry.error().contains("no longer exists"), "{}", retry.error());
+}
+
+#[tokio::test]
+async fn a_restart_requeues_an_active_reply_which_completes_once_a_client_connects() {
+    for (max_attempts, survives) in [("3", true), ("1", false)] {
+        let (app, alice, client, mut conn) = alice_with_a_client(&[("JOB_MAX_ATTEMPTS", max_attempts)]).await;
+        let (conv, _reader) = start_send(&app, &alice, "mid-reply", target(&client)).await;
+        let reply = leaf(&app, &alice, &conv).await;
+        let (attempt, _) = next_request(&mut conn).await;
+        chunk(&app, &conn, &attempt, "half");
+        job_reaches(&app, &reply, MessageStatus::Running).await;
+        // The text so far is flushed before the server goes down.
+        tokio::time::sleep(Duration::from_millis(150)).await;
+
+        // The server restarts: the same database, nothing in memory.
+        let app = start(app.state.db.clone(), (*app.state.settings).clone());
+        let stored = message(&app, &alice, &conv, &reply).await;
+        if !survives {
+            assert_eq!(
+                (&stored["status"], &stored["content"], &stored["error"]),
+                (
+                    &json!("orphaned"),
+                    &json!("half"),
+                    &json!("Interrupted by a server restart")
+                )
+            );
+            assert_eq!(
+                job_reaches(&app, &reply, MessageStatus::Orphaned).await,
+                vec!["interrupted"]
+            );
+            continue;
+        }
+        assert_eq!(
+            (&stored["status"], &stored["content"]),
+            (&json!("queued"), &json!("")),
+            "back in the queue, starting again"
+        );
+        assert_eq!(
+            job_reaches(&app, &reply, MessageStatus::Queued).await,
+            vec!["interrupted"]
+        );
+        assert_eq!(app.state.replies.scheduler().queued_len(), 1);
+
+        // Its client reconnects a few seconds later, and the reply runs.
+        let stream = app
+            .raw(Call {
+                cookie: Some(&alice),
+                ..app.call(Method::GET, &format!("/api/messages/{reply}/stream"))
+            })
+            .await;
+        let reader = tokio::spawn(sse_events(stream));
+        let mut conn = app.connect(&client);
+        let (second, messages) = next_request(&mut conn).await;
+        assert_ne!(second, attempt);
+        echo(&app, &conn, &second, &messages);
+        let events = reader.await.unwrap();
+        assert_eq!(ending(&events).1["status"], "completed");
+        assert_eq!(streamed_text(&events), "mid-reply");
+        assert_eq!(
+            job_reaches(&app, &reply, MessageStatus::Completed).await,
+            vec!["interrupted", "completed"]
+        );
+        assert_eq!(message(&app, &alice, &conv, &reply).await["attempts"], 2);
+    }
+}
+
+#[tokio::test]
+async fn pool_targets_need_a_client_and_the_queue_has_a_limit() {
+    let app = test_app(&[("JOB_QUEUE_MAX", "1")]).await;
+    let admin = app.setup_admin().await;
+    let alice = app.signup("alice").await;
+    let bob = app.signup("bob").await;
+    let bobs = app.enroll(&bob, "bob-pc").await;
+    let _bob_conn = app.connect(&bobs);
+    let send = |cookie: String, conversation: String, target: Value| {
+        let app = &app;
+        async move {
+            app.post(
+                &format!("/api/conversations/{conversation}/messages"),
+                Some(&cookie),
+                json!({ "content": "hi", "parent_id": null, "target": target }),
+            )
+            .await
+        }
+    };
+
+    // Nobody in Alice's pool offers the model: 409, and nothing is created.
+    let conversation = new_id();
+    let none = send(alice.clone(), conversation.clone(), pool()).await;
+    assert_eq!(none.status, StatusCode::CONFLICT);
+    assert_eq!(none.error(), "None of your clients offer echo right now.");
+    assert_eq!(
+        app.get(&format!("/api/conversations/{conversation}"), &alice)
+            .await
+            .status,
+        StatusCode::NOT_FOUND
+    );
+    // Bob's client doesn't count for the admin either: the admin may send
+    // to it directly, but it isn't in the admin's pool.
+    assert_eq!(send(admin.clone(), new_id(), pool()).await.status, StatusCode::CONFLICT);
+
+    let client = app.enroll(&alice, "alice-pc").await;
+    let mut conn = app.connect_with(
+        &client,
+        vec![
+            model("echo", Backend::Echo, ModelState::Loaded),
+            model("pulling", Backend::LlamaCpp, ModelState::Downloading),
+        ],
+    );
+    let downloading = send(alice.clone(), new_id(), json!({ "kind": "pool", "model": "pulling" })).await;
+    assert_eq!(downloading.status, StatusCode::CONFLICT, "not usable yet");
+
+    // One reply generating, one waiting: the queue (of one) is full.
+    let (_, _running) = start_send(&app, &alice, "one", pool()).await;
+    let _ = next_request(&mut conn).await;
+    let (conv, _waiting) = start_send(&app, &alice, "two", pool()).await;
+    queue_of(&app, &leaf(&app, &alice, &conv).await).await;
+    let full = send(alice.clone(), new_id(), pool()).await;
+    assert_eq!(full.status, StatusCode::TOO_MANY_REQUESTS);
+    assert!(full.headers.contains_key(header::RETRY_AFTER));
+    assert!(full.error().contains("queue is full"), "{}", full.error());
+}
+
+#[tokio::test]
+async fn the_reply_limits_count_queued_replies() {
+    let (app, alice, client, mut conn) = alice_with_a_client(&[("CHAT_MAX_ACTIVE_REPLIES_PER_USER", "2")]).await;
+    let (_, _running) = start_send(&app, &alice, "one", target(&client)).await;
+    let _ = next_request(&mut conn).await;
+    let (conv, _waiting) = start_send(&app, &alice, "two", pool()).await;
+    let reply = leaf(&app, &alice, &conv).await;
+    queue_of(&app, &reply).await;
+
+    // Two replies in progress (one of them only queued) is the limit.
+    let third = app
+        .post(
+            &format!("/api/conversations/{}/messages", new_id()),
+            Some(&alice),
+            json!({ "content": "three", "parent_id": null, "target": pool() }),
+        )
+        .await;
+    assert_eq!(third.status, StatusCode::TOO_MANY_REQUESTS);
+    assert!(third.error().contains("too many replies"), "{}", third.error());
+    // And a conversation whose reply is queued can't take another message.
+    let again = app
+        .post(
+            &format!("/api/conversations/{conv}/messages"),
+            Some(&alice),
+            json!({ "content": "again", "parent_id": reply, "target": pool() }),
+        )
+        .await;
+    assert_eq!(again.status, StatusCode::CONFLICT);
+}
+
+#[tokio::test]
+async fn a_pooled_job_never_lands_on_someone_elses_client() {
+    let app = test_app(&[]).await;
+    let admin = app.setup_admin().await;
+    let bob = app.signup("bob").await;
+    let admins = app.enroll(&admin, "admin-pc").await;
+    let bobs = app.enroll(&bob, "bob-pc").await;
+    let mut admin_conn = app.connect(&admins);
+    let mut bob_conn = app.connect(&bobs);
+
+    // The admin's own client is busy and Bob's is idle. The admin's pooled
+    // reply waits for the admin's client all the same.
+    let (_, first) = start_send(&app, &admin, "one", pool()).await;
+    let (a1, m1) = next_request(&mut admin_conn).await;
+    let (conv, second) = start_send(&app, &admin, "two", pool()).await;
+    let reply = leaf(&app, &admin, &conv).await;
+    assert_eq!(queue_of(&app, &reply).await["waiting_for"], "a_free_client");
+    nothing_sent(&mut bob_conn).await;
+
+    // A reply sent straight to Bob's client does go there.
+    let (_, direct) = start_send(&app, &admin, "direct", target(&bobs)).await;
+    let (a3, m3) = next_request(&mut bob_conn).await;
+    echo(&app, &bob_conn, &a3, &m3);
+    assert_eq!(ending(&direct.await.unwrap()).1["status"], "completed");
+
+    echo(&app, &admin_conn, &a1, &m1);
+    assert_eq!(ending(&first.await.unwrap()).1["status"], "completed");
+    let (a2, m2) = next_request(&mut admin_conn).await;
+    echo(&app, &admin_conn, &a2, &m2);
+    assert_eq!(ending(&second.await.unwrap()).1["status"], "completed");
+    nothing_sent(&mut bob_conn).await;
+}
+
+#[tokio::test]
+async fn the_jobs_api_lists_a_users_own_jobs_without_message_content() {
+    let app = test_app(&[]).await;
+    let admin = app.setup_admin().await;
+    let alice = app.signup("alice").await;
+    let bob = app.signup("bob").await;
+    let alices = app.enroll(&alice, "alice-pc").await;
+    let bobs = app.enroll(&bob, "bob-pc").await;
+    let mut alice_conn = app.connect(&alices);
+    let mut bob_conn = app.connect(&bobs);
+
+    // Alice: one finished (after losing its first attempt), one generating.
+    let (finished_conv, reader) = start_send(&app, &alice, "alice's secret question", pool()).await;
+    let (attempt, _) = next_request(&mut alice_conn).await;
+    app.disconnect(&alices, &alice_conn);
+    let mut alice_conn = app.connect(&alices);
+    let (attempt2, _) = next_request(&mut alice_conn).await;
+    assert_ne!(attempt, attempt2);
+    chunk(&app, &alice_conn, &attempt2, "alice's secret answer");
+    done(&app, &alice_conn, &attempt2);
+    assert_eq!(ending(&reader.await.unwrap()).1["status"], "completed");
+    let (_, _running) = start_send(&app, &alice, "another secret", target(&alices)).await;
+    let _ = next_request(&mut alice_conn).await;
+    // Bob: one finished.
+    let (_, reader) = start_send(&app, &bob, "bob's secret", target(&bobs)).await;
+    let (attempt, messages) = next_request(&mut bob_conn).await;
+    echo(&app, &bob_conn, &attempt, &messages);
+    assert_eq!(ending(&reader.await.unwrap()).1["status"], "completed");
+
+    let mine = app.get("/api/jobs", &alice).await;
+    assert_eq!(mine.status, StatusCode::OK);
+    let jobs = mine.json["jobs"].as_array().unwrap();
+    assert_eq!(jobs.len(), 2, "only her own: {}", mine.json);
+    // Newest first.
+    assert_eq!(
+        (
+            &jobs[0]["status"],
+            &jobs[0]["target"]["kind"],
+            &jobs[0]["target"]["client_label"]
+        ),
+        (&json!("assigned"), &json!("client"), &json!("alice-pc"))
+    );
+    let finished = &jobs[1];
+    assert_eq!(
+        (
+            &finished["kind"],
+            &finished["status"],
+            &finished["model"],
+            &finished["target"]["kind"],
+            &finished["attempts"],
+            &finished["max_attempts"],
+            &finished["conversation_id"],
+            &finished["owner"]["username"],
+        ),
+        (
+            &json!("chat_reply"),
+            &json!("completed"),
+            &json!("echo"),
+            &json!("pool"),
+            &json!(2),
+            &json!(3),
+            &json!(finished_conv),
+            &json!("alice"),
+        )
+    );
+    let history = finished["history"].as_array().unwrap();
+    let outcomes: Vec<&Value> = history.iter().map(|a| &a["outcome"]).collect();
+    assert_eq!(outcomes, vec![&json!("lost"), &json!("completed")]);
+    assert_eq!(
+        (&history[1]["number"], &history[1]["client_label"], &history[1]["model"]),
+        (&json!(2), &json!("alice-pc"), &json!("echo"))
+    );
+    assert!(history[1]["first_output_at"].is_string() && history[1]["ended_at"].is_string());
+    assert!(finished["queue_wait_ms"].is_u64() && finished["run_ms"].is_u64());
+
+    // Filters.
+    let active = app.get("/api/jobs?status=active", &alice).await.json;
+    assert_eq!(active["jobs"].as_array().unwrap().len(), 1);
+    assert_eq!(active["jobs"][0]["status"], "assigned");
+    let recent = app.get("/api/jobs?status=recent&limit=50", &alice).await.json;
+    assert_eq!(recent["jobs"].as_array().unwrap().len(), 1);
+    assert_eq!(recent["jobs"][0]["id"], finished["id"]);
+    assert_eq!(
+        app.get("/api/jobs?status=sideways", &alice).await.status,
+        StatusCode::BAD_REQUEST
+    );
+
+    // The admin sees their own by default, everyone's with all=1; nobody
+    // else may ask for that.
+    assert_eq!(app.get("/api/jobs", &admin).await.json["jobs"], json!([]));
+    let everyone = app.get("/api/jobs?all=1", &admin).await;
+    assert_eq!(everyone.json["jobs"].as_array().unwrap().len(), 3);
+    assert_eq!(app.get("/api/jobs?all=1", &bob).await.status, StatusCode::FORBIDDEN);
+
+    // One job: its owner and the admin, and a 404 for anyone else.
+    let one = format!("/api/jobs/{}", finished["id"].as_str().unwrap());
+    assert_eq!(app.get(&one, &alice).await.json["id"], finished["id"]);
+    assert_eq!(app.get(&one, &admin).await.status, StatusCode::OK);
+    assert_eq!(app.get(&one, &bob).await.status, StatusCode::NOT_FOUND);
+    assert_eq!(app.get("/api/jobs/nope", &alice).await.status, StatusCode::NOT_FOUND);
+
+    // Metadata only: no message text anywhere, for anyone.
+    for body in [&mine.json, &everyone.json] {
+        let text = body.to_string();
+        assert!(!text.contains("secret"), "message content leaked: {text}");
+    }
 }
 
 // ---------------- models on clients ----------------
@@ -1955,7 +2923,8 @@ async fn the_picker_lists_usable_models_on_clients_the_user_can_use() {
     );
     let _b = app.connect_with(&b1, vec![model("bobs", Backend::LlamaCpp, ModelState::Available)]);
 
-    let list = app.get("/api/chat/models", &alice).await.json;
+    let both = app.get("/api/chat/models", &alice).await.json;
+    let list = &both["clients"];
     let ids: Vec<&str> = list
         .as_array()
         .unwrap()
@@ -1966,8 +2935,31 @@ async fn the_picker_lists_usable_models_on_clients_the_user_can_use() {
     assert_eq!(list[1]["model_name"], "ready model");
     assert_eq!(list[1]["client_name"], "alice-pc");
     assert_eq!(list[1]["backend"], "llama_cpp");
+    // "Any of my clients": one entry per model her pool offers.
+    assert_eq!(
+        both["pools"],
+        json!([
+            { "model": "echo", "model_name": "echo model", "clients": 1, "loaded_on": 1 },
+            { "model": "ready", "model_name": "ready model", "clients": 1, "loaded_on": 0 },
+            { "model": "warm", "model_name": "warm model", "clients": 1, "loaded_on": 1 },
+        ])
+    );
     let all = app.get("/api/chat/models", &admin).await.json;
-    assert_eq!(all.as_array().unwrap().len(), 4, "the admin can use Bob's too");
+    assert_eq!(
+        all["clients"].as_array().unwrap().len(),
+        4,
+        "the admin can use Bob's too"
+    );
+    assert_eq!(all["pools"], json!([]), "but pools only their own clients");
+
+    // A second client of Alice's with the same model joins the pool.
+    let a2 = app.enroll(&alice, "alice-laptop").await;
+    let _a2 = app.connect_with(&a2, vec![model("ready", Backend::LlamaCpp, ModelState::Loaded)]);
+    let pools = app.get("/api/chat/models", &alice).await.json["pools"].clone();
+    assert_eq!(
+        pools[1],
+        json!({ "model": "ready", "model_name": "ready model", "clients": 2, "loaded_on": 1 })
+    );
 
     // Sending to a model that's still downloading is refused.
     let r = app
@@ -1986,7 +2978,10 @@ async fn the_picker_lists_usable_models_on_clients_the_user_can_use() {
     let alice = app.signup("alice").await;
     let a1 = app.enroll(&alice, "alice-pc").await;
     let _a = app.connect(&a1);
-    assert_eq!(app.get("/api/chat/models", &alice).await.json, json!([]));
+    assert_eq!(
+        app.get("/api/chat/models", &alice).await.json,
+        json!({ "pools": [], "clients": [] })
+    );
 }
 
 #[tokio::test]
@@ -2017,7 +3012,16 @@ async fn inference_echo_model_controls_echo_on_cards_and_in_chat() {
             "card, INFERENCE_ECHO_MODEL={on}: {detail}"
         );
         let list = app.get("/api/chat/models", &alice).await.json;
-        assert_eq!(ids_of(&list, "model"), ids, "chat, INFERENCE_ECHO_MODEL={on}: {list}");
+        assert_eq!(
+            ids_of(&list["clients"], "model"),
+            ids,
+            "chat, INFERENCE_ECHO_MODEL={on}: {list}"
+        );
+        assert_eq!(
+            ids_of(&list["pools"], "model"),
+            ids,
+            "pools, INFERENCE_ECHO_MODEL={on}: {list}"
+        );
     }
 }
 

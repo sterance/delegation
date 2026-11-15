@@ -18,7 +18,10 @@ interface Props {
   upward?: boolean
 }
 
-/** The models the user can chat with, grouped by client, to pick one for an action. */
+/**
+ * The models the user can chat with, to pick one for an action: "any of my
+ * clients" entries first, then each client's.
+ */
 export default function ModelMenu({ anchor, onClose, models, selectedId, onPick, heading, upward = false }: Props) {
   return (
     <Menu
@@ -33,8 +36,9 @@ export default function ModelMenu({ anchor, onClose, models, selectedId, onPick,
         <MenuItem disabled>No models available: connect a client, or install one from Clients</MenuItem>
       )}
       {models.flatMap((m, i) => {
-        // The list comes sorted by client, so a new client starts a new group.
-        const group = i === 0 || models[i - 1].target.client_id !== m.target.client_id
+        // The list comes sorted: pool entries, then client by client. A new
+        // heading starts a new group.
+        const group = i === 0 || models[i - 1].detail !== m.detail
         const item = (
           <MenuItem
             key={m.id}
@@ -45,12 +49,12 @@ export default function ModelMenu({ anchor, onClose, models, selectedId, onPick,
             }}
           >
             <ListItemIcon>{m.id === selectedId && <CheckIcon fontSize="small" />}</ListItemIcon>
-            <ListItemText primary={m.label} />
+            <ListItemText primary={m.label} secondary={m.note} />
           </MenuItem>
         )
         return group
           ? [
-              <ListSubheader key={`group-${m.target.client_id}`} sx={{ lineHeight: 2.5 }}>
+              <ListSubheader key={`group-${m.id}`} sx={{ lineHeight: 2.5 }}>
                 {m.detail}
               </ListSubheader>,
               item,

@@ -1,7 +1,7 @@
 # The server database
 
 The server keeps everything (accounts, sessions, clients, pairing codes,
-conversations) in one SQLite file, `delegation.db`, in WAL mode. In
+conversations, jobs) in one SQLite file, `delegation.db`, in WAL mode. In
 production it lives at `/opt/apps/delegation/data/delegation.db` on the host
 (`/app/data` in the `delegation` container, deployed by `sterance/infra`'s
 `deploy-backend.yml`). It's `data/delegation.db` for a native run, and the
@@ -53,6 +53,55 @@ persistence release) refuses every newer database. So if the deploy that
 first upgrades to version 2 fails and rolls back, restore the backup to
 recover (see below).
 
+## The job tables
+
+Migration 3 added the job queue's two tables. [`JOBS.md`](JOBS.md) describes
+how they're used.
+
+**`jobs`**: one row per job. Chat replies are the only kind so far.
+
+| Column | Meaning |
+|---|---|
+| `id` | The job's id. |
+| `kind` | `chat_reply`. |
+| `owner_user_id` | Whose job it is. Deleting the user deletes their jobs. |
+| `message_id` | The chat reply this job produces: unique, and required for `chat_reply` jobs. Deleting the message (with its conversation) deletes the job. |
+| `status` | `queued`, `assigned`, `running`, `completed`, `failed`, `cancelled` or `orphaned`. This is the truth; `messages.status` is written with the same value in the same transaction. |
+| `target_kind` | `client` (pinned to one client) or `pool` (any client in the owner's pool). |
+| `pinned_client_id` | The client a `client` job is pinned to. Set to NULL when that client is deleted, which a CHECK only allows once the job has finished, so the server fails such jobs before deleting the client. |
+| `model` | The model the job needs. |
+| `requirements_json` | Reserved for later requirements (minimum VRAM, say). NULL for now. |
+| `attempts`, `max_attempts` | Attempts that reached a client (refusals not counted), and how many it may have. A manual Retry raises `max_attempts`. |
+| `attempt_id`, `client_id` | The current attempt and the client that has it. NULL while queued. |
+| `error` | Why it failed or was orphaned. |
+| `created_at` | When it was first submitted. |
+| `queued_at` | When it last entered the queue. The scheduler serves oldest first. |
+| `deadline_at` | A queued job not assigned by then fails. |
+| `not_before` | Not assigned before this (backoff after a client refused it). |
+| `finished_at` | When it reached a final status. |
+
+**`job_attempts`**: one row each time a job was sent to a client.
+
+| Column | Meaning |
+|---|---|
+| `id` | The attempt id, sent to the client as the request's `request_id`. |
+| `job_id` | Its job. Deleted with it. |
+| `number` | 1, 2, 3 … A refused attempt doesn't use up a number, so the next one has the same. |
+| `client_id`, `client_label` | Who ran it. `client_id` becomes NULL if that client is deleted; the label still says who it was. |
+| `model` | The model it ran. |
+| `assigned_at`, `first_output_at`, `ended_at` | When it was sent, when its first output arrived, and when it ended. |
+| `outcome` | `completed`, `failed`, `cancelled`, `lost`, `timed_out`, `refused` or `interrupted`. NULL while it's running. |
+| `error` | What went wrong, if anything. |
+
+Replies from before migration 3 have no job. Retrying one creates a job for
+it. Deleting a conversation or a user cascades to their jobs and attempts,
+so `CHAT_RETENTION_DAYS` needs nothing extra.
+
+The migration only adds tables, so `min_compatible_version` stays 1: a
+rollback to the build before the job queue starts against this schema. That
+build ignores the job tables, and the next start of a newer build tidies up
+after it (see "Restart recovery" in [`JOBS.md`](JOBS.md)).
+
 ## Changing the schema
 
 1. Append a `Migration` to `MIGRATIONS` in `src/db/migrations.rs` with the
@@ -66,8 +115,9 @@ recover (see below).
 3. Run `cargo test -p delegation-server`. The tests check that the list is
    consecutive and that `min_compatible` never goes down. They also check
    that migration 1 still matches the schema the live databases were created
-   with, and that the schema accepts every `MessageStatus`, `MessageRole` and
-   `Role` the code has.
+   with, and that the schema accepts every `MessageStatus` (in `messages`
+   and in `jobs`), `MessageRole`, `Role`, `JobKind`, `TargetKind` and
+   `AttemptOutcome` the code has.
 4. **Never edit a migration that has been deployed.** Databases that ran it
    won't run it again, so an edit only reaches new databases, and the two
    drift apart. Put fixes in a new migration.
@@ -77,8 +127,10 @@ recover (see below).
 ### Table rebuilds
 
 SQLite can't change a column definition or a `CHECK` constraint in place.
-Adding a variant to `MessageStatus`, `MessageRole` or `Role` is one of these
-changes, because their allowed values are `CHECK` lists in the schema. Use
+Adding a variant to `MessageStatus`, `MessageRole`, `Role`, `JobKind`,
+`TargetKind` or `AttemptOutcome` is one of these changes, because their
+allowed values are `CHECK` lists in the schema. (A new `MessageStatus`
+means rebuilding both `messages` and `jobs`.) Use
 SQLite's table-rebuild procedure in a migration with
 `rebuilds_tables: true`:
 

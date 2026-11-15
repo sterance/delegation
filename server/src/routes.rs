@@ -12,7 +12,7 @@
 
 use crate::auth::{self, handlers as auth_api};
 use crate::http::{self, ApiError, ApiResult};
-use crate::{chat, clients, db, models, ws, AppState};
+use crate::{chat, clients, db, jobs, models, ws, AppState};
 use axum::{
     extract::{MatchedPath, Request, State},
     handler::Handler,
@@ -128,6 +128,9 @@ pub fn api_routes() -> ApiRoutes {
         .get("/messages/{id}/stream", chat::stream_message)
         .post("/messages/{id}/cancel", chat::cancel_message)
         .post("/messages/{id}/retry", chat::retry_message)
+        // jobs
+        .get("/jobs", jobs::api::list_jobs)
+        .get("/jobs/{id}", jobs::api::get_job)
 }
 
 pub fn is_public(method: &Method, path: &str) -> bool {

@@ -23,10 +23,12 @@
 //!   misreading it. Prefer additive changes; split a breaking change across
 //!   two releases where practical (add the new column and write both, then
 //!   drop the old one in a later release).
-//! - The `CHECK` lists for message statuses and roles are literals here, not
-//!   generated from the Rust enums. Adding a variant to `MessageStatus`,
-//!   `MessageRole` or `Role` needs a table-rebuild migration (below); a test
-//!   fails until there is one.
+//! - The `CHECK` lists for statuses, roles, job kinds, target kinds and
+//!   attempt outcomes are literals here, not generated from the Rust enums.
+//!   Adding a variant to `MessageStatus` (which is also `jobs.status`),
+//!   `MessageRole`, `Role`, `JobKind`, `TargetKind` or `AttemptOutcome`
+//!   needs a table-rebuild migration (below); a test fails until there is
+//!   one.
 //!
 //! # Table rebuilds
 //!
@@ -98,7 +100,71 @@ pub const MIGRATIONS: &[Migration] = &[
             )
         },
     },
+    Migration {
+        version: 3,
+        name: "add jobs and job_attempts",
+        // Only adds tables: a build from before the job queue still runs
+        // against it (and `jobs::store::recover` tidies up after one).
+        min_compatible: 1,
+        rebuilds_tables: false,
+        apply: |tx| sql(tx, V3_JOBS),
+    },
 ];
+
+/// Version 3: the job queue. `messages` is unchanged; a chat reply's job
+/// carries the same status as its message, written in the same transaction.
+const V3_JOBS: &str = r#"
+        CREATE TABLE jobs (
+          id                TEXT PRIMARY KEY,
+          kind              TEXT NOT NULL CHECK (kind IN ('chat_reply')),
+          owner_user_id     TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+          -- The chat reply this job produces. Required for chat_reply jobs.
+          message_id        TEXT UNIQUE REFERENCES messages(id) ON DELETE CASCADE,
+          status            TEXT NOT NULL CHECK (status IN ('queued','assigned','running','completed','failed','cancelled','orphaned')),
+          target_kind       TEXT NOT NULL CHECK (target_kind IN ('client','pool')),
+          -- Set for target_kind = 'client'. If the client is deleted, a queued job fails.
+          pinned_client_id  TEXT REFERENCES clients(client_id) ON DELETE SET NULL,
+          model             TEXT NOT NULL,
+          -- Reserved for later requirements (e.g. minimum VRAM); NULL for now.
+          requirements_json TEXT,
+          attempts          INTEGER NOT NULL DEFAULT 0,
+          max_attempts      INTEGER NOT NULL,
+          -- Who has the current attempt (NULL while queued).
+          attempt_id        TEXT,
+          client_id         TEXT REFERENCES clients(client_id) ON DELETE SET NULL,
+          error             TEXT,
+          created_at        TEXT NOT NULL,
+          -- When it last entered the queue; the scheduler serves oldest first.
+          queued_at         TEXT NOT NULL,
+          -- A queued job that isn't assigned by then fails.
+          deadline_at       TEXT,
+          -- Don't assign before this (backoff after a client refused it).
+          not_before        TEXT,
+          finished_at       TEXT,
+          CHECK (kind <> 'chat_reply' OR message_id IS NOT NULL),
+          CHECK (target_kind <> 'client' OR pinned_client_id IS NOT NULL OR status NOT IN ('queued','assigned','running'))
+        );
+        CREATE INDEX jobs_queued ON jobs(queued_at) WHERE status = 'queued';
+        CREATE INDEX jobs_active_by_owner ON jobs(owner_user_id) WHERE status IN ('queued','assigned','running');
+        CREATE INDEX jobs_by_client ON jobs(client_id);
+        CREATE INDEX jobs_by_pinned_client ON jobs(pinned_client_id);
+
+        CREATE TABLE job_attempts (
+          id               TEXT PRIMARY KEY,           -- the attempt_id sent as request_id
+          job_id           TEXT NOT NULL REFERENCES jobs(id) ON DELETE CASCADE,
+          number           INTEGER NOT NULL,           -- 1, 2, 3 …
+          client_id        TEXT REFERENCES clients(client_id) ON DELETE SET NULL,
+          client_label     TEXT NOT NULL,              -- who it was, even after deletion
+          model            TEXT NOT NULL,
+          assigned_at      TEXT NOT NULL,
+          first_output_at  TEXT,
+          ended_at         TEXT,
+          outcome          TEXT CHECK (outcome IN ('completed','failed','cancelled','lost','timed_out','refused','interrupted')),
+          error            TEXT
+        );
+        CREATE INDEX job_attempts_by_job ON job_attempts(job_id, number);
+        CREATE INDEX job_attempts_by_client ON job_attempts(client_id);
+        "#;
 
 /// The schema version this build creates and expects: the last migration's.
 pub const SCHEMA_VERSION: i64 = MIGRATIONS[MIGRATIONS.len() - 1].version;
@@ -602,6 +668,129 @@ mod tests {
         assert!(conn
             .execute("UPDATE messages SET status = 'bogus' WHERE id = 'm1'", [])
             .is_err());
+
+        // The job queue's lists: jobs.status, jobs.kind, jobs.target_kind
+        // and job_attempts.outcome.
+        use crate::jobs::{AttemptOutcome, JobKind, JobStatus, TargetKind};
+        let insert_job = |id: &str, kind: &str, status: &str, target_kind: &str| {
+            conn.execute(
+                "INSERT INTO jobs (id, kind, owner_user_id, message_id, status, target_kind, pinned_client_id,
+                   model, max_attempts, created_at, queued_at)
+                 VALUES (?1, ?2, 'u1', ?3, ?4, ?5, 'c1', 'm', 3, 't', 't')",
+                (id, kind, format!("s-{status}"), status, target_kind),
+            )
+        };
+        for status in JobStatus::ALL {
+            let status = status.as_str();
+            insert_job(&format!("j-{status}"), "chat_reply", status, "client")
+                .unwrap_or_else(|e| panic!("job status {status} is refused ({e}): {hint}"));
+        }
+        conn.execute("DELETE FROM jobs", []).unwrap();
+        for kind in JobKind::ALL {
+            insert_job("j", kind.as_str(), "queued", "client")
+                .unwrap_or_else(|e| panic!("job kind {} is refused ({e}): {hint}", kind.as_str()));
+            conn.execute("DELETE FROM jobs", []).unwrap();
+        }
+        for target_kind in TargetKind::ALL {
+            insert_job("j", "chat_reply", "queued", target_kind.as_str())
+                .unwrap_or_else(|e| panic!("target kind {} is refused ({e}): {hint}", target_kind.as_str()));
+            conn.execute("DELETE FROM jobs", []).unwrap();
+        }
+        insert_job("j", "chat_reply", "queued", "pool").unwrap();
+        for outcome in AttemptOutcome::ALL {
+            conn.execute(
+                "INSERT INTO job_attempts (id, job_id, number, client_label, model, assigned_at, outcome)
+                 VALUES (?1, 'j', 1, 'host', 'm', 't', ?1)",
+                [outcome.as_str()],
+            )
+            .unwrap_or_else(|e| panic!("attempt outcome {} is refused ({e}): {hint}", outcome.as_str()));
+        }
+        for bad in [
+            "UPDATE jobs SET status = 'bogus'",
+            "UPDATE jobs SET kind = 'bogus'",
+            "UPDATE jobs SET target_kind = 'bogus'",
+            "UPDATE job_attempts SET outcome = 'bogus'",
+            // A chat reply's job needs its message.
+            "UPDATE jobs SET message_id = NULL",
+            // An active job pinned to a client needs that client.
+            "UPDATE jobs SET target_kind = 'client', pinned_client_id = NULL",
+        ] {
+            assert!(conn.execute(bad, []).is_err(), "{bad} should be refused");
+        }
+        // Deleting the client an active job is pinned to is refused for the
+        // same reason (the reply runner fails such jobs first); once the
+        // job has ended, the client can go and the job just forgets it.
+        conn.execute("UPDATE jobs SET target_kind = 'client', pinned_client_id = 'c1'", [])
+            .unwrap();
+        assert!(conn.execute("DELETE FROM clients WHERE client_id = 'c1'", []).is_err());
+        conn.execute("UPDATE jobs SET status = 'failed'", []).unwrap();
+        conn.execute("DELETE FROM clients WHERE client_id = 'c1'", []).unwrap();
+        let pinned: Option<String> = conn
+            .query_row("SELECT pinned_client_id FROM jobs", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(pinned, None);
+    }
+
+    #[test]
+    fn migration_3_adds_the_job_tables_to_a_version_2_database_with_data() {
+        let dir = temp_dir("jobs");
+        let path = dir.join("delegation.db").to_string_lossy().into_owned();
+        {
+            let conn = open_with(&path, &MIGRATIONS[..2], 3).unwrap();
+            assert_eq!(version(&conn), 2);
+            fill_v1(&conn);
+            // A reply caught mid-generation by the upgrade.
+            conn.execute(
+                "INSERT INTO messages (id, conversation_id, parent_id, role, content, status, created_at)
+                 VALUES ('m3', 'conv', 'm1', 'assistant', 'half', 'running', 't')",
+                [],
+            )
+            .unwrap();
+        }
+        let mut conn = open_with(&path, MIGRATIONS, 3).unwrap();
+        assert!(version(&conn) >= 3);
+        // Everything that was there still is, untouched.
+        let counts: Vec<i64> = V1_TABLES.iter().map(|t| count(&conn, t)).collect();
+        assert_eq!(counts, [2, 1, 1, 1, 1, 1, 3]);
+        assert_eq!((count(&conn, "jobs"), count(&conn, "job_attempts")), (0, 0));
+        assert!(has_table(&conn, "jobs") && has_table(&conn, "job_attempts"));
+        // Additive: a build from before the job queue still starts.
+        let min: i64 = conn
+            .query_row("SELECT min_compatible_version FROM schema_meta", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(min, 1);
+        assert_eq!(MIGRATIONS[2].min_compatible, 1);
+        assert!(!MIGRATIONS[2].rebuilds_tables);
+        let backup = list_backups(&path).pop().expect("backed up first");
+        let copy = Connection::open(&backup).unwrap();
+        assert_eq!(version(&copy), 2);
+        assert!(!has_table(&copy, "jobs"));
+
+        // Old replies have no job: the one that was active is orphaned at
+        // startup as before, and a new job can point at an old message.
+        let recovery = crate::jobs::store::recover(&mut conn, std::time::Duration::from_secs(60)).unwrap();
+        assert_eq!(recovery.orphaned_without_job, 1);
+        let status: String = conn
+            .query_row("SELECT status FROM messages WHERE id = 'm3'", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(status, "orphaned");
+        conn.execute(
+            "INSERT INTO jobs (id, kind, owner_user_id, message_id, status, target_kind, pinned_client_id, model,
+               max_attempts, created_at, queued_at)
+             VALUES ('j1', 'chat_reply', 'u1', 'm3', 'queued', 'client', 'c1', 'echo', 3, 't', 't')",
+            [],
+        )
+        .unwrap();
+        // One job per reply.
+        assert!(conn
+            .execute(
+                "INSERT INTO jobs (id, kind, owner_user_id, message_id, status, target_kind, model, max_attempts,
+                   created_at, queued_at)
+                 VALUES ('j2', 'chat_reply', 'u1', 'm3', 'queued', 'pool', 'echo', 3, 't', 't')",
+                []
+            )
+            .is_err());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

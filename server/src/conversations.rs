@@ -10,22 +10,28 @@
 //! handlers answer 404 rather than 403.
 //!
 //! This module never changes a reply's status. Inserting a new reply as
-//! `queued` is its creation; every move after that belongs to `replies.rs`.
+//! `queued` (with its job, in the same transaction) is its creation; every
+//! move after that belongs to `replies.rs`.
 
-use crate::db::now_ts;
+use crate::db::{now_ts, ts};
+use crate::jobs::store::{self as job_store, QueuedReply};
+use crate::jobs::Target;
 use anyhow::Result;
 use protocol::{ChatRole, ChatTurn};
 use rusqlite::types::{FromSql, FromSqlError, FromSqlResult, ToSql, ToSqlOutput, ValueRef};
 use rusqlite::{Connection, OptionalExtension, Transaction};
 use serde::{Deserialize, Serialize};
+use std::time::{Duration, SystemTime};
 use uuid::Uuid;
 
 /// A message's state. User and system messages are always `completed`. An
-/// assistant reply goes `queued` (created, not yet sent) -> `assigned` (sent
+/// assistant reply goes `queued` (waiting for a client) -> `assigned` (sent
 /// to a client) -> `running` (first chunk received) -> one of the final
-/// four. These are the job states a future job queue will use. Mirrored in
-/// `frontend/src/types/chat.ts`; the database's CHECK constraint is built
-/// from `ALL`.
+/// four, or back to `queued` if the attempt is lost. These are the job
+/// states (`jobs::JobStatus` is this type), and a reply's status always
+/// equals its job's. Mirrored in `frontend/src/types/chat.ts`; the
+/// database's CHECK lists are literals in the migrations, compared with
+/// `ALL` by a test.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum MessageStatus {
@@ -35,8 +41,9 @@ pub enum MessageStatus {
     Completed,
     Failed,
     Cancelled,
-    /// The answering client went away mid-reply (or the server restarted).
-    /// The partial text is kept and the reply can be retried.
+    /// The answering client went away mid-reply (or the server restarted)
+    /// and the job had no attempts left. The partial text is kept and the
+    /// reply can be retried.
     Orphaned,
 }
 
@@ -404,6 +411,12 @@ pub struct NewTurn<'a> {
     /// earlier message when editing. None starts a new root.
     pub parent_id: Option<&'a str>,
     pub max_active_per_user: usize,
+    /// Who should answer: the reply's job is created with it.
+    pub target: &'a Target,
+    /// `JOB_MAX_ATTEMPTS`.
+    pub max_attempts: u32,
+    /// `JOB_QUEUE_TIMEOUT_SECS`.
+    pub queue_timeout: Duration,
 }
 
 pub struct CreatedTurn {
@@ -411,6 +424,8 @@ pub struct CreatedTurn {
     pub new_conversation: Option<ConversationSummary>,
     pub user_message: Option<Message>,
     pub reply: Message,
+    /// The reply's job, to hand to `ReplyRunner::submit`.
+    pub job: QueuedReply,
 }
 
 pub enum TurnOutcome {
@@ -423,8 +438,8 @@ pub enum TurnOutcome {
 
 /// The send transaction: creates the conversation if it doesn't exist yet
 /// (titled from the message), inserts the user message (unless
-/// regenerating) and an empty `queued` reply as its child, and points
-/// `active_leaf_id` at the reply.
+/// regenerating) and an empty `queued` reply as its child with the job
+/// that will produce it, and points `active_leaf_id` at the reply.
 pub fn create_turn(conn: &mut Connection, turn: NewTurn<'_>) -> Result<TurnOutcome> {
     let tx = conn.transaction()?;
     let now = now_ts();
@@ -535,6 +550,29 @@ pub fn create_turn(conn: &mut Connection, turn: NewTurn<'_>) -> Result<TurnOutco
             ),
         )?;
     }
+    // In the same transaction, so a reply can never exist without its job.
+    let job = QueuedReply {
+        job_id: Uuid::new_v4().to_string(),
+        message_id: reply.id.clone(),
+        conversation_id: turn.conversation_id.to_string(),
+        owner_user_id: turn.owner.to_string(),
+        target: turn.target.clone(),
+        attempts: 0,
+        max_attempts: turn.max_attempts,
+    };
+    job_store::insert_job(
+        &tx,
+        &job_store::NewJob {
+            id: &job.job_id,
+            owner_user_id: turn.owner,
+            message_id: &reply.id,
+            target: turn.target,
+            attempts: 0,
+            max_attempts: turn.max_attempts,
+            now: &now,
+            deadline_at: &ts(SystemTime::now() + turn.queue_timeout),
+        },
+    )?;
     tx.execute(
         "UPDATE conversations SET active_leaf_id = ?1, updated_at = ?2 WHERE id = ?3",
         (&reply.id, &now, turn.conversation_id),
@@ -548,6 +586,7 @@ pub fn create_turn(conn: &mut Connection, turn: NewTurn<'_>) -> Result<TurnOutco
         new_conversation,
         user_message,
         reply,
+        job,
     })))
 }
 
@@ -633,6 +672,8 @@ mod tests {
     use super::*;
     use crate::db::tests::{add_user, memory_db};
 
+    static POOL: Target = Target::Pool { model: String::new() };
+
     fn turn<'a>(owner: &'a str, conv: &'a str, content: Option<&'a str>, parent: Option<&'a str>) -> NewTurn<'a> {
         NewTurn {
             owner,
@@ -640,6 +681,9 @@ mod tests {
             content,
             parent_id: parent,
             max_active_per_user: 10,
+            target: &POOL,
+            max_attempts: 3,
+            queue_timeout: Duration::from_secs(120),
         }
     }
 

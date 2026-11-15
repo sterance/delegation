@@ -11,6 +11,7 @@
 //! broken cross-variable rule, stops the server with a message naming the
 //! variable, rather than quietly running on something else.
 
+use crate::jobs::JobSettings;
 use protocol::models::{MIN_CONTEXT, MIN_MODEL_LOAD_TIMEOUT_MS, MIN_PROGRESS_INTERVAL_MS};
 use protocol::telemetry::MIN_SAMPLER_INTERVAL_MS;
 use protocol::{valid_model_id, Backend, ClientSettings, InferenceSettings, ModelMeta, ModelSource, ModelSpec};
@@ -109,6 +110,8 @@ pub struct Settings {
     pub metrics: MetricsLimits,
     pub pairing_code_ttl_secs: u64,
     pub chat: ChatSettings,
+    /// `JOB_*`: the job queue.
+    pub jobs: JobSettings,
     pub dashboard: DashboardConfig,
     pub http: HttpSettings,
     pub auth: AuthSettings,
@@ -290,6 +293,13 @@ impl Settings {
         let chat_max_reply = p.int("CHAT_MAX_REPLY_CHARS", 400_000, 1);
         let chat_max_active = p.int("CHAT_MAX_ACTIVE_REPLIES_PER_USER", 3, 1);
 
+        // ---- jobs ----
+        let job_queue_timeout = p.int_in("JOB_QUEUE_TIMEOUT_SECS", 120, 5, 3_600);
+        let job_max_attempts = p.int_in("JOB_MAX_ATTEMPTS", 3, 1, 10);
+        let job_max_refusals = p.int_in("JOB_MAX_REFUSALS", 5, 1, 50);
+        let job_refused_backoff = p.int_in("JOB_REFUSED_BACKOFF_MS", 2_000, 100, 60_000);
+        let job_queue_max = p.int_in("JOB_QUEUE_MAX", 200, 1, 10_000);
+
         // ---- inference (pushed to clients) ----
         let inference_defaults = InferenceSettings::default();
         let inf_progress = p.int(
@@ -422,6 +432,13 @@ impl Settings {
                 "RECONNECT_BACKOFF_MAX_MS ({backoff_max}) must be at least RECONNECT_BACKOFF_INITIAL_MS ({backoff_initial})"
             ));
         }
+        // A pinned job waits for its client to come back. It must be able
+        // to wait out at least one full reconnect cycle.
+        if u64::from(job_queue_timeout) * 1_000 < backoff_max + liveness {
+            p.errors.push(format!(
+                "JOB_QUEUE_TIMEOUT_SECS ({job_queue_timeout}) x 1000 must be at least RECONNECT_BACKOFF_MAX_MS                  ({backoff_max}) + LIVENESS_TIMEOUT_MS ({liveness}), or a job waiting for its client could fail                  before the client finishes one reconnect cycle"
+            ));
+        }
         if min_spacing >= tick {
             p.errors.push(format!(
                 "METRICS_MIN_SPACING_MS ({min_spacing}) must be less than TICK_INTERVAL_MS ({tick}), \
@@ -529,6 +546,13 @@ impl Settings {
                 max_reply_chars: chat_max_reply as usize,
                 max_active_replies_per_user: chat_max_active as usize,
             },
+            jobs: JobSettings {
+                queue_timeout: Duration::from_secs(u64::from(job_queue_timeout)),
+                max_attempts: job_max_attempts,
+                max_refusals: job_max_refusals,
+                refused_backoff: Duration::from_millis(u64::from(job_refused_backoff)),
+                queue_max: job_queue_max as usize,
+            },
             http: HttpSettings {
                 public_origin,
                 extra_allowed_origins: extra_origins,
@@ -628,6 +652,15 @@ impl Settings {
                 self.chat.max_message_chars,
                 self.chat.max_reply_chars,
                 self.chat.max_active_replies_per_user
+            ),
+            format!(
+                "jobs: wait up to {} s in the queue, {} attempt(s), {} refusal(s) in a row, {} ms backoff after \
+                 a refusal, at most {} queued",
+                self.jobs.queue_timeout.as_secs(),
+                self.jobs.max_attempts,
+                self.jobs.max_refusals,
+                self.jobs.refused_backoff.as_millis(),
+                self.jobs.queue_max
             ),
             format!(
                 "inference (pushed to clients): {} at once, max {} tokens, default context {}, threads {}, \
@@ -1028,6 +1061,16 @@ mod tests {
             }
         );
         assert_eq!(
+            s.jobs,
+            JobSettings {
+                queue_timeout: Duration::from_secs(120),
+                max_attempts: 3,
+                max_refusals: 5,
+                refused_backoff: Duration::from_millis(2_000),
+                queue_max: 200,
+            }
+        );
+        assert_eq!(
             s.http,
             HttpSettings {
                 public_origin: "https://llm.smith-c.com".into(),
@@ -1155,6 +1198,37 @@ mod tests {
     }
 
     #[test]
+    fn job_settings_have_ranges_and_the_queue_timeout_covers_a_reconnect() {
+        for (key, low, high) in [
+            ("JOB_QUEUE_TIMEOUT_SECS", "4", "3601"),
+            ("JOB_MAX_ATTEMPTS", "0", "11"),
+            ("JOB_MAX_REFUSALS", "0", "51"),
+            ("JOB_REFUSED_BACKOFF_MS", "99", "60001"),
+            ("JOB_QUEUE_MAX", "0", "10001"),
+        ] {
+            rejects(&[(key, low)], key);
+            rejects(&[(key, high)], key);
+        }
+        let s = parse(&[
+            ("JOB_QUEUE_TIMEOUT_SECS", "3600"),
+            ("JOB_MAX_ATTEMPTS", "10"),
+            ("JOB_MAX_REFUSALS", "1"),
+            ("JOB_REFUSED_BACKOFF_MS", "100"),
+            ("JOB_QUEUE_MAX", "1"),
+        ])
+        .unwrap();
+        assert_eq!(s.jobs.queue_timeout, Duration::from_secs(3_600));
+        assert_eq!((s.jobs.max_attempts, s.jobs.max_refusals, s.jobs.queue_max), (10, 1, 1));
+
+        // The defaults: 120 000 >= 30 000 + 4 000. A queue timeout shorter
+        // than one reconnect cycle is refused, whichever side moves.
+        rejects(&[("JOB_QUEUE_TIMEOUT_SECS", "33")], "JOB_QUEUE_TIMEOUT_SECS");
+        assert!(parse(&[("JOB_QUEUE_TIMEOUT_SECS", "34")]).is_ok());
+        rejects(&[("RECONNECT_BACKOFF_MAX_MS", "120000")], "JOB_QUEUE_TIMEOUT_SECS");
+        assert!(parse(&[("RECONNECT_BACKOFF_MAX_MS", "116000")]).is_ok());
+    }
+
+    #[test]
     fn min_spacing_must_be_below_the_tick() {
         rejects(&[("METRICS_MIN_SPACING_MS", "1000")], "METRICS_MIN_SPACING_MS");
         rejects(
@@ -1227,6 +1301,7 @@ mod tests {
         assert_eq!(s.client, defaults.client, "the pushed values, inference included");
         assert_eq!(s.test_model, defaults.test_model);
         assert_eq!(s.chat, defaults.chat);
+        assert_eq!(s.jobs, defaults.jobs);
     }
 
     #[test]

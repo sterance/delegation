@@ -89,6 +89,10 @@ pub struct Snapshot {
 pub struct Live {
     /// Random per process start.
     pub epoch: String,
+    /// Notified when a client connects, disconnects or sends a new
+    /// inventory: the job scheduler's cue that a queued job may now have
+    /// somewhere to go (it uses this as its one wake-up signal).
+    pub changed: Arc<Notify>,
     limits: MetricsLimits,
     inner: Mutex<Inner>,
 }
@@ -122,6 +126,7 @@ impl Live {
         let bytes: [u8; 8] = rand::rng().random();
         Live {
             epoch: bytes.iter().map(|b| format!("{b:02x}")).collect(),
+            changed: Arc::new(Notify::new()),
             limits,
             inner: Mutex::new(Inner::default()),
         }
@@ -159,6 +164,7 @@ impl Live {
             old.kick.notify_one();
         }
         touch(&mut inner, client_id);
+        self.changed.notify_one();
         ConnHandle { id, kick, outbound }
     }
 
@@ -169,6 +175,7 @@ impl Live {
         let mut inner = self.lock();
         if inner.conns.get(client_id).is_some_and(|c| c.id == conn_id) {
             inner.conns.remove(client_id);
+            self.changed.notify_one();
             true
         } else {
             false
@@ -182,6 +189,7 @@ impl Live {
         match inner.conns.get_mut(client_id).filter(|c| c.id == conn_id) {
             Some(conn) => {
                 conn.inventory = Some(Arc::new(inventory));
+                self.changed.notify_one();
                 true
             }
             None => false,

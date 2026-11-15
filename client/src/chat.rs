@@ -6,9 +6,9 @@
 //! `respond`, which drops the `Inference::chat` future, which stops
 //! generation.
 
-use crate::inference::{ChatCompletion, Inference, InferenceEvent};
+use crate::inference::{ChatCompletion, Inference, InferenceError, InferenceEvent};
 use log::debug;
-use protocol::{ChatTurn, ClientMessage, Stage};
+use protocol::{ChatErrorCode, ChatTurn, ClientMessage, Stage};
 use std::time::Duration;
 use tokio::sync::mpsc;
 
@@ -121,10 +121,27 @@ pub async fn respond(
             ClientMessage::ChatError {
                 request_id,
                 error: error.to_string(),
+                code: error_code(&error),
             }
         }
     };
     let _ = out.send(last).await;
+}
+
+/// The errors the server's job queue acts on: a busy client's request goes
+/// back to the queue, and a pooled one whose model is missing here can run
+/// on another client. Everything else is a plain failure (no code).
+fn error_code(error: &InferenceError) -> Option<ChatErrorCode> {
+    match error {
+        InferenceError::Busy => Some(ChatErrorCode::Busy),
+        InferenceError::BusyWithAnotherModel(_) => Some(ChatErrorCode::BusyWithAnotherModel),
+        InferenceError::UnknownModel(_) | InferenceError::StillDownloading(_) => Some(ChatErrorCode::ModelUnavailable),
+        InferenceError::LoadFailed(_)
+        | InferenceError::Crashed(_)
+        | InferenceError::Backend(_)
+        | InferenceError::NoUserMessage
+        | InferenceError::Closed => None,
+    }
 }
 
 #[cfg(test)]
@@ -206,13 +223,34 @@ mod tests {
     async fn inference_errors_become_readable_chat_errors() {
         let got = run("nope", vec![turn(ChatRole::User, "hi")]).await;
         assert!(
-            matches!(got.as_slice(), [ClientMessage::ChatError { error, .. }] if error.contains("doesn't have the model \"nope\"")),
+            matches!(
+                got.as_slice(),
+                [ClientMessage::ChatError { error, code: Some(ChatErrorCode::ModelUnavailable), .. }]
+                    if error.contains("doesn't have the model \"nope\"")
+            ),
             "{got:?}"
         );
         let got = run("echo", vec![turn(ChatRole::Assistant, "hi")]).await;
         assert!(
-            matches!(got.as_slice(), [ClientMessage::ChatError { error, .. }] if error.contains("no user message")),
+            matches!(
+                got.as_slice(),
+                [ClientMessage::ChatError { error, code: None, .. }] if error.contains("no user message")
+            ),
             "{got:?}"
         );
+    }
+
+    #[test]
+    fn busy_errors_carry_the_codes_the_queue_acts_on() {
+        assert_eq!(error_code(&InferenceError::Busy), Some(ChatErrorCode::Busy));
+        assert_eq!(
+            error_code(&InferenceError::BusyWithAnotherModel("m".into())),
+            Some(ChatErrorCode::BusyWithAnotherModel)
+        );
+        assert_eq!(
+            error_code(&InferenceError::StillDownloading("m".into())),
+            Some(ChatErrorCode::ModelUnavailable)
+        );
+        assert_eq!(error_code(&InferenceError::LoadFailed("oom".into())), None);
     }
 }

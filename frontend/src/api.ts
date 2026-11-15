@@ -9,7 +9,7 @@
 import type {
   Backend,
   ChatMessage,
-  ChatModel,
+  ChatModels,
   Conversation,
   ConversationPage,
   MessageStatus,
@@ -40,6 +40,8 @@ export interface Client {
   can_manage: boolean
   /** Jobs (chat replies) it's working on now, whoever started them; the card's blue dot blinks while above 0. */
   active_jobs: number
+  /** Queued jobs waiting for this client in particular. They don't make the dot blink. */
+  queued_for: number
   // From the client's `info` message: null until the client has connected once.
   os: string | null
   client_version: string | null
@@ -543,9 +545,9 @@ export function cancelModelCommand(clientId: string, commandId: string): Promise
 
 // ---- chat ----
 
-/** Models on connected clients you can chat with. */
-export function listChatModels(): Promise<ChatModel[]> {
-  return request<ChatModel[]>('GET', '/api/chat/models')
+/** Models on connected clients you can chat with: per client, and pooled across your own. */
+export function listChatModels(): Promise<ChatModels> {
+  return request<ChatModels>('GET', '/api/chat/models')
 }
 
 export function listConversations(before?: string | null): Promise<ConversationPage> {
@@ -643,7 +645,7 @@ export function streamMessage(id: string, onEvent: (event: ReplyEvent) => void, 
   return streamReply('GET', `/api/messages/${encodeURIComponent(id)}/stream`, undefined, onEvent, signal)
 }
 
-/** A new attempt at a failed or interrupted reply; `target` defaults to the client that answered last time. */
+/** Retries a failed or interrupted reply in place; `target` defaults to what it was sent to (a pooled reply retries pooled). */
 export function retryMessage(
   id: string,
   target: Target | null,
@@ -651,6 +653,61 @@ export function retryMessage(
   signal?: AbortSignal,
 ): Promise<void> {
   return streamReply('POST', `/api/messages/${encodeURIComponent(id)}/retry`, target ? { target } : {}, onEvent, signal)
+}
+
+// ---- jobs: mirrors server/src/jobs/store.rs ----
+
+export type AttemptOutcome = 'completed' | 'failed' | 'cancelled' | 'lost' | 'timed_out' | 'refused' | 'interrupted'
+
+/** One attempt at a job. */
+export interface JobAttempt {
+  id: string
+  number: number
+  /** Null once that client has been deleted; the label keeps its name. */
+  client_id: string | null
+  client_label: string
+  model: string
+  assigned_at: string
+  first_output_at: string | null
+  ended_at: string | null
+  /** Null while it's running. */
+  outcome: AttemptOutcome | null
+  error: string | null
+}
+
+/** A job as `GET /api/jobs` returns it: metadata only, never message text. */
+export interface Job {
+  id: string
+  kind: 'chat_reply'
+  status: MessageStatus
+  owner: { user_id: string; username: string }
+  target: { kind: 'client' | 'pool'; client_id: string | null; client_label: string | null }
+  model: string
+  /** Attempts that reached a client, refusals not counted. */
+  attempts: number
+  max_attempts: number
+  error: string | null
+  created_at: string
+  queued_at: string
+  finished_at: string | null
+  message_id: string | null
+  conversation_id: string | null
+  /** How long it waited the last time it was queued (so far, if it's still waiting). */
+  queue_wait_ms: number | null
+  /** How long its newest attempt ran (so far, if it's still running). */
+  run_ms: number | null
+  /** Every attempt, oldest first. */
+  history: JobAttempt[]
+}
+
+/**
+ * The user's jobs: `active` (queued, assigned or running; oldest in the
+ * queue first) or `recent` (finished; newest first). `all` is for the
+ * admin: everyone's.
+ */
+export async function listJobs(status: 'active' | 'recent', limit: number, all = false): Promise<Job[]> {
+  const query = `?status=${status}&limit=${limit}${all ? '&all=1' : ''}`
+  return (await request<{ jobs: Job[] }>('GET', `/api/jobs${query}`)).jobs
 }
 
 export function isActive(status: MessageStatus): boolean {

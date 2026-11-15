@@ -2,8 +2,8 @@
 //! here; they never compare owners or roles themselves.
 //!
 //! Lending a client to another user (not built yet) slots in as:
-//! - a `Borrower(GrantId)` variant of [`ClientAccess`] that allows `View`
-//!   and `Use` but not `Manage`;
+//! - a `Borrower(GrantId)` variant of [`ClientAccess`] that allows `View`,
+//!   `Use` and `Pool` but not `Manage`;
 //! - one join against a `client_grants` table in [`VISIBLE_CLIENTS`];
 //! - nothing in the dashboard beyond the "Lent by …" wording, since it
 //!   decides what to show from `can_use` / `can_manage`.
@@ -29,6 +29,11 @@ pub enum ClientAction {
     View,
     /// Chat with it.
     Use,
+    /// Have it take the user's pooled jobs ("any of my clients"). Narrower
+    /// than `Use`: the admin may Use anyone's client directly, but a pooled
+    /// job must never land on a volunteer's machine just because the
+    /// admin's own clients are busy.
+    Pool,
     /// Rename or delete it.
     Manage,
 }
@@ -46,10 +51,49 @@ pub fn client_access(user: &User, client: &ClientListRow) -> Option<ClientAccess
 
 pub fn allows(access: ClientAccess, action: ClientAction) -> bool {
     match (access, action) {
-        (ClientAccess::Admin | ClientAccess::Owner, _) => true,
-        // (ClientAccess::Borrower(_), ClientAction::View | ClientAction::Use) => true,
+        (ClientAccess::Owner, _) => true,
+        // The admin's pool is the admin's own clients.
+        (ClientAccess::Admin, ClientAction::Pool) => false,
+        (ClientAccess::Admin, _) => true,
+        // (ClientAccess::Borrower(_), ClientAction::View | ClientAction::Use | ClientAction::Pool) => true,
         // (ClientAccess::Borrower(_), ClientAction::Manage) => false,
     }
+}
+
+/// A client a user's jobs might be placed on.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PlacementClient {
+    pub client_id: String,
+    /// What the dashboard calls it.
+    pub label: String,
+    /// A job pinned to it may run there.
+    pub can_use: bool,
+    /// It's in the user's pool.
+    pub can_pool: bool,
+}
+
+/// Every client `user_id`'s jobs may be placed on, for the scheduler, which
+/// asks again at each placement so a change in access (a deleted client,
+/// later a revoked loan) takes effect on the next one. None if the user no
+/// longer exists.
+pub fn placement_clients(conn: &Connection, user_id: &str) -> Result<Option<Vec<PlacementClient>>> {
+    let Some(row) = crate::auth::store::find_by_id(conn, user_id)? else {
+        return Ok(None);
+    };
+    let user = row.user;
+    let clients = visible_clients(conn, &user)?
+        .into_iter()
+        .filter_map(|client| {
+            let access = client_access(&user, &client)?;
+            Some(PlacementClient {
+                can_use: allows(access, ClientAction::Use),
+                can_pool: allows(access, ClientAction::Pool),
+                client_id: client.client_id,
+                label: client.friendly_name,
+            })
+        })
+        .collect();
+    Ok(Some(clients))
 }
 
 /// "Clients this user can see": the admin sees all, everyone else their
@@ -156,11 +200,44 @@ mod tests {
     }
 
     #[test]
-    fn admins_and_owners_may_do_everything() {
+    fn admins_and_owners_may_do_everything_but_the_admin_pools_only_their_own() {
         for access in [ClientAccess::Admin, ClientAccess::Owner] {
             for action in [ClientAction::View, ClientAction::Use, ClientAction::Manage] {
                 assert!(allows(access, action));
             }
         }
+        assert!(allows(ClientAccess::Owner, ClientAction::Pool));
+        assert!(!allows(ClientAccess::Admin, ClientAction::Pool));
+    }
+
+    #[test]
+    fn a_pool_is_the_users_own_clients_even_for_the_admin() {
+        let db = memory_db();
+        let admin_id = add_user(&db, "admin", "admin");
+        let alice_id = add_user(&db, "alice", "user");
+        add_client(&db, "a1", &alice_id);
+        add_client(&db, "z1", &admin_id);
+        db.blocking(|c| {
+            let pool = |clients: Vec<PlacementClient>, pooled: bool| {
+                let mut ids: Vec<String> = clients
+                    .into_iter()
+                    .filter(|c| if pooled { c.can_pool } else { c.can_use })
+                    .map(|c| c.client_id)
+                    .collect();
+                ids.sort();
+                ids
+            };
+            let admins = placement_clients(c, &admin_id)?.unwrap();
+            // The admin may send a job straight to Alice's client, but
+            // "any of my clients" means the admin's own.
+            assert_eq!(pool(admins.clone(), false), vec!["a1", "z1"]);
+            assert_eq!(pool(admins, true), vec!["z1"]);
+            let alices = placement_clients(c, &alice_id)?.unwrap();
+            assert_eq!(alices.len(), 1, "other people's clients aren't even listed");
+            assert_eq!(pool(alices, true), vec!["a1"]);
+            assert_eq!(placement_clients(c, "nobody")?, None);
+            Ok(())
+        })
+        .unwrap();
     }
 }

@@ -23,6 +23,17 @@ export function formatDuration(totalSeconds: number): string {
   return plural(totalSeconds, 'second')
 }
 
+/** A measured time: 850 -> "850 ms", 12300 -> "12.3 s", 185000 -> "3 min 5 s". Null is "–". */
+export function formatElapsed(ms: number | null | undefined): string {
+  if (ms === null || ms === undefined) return '–'
+  if (ms < 1000) return `${Math.round(ms)} ms`
+  const seconds = ms / 1000
+  if (seconds < 60) return `${seconds.toFixed(1)} s`
+  const minutes = Math.floor(seconds / 60)
+  if (minutes < 60) return `${minutes} min ${Math.round(seconds - minutes * 60)} s`
+  return `${Math.floor(minutes / 60)} h ${minutes % 60} min`
+}
+
 function trimNumber(value: number, decimals: number): string {
   return value.toFixed(decimals).replace(/\.?0+$/, '')
 }

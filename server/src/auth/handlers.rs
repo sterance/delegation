@@ -476,8 +476,15 @@ pub async fn delete_user(
     if user_id == admin.id {
         return Err(ApiError::bad_request("You can't delete your own account."));
     }
-    // Stop their replies first, so nothing writes to rows being deleted.
+    // Stop their replies first, so nothing writes to rows being deleted, and
+    // fail anyone else's replies pinned to their clients (the admin's),
+    // which go with the account.
     state.replies.cancel_owner(&user_id).await;
+    let id = user_id.clone();
+    let their_clients = state.db.call(move |c| store::client_ids_of(c, &id)).await?;
+    for client_id in &their_clients {
+        state.replies.fail_pinned_to(client_id).await;
+    }
     let id = user_id.clone();
     let Some(clients) = state.db.call(move |c| store::delete_user(c, &id)).await? else {
         return Err(ApiError::not_found());

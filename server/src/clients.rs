@@ -56,6 +56,9 @@ pub struct ClientListEntry {
     /// to it until it ends, whoever started them. Drives the card's blinking
     /// blue dot.
     active_jobs: usize,
+    /// Queued jobs pinned to it, waiting for it to be free (or to
+    /// reconnect). These don't make the dot blink.
+    queued_for: usize,
     /// The rest come from the client's `info` message, so they're null
     /// until the client has connected at least once.
     os: Option<String>,
@@ -105,6 +108,7 @@ pub async fn list_clients(
     let since = query.since.unwrap_or(0);
     let mut snapshot = state.live.snapshot(since);
     let active_jobs = state.replies.active_jobs();
+    let queued_for = state.replies.scheduler().queued_for();
     let mut active_pulls = state.model_commands.active_pulls();
     // The cursor only reflects samples this user gets, so it says nothing
     // about other people's clients.
@@ -153,6 +157,7 @@ pub async fn list_clients(
                 can_use: access::allows(access, ClientAction::Use),
                 can_manage: access::allows(access, ClientAction::Manage),
                 active_jobs: active_jobs.get(&r.client_id).copied().unwrap_or(0),
+                queued_for: queued_for.get(&r.client_id).copied().unwrap_or(0),
                 client_id: r.client_id,
                 hostname: r.hostname,
                 friendly_name: r.friendly_name,
@@ -227,13 +232,17 @@ pub async fn update_client(
 
 /// `DELETE /api/clients/:id` (Manage). Closes its socket if it's connected;
 /// it then reconnects, gets `unknown client_id`, and clears its identity.
-/// Replies it gave stay readable under its saved name.
+/// Replies it gave stay readable under its saved name. Replies still
+/// waiting for it (or running on it at its owner's or the admin's direct
+/// request) fail first; pooled ones it was running go back to the queue
+/// when its connection closes.
 pub async fn delete_client(
     State(state): State<AppState>,
     CurrentUser(user): CurrentUser,
     Path(client_id): Path<String>,
 ) -> ApiResult<StatusCode> {
     require(&state, &user, &client_id, ClientAction::Manage).await?;
+    state.replies.fail_pinned_to(&client_id).await;
     let id = client_id.clone();
     if !state.db.call(move |c| db::delete_client(c, &id)).await? {
         return Err(ApiError::not_found());

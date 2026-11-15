@@ -6,6 +6,7 @@ mod config;
 mod conversations;
 mod db;
 mod http;
+mod jobs;
 mod live;
 mod metrics;
 mod models;
@@ -41,7 +42,7 @@ pub struct AppState {
     pub settings: Arc<Settings>,
     /// Sessions cache, rate limits, password hashing, the setup token.
     pub auth: Arc<Auth>,
-    /// Every chat reply being generated.
+    /// Every chat reply that hasn't ended, and through it the job queue.
     pub replies: Arc<ReplyRunner>,
     /// The models clients may be told to install.
     pub catalog: Arc<Catalog>,
@@ -164,13 +165,31 @@ async fn serve(settings: Settings) -> ExitCode {
         settings.db_path,
         db::SCHEMA_VERSION
     ));
-    match db.blocking(ReplyRunner::orphan_interrupted) {
-        Ok(0) => {}
-        Ok(n) => log(format!(
-            "[reply] {n} reply(s) interrupted by the last shutdown marked orphaned"
-        )),
-        Err(e) => log(format!("[reply] error orphaning interrupted replies: {e:#}")),
-    }
+    // Before anything is served: nothing is running any more, so jobs that
+    // were mid-attempt go back to the queue.
+    let queue_timeout = settings.jobs.queue_timeout;
+    let recovered = match db.blocking(|c| jobs::store::recover(c, queue_timeout)) {
+        Ok(recovery) => {
+            let interrupted = recovery.requeued + recovery.orphaned + recovery.orphaned_without_job + recovery.settled;
+            if interrupted > 0 || !recovery.queued.is_empty() {
+                log(format!(
+                    "[jobs] recovered from the last shutdown: {} job(s) back in the queue after an interrupted \
+                     attempt, {} out of attempts (orphaned), {} repl(ies) without a job orphaned, {} job(s) \
+                     settled from their replies; {} queued in all",
+                    recovery.requeued,
+                    recovery.orphaned,
+                    recovery.orphaned_without_job,
+                    recovery.settled,
+                    recovery.queued.len()
+                ));
+            }
+            recovery.queued
+        }
+        Err(e) => {
+            log(format!("[jobs] error recovering interrupted jobs: {e:#}"));
+            Vec::new()
+        }
+    };
 
     let live = Arc::new(Live::new(settings.metrics));
     log(format!("[live] epoch {}", live.epoch));
@@ -182,7 +201,17 @@ async fn serve(settings: Settings) -> ExitCode {
         }
     };
     let settings = Arc::new(settings);
-    let replies = ReplyRunner::new(db.clone(), live.clone(), settings.chat, settings.client.inference);
+    let replies = ReplyRunner::new(
+        db.clone(),
+        live.clone(),
+        settings.chat,
+        settings.client.inference,
+        settings.jobs,
+    );
+    // They wait for their clients to reconnect, up to their deadline.
+    for job in recovered {
+        replies.submit(job);
+    }
     let state = AppState {
         db,
         live,

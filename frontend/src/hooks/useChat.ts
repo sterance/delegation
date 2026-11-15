@@ -13,7 +13,17 @@ import {
   streamMessage,
   updateConversation,
 } from '../api'
-import type { ChatMessage, Conversation, ConversationSummary, ModelOption, ReplyEvent, Target } from '../types/chat'
+import { useAuth } from '../auth/context'
+import {
+  POOL_LABEL,
+  sameTarget,
+  type ChatMessage,
+  type Conversation,
+  type ConversationSummary,
+  type ModelOption,
+  type ReplyEvent,
+  type Target,
+} from '../types/chat'
 import { branch, childIndex, latestLeaf, type BranchStep } from '../utils/tree'
 
 // All chat state lives here, behind a small set of actions, so the
@@ -41,7 +51,11 @@ interface State {
   listError: string | null
   /** Null is a fresh "new chat": nothing is created until the first send. */
   open: Open | null
-  /** The user's pick. If it's gone from the model list, the first model is used instead. */
+  /**
+   * The user's pick, remembered per user. If it's gone from the model list
+   * (or there's none yet), the first entry is used instead: the first "any
+   * of my clients" one, when there is one.
+   */
   modelId: string | null
 }
 
@@ -96,8 +110,9 @@ function temp(conversationId: string, role: 'user' | 'assistant', parentId: stri
     status: role === 'user' ? 'completed' : 'queued',
     error: null,
     attempts: 0,
-    client_id: target?.target.client_id ?? null,
-    client_label: target?.detail ?? null,
+    // A pooled reply has no client until one is chosen for it.
+    client_id: target?.target.kind === 'client' ? target.target.client_id : null,
+    client_label: target?.target.kind === 'client' ? target.detail : null,
     model: target?.target.model ?? null,
     created_at: now,
     completed_at: role === 'user' ? now : null,
@@ -117,20 +132,28 @@ function applyEvent(m: ChatMessage, event: ReplyEvent): ChatMessage {
         content: event.content,
         status: event.status,
         error: event.error,
-        client_id: event.client_id ?? m.client_id,
-        client_label: event.client_label ?? m.client_label,
-        model: event.model ?? m.model,
+        ...answerer(m, event),
         stage: event.stage ?? null,
       }
     case 'progress':
       return { ...m, stage: event.stage }
     case 'status':
+      return { ...m, status: event.status, ...answerer(m, event) }
+    case 'requeued':
+      // The attempt was lost: what it wrote is discarded, and the reply
+      // starts again once it's placed.
       return {
         ...m,
-        status: event.status,
-        client_id: event.client_id ?? m.client_id,
-        client_label: event.client_label ?? m.client_label,
-        model: event.model ?? m.model,
+        content: '',
+        stage: null,
+        client_id: null,
+        client_label: null,
+        requeue: {
+          attempt: event.attempt,
+          max_attempts: event.max_attempts,
+          reason: event.reason,
+          previous_client_label: event.previous_client_label,
+        },
       }
     case 'chunk':
       return { ...m, content: m.content + event.delta }
@@ -140,11 +163,32 @@ function applyEvent(m: ChatMessage, event: ReplyEvent): ChatMessage {
         status: event.status,
         error: event.error,
         stage: null,
+        queue: null,
+        requeue: null,
         completed_at: new Date().toISOString(),
         meta: event.meta ?? m.meta,
       }
     case 'created':
       return m
+  }
+}
+
+/**
+ * Who's answering, from a `snapshot` or `status` event. While the reply is
+ * queued nobody is, so the client is cleared; the model it was sent for
+ * stays on show.
+ */
+function answerer(
+  m: ChatMessage,
+  event: Extract<ReplyEvent, { type: 'snapshot' | 'status' }>,
+): Pick<ChatMessage, 'client_id' | 'client_label' | 'model' | 'queue' | 'attempts'> {
+  const queued = event.status === 'queued'
+  return {
+    client_id: queued ? null : (event.client_id ?? m.client_id),
+    client_label: queued ? null : (event.client_label ?? m.client_label),
+    model: event.model ?? m.model,
+    queue: queued ? (event.queue ?? null) : null,
+    attempts: event.attempt ?? m.attempts,
   }
 }
 
@@ -262,20 +306,40 @@ function reducer(state: State, action: Action): State {
   }
 }
 
-/** Models on connected clients the user can chat with, grouped by client, refetched on demand. */
+/** "2 clients · loaded on 1": how many offer a pooled model, and whether it's warm anywhere. */
+function poolNote(clients: number, loadedOn: number): string {
+  const count = `${clients} client${clients === 1 ? '' : 's'}`
+  return loadedOn > 0 ? `${count} · loaded on ${loadedOn}` : `${count} · not loaded`
+}
+
+/**
+ * What the user can chat with, refetched on demand: an "any of my clients"
+ * entry for each model their pool offers, then every model client by client.
+ */
 function useModels(): [ModelOption[], () => void] {
   const [models, setModels] = useState<ModelOption[]>([])
   const refresh = useCallback(() => {
     listChatModels().then(
       (list) =>
-        setModels(
-          list.map((m) => ({
-            id: `${m.client_id}/${m.model}`,
-            target: { kind: 'client', client_id: m.client_id, model: m.model },
-            label: m.model_name,
-            detail: m.client_name,
-          })),
-        ),
+        setModels([
+          ...list.pools.map(
+            (p): ModelOption => ({
+              id: `pool/${p.model}`,
+              target: { kind: 'pool', model: p.model },
+              label: p.model_name,
+              detail: POOL_LABEL,
+              note: poolNote(p.clients, p.loaded_on),
+            }),
+          ),
+          ...list.clients.map(
+            (m): ModelOption => ({
+              id: `${m.client_id}/${m.model}`,
+              target: { kind: 'client', client_id: m.client_id, model: m.model },
+              label: m.model_name,
+              detail: m.client_name,
+            }),
+          ),
+        ]),
       // Keep the last list: the picker still works if one refresh fails.
       (err: unknown) => console.error(`Couldn't load chat models: ${errorMessage(err)}`),
     )
@@ -323,13 +387,29 @@ export interface UseChat {
   dismissError: () => void
 }
 
+/** Where the picker's last choice is kept, per user. */
+function modelKey(userId: string): string {
+  return `delegation.chat-model.${userId}`
+}
+
+function readStoredModel(userId: string | undefined): string | null {
+  if (!userId) return null
+  try {
+    return localStorage.getItem(modelKey(userId))
+  } catch {
+    // Storage can be unavailable (private mode): the choice lasts the page.
+    return null
+  }
+}
+
 export function useChat(): UseChat {
+  const userId = useAuth().user?.id
   const [state, dispatch] = useReducer(reducer, {
     conversations: [],
     nextBefore: null,
     listError: null,
     open: null,
-    modelId: null,
+    modelId: readStoredModel(userId),
   })
   const [models, refreshModels] = useModels()
   const [error, setError] = useState<string | null>(null)
@@ -514,7 +594,7 @@ export function useChat(): UseChat {
       const open = stateRef.current.open
       if (!open || !replyMessage.parent_id) return
       setError(null)
-      const option = models.find((m) => m.target.client_id === target.client_id && m.target.model === target.model)
+      const option = models.find((m) => sameTarget(m.target, target))
       const reply = temp(open.id, 'assistant', replyMessage.parent_id, '', option)
       const previousLeaf = open.activeLeafId
       dispatch({ type: 'upsert', conversationId: open.id, messages: [reply], leafId: reply.id })
@@ -535,7 +615,7 @@ export function useChat(): UseChat {
       const open = stateRef.current.open
       if (!open) return
       setError(null)
-      const option = models.find((m) => m.target.client_id === target.client_id && m.target.model === target.model)
+      const option = models.find((m) => sameTarget(m.target, target))
       const user = temp(open.id, 'user', message.parent_id, text)
       const reply = temp(open.id, 'assistant', user.id, '', option)
       const previousLeaf = open.activeLeafId
@@ -556,19 +636,21 @@ export function useChat(): UseChat {
       const open = stateRef.current.open
       if (!open) return
       setError(null)
-      const option = target && models.find((m) => m.target.client_id === target.client_id && m.target.model === target.model)
       const fresh: ChatMessage = {
         ...replyMessage,
         content: '',
         error: null,
         status: 'queued',
-        ...(option && { client_id: option.target.client_id, client_label: option.detail, model: option.target.model }),
+        // Nobody has it until the queue places it.
+        client_id: null,
+        client_label: null,
+        ...(target && { model: target.model }),
       }
       dispatch({ type: 'upsert', conversationId: open.id, messages: [fresh] })
       const undo = () => dispatch({ type: 'upsert', conversationId: open.id, messages: [replyMessage] })
       void runReply(open.id, [], undo, (onEvent, signal) => retryMessage(replyMessage.id, target, onEvent, signal))
     },
-    [models, runReply],
+    [runReply],
   )
 
   const stop = useCallback(() => {
@@ -625,7 +707,17 @@ export function useChat(): UseChat {
     [stopListening],
   )
 
-  const selectModel = useCallback((id: string) => dispatch({ type: 'selectModel', id }), [])
+  const selectModel = useCallback(
+    (id: string) => {
+      dispatch({ type: 'selectModel', id })
+      try {
+        if (userId) localStorage.setItem(modelKey(userId), id)
+      } catch {
+        // Not remembered across reloads, then.
+      }
+    },
+    [userId],
+  )
   const dismissError = useCallback(() => setError(null), [])
 
   return {
